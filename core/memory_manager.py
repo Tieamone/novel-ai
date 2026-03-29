@@ -16,6 +16,8 @@ class MemoryManager:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         init_database(novel_name)
 
+    # ==================== 世界观 ====================
+
     def save_world_settings(self, content: str):
         conn = get_connection(self.novel_name)
         conn.execute("""
@@ -33,6 +35,8 @@ class MemoryManager:
         ).fetchone()
         conn.close()
         return row["content"] if row else ""
+
+    # ==================== 人物 ====================
 
     def save_character(self, name: str, data: dict):
         conn = get_connection(self.novel_name)
@@ -80,6 +84,41 @@ class MemoryManager:
         conn.close()
         self._refresh_characters_md()
 
+    def update_character_relationship(self, name: str,
+                                      other_name: str,
+                                      new_relationship: str,
+                                      chapter_num: int):
+        """更新人物之间的关系"""
+        conn = get_connection(self.novel_name)
+        row = conn.execute(
+            "SELECT relationships FROM characters WHERE name=?", (name,)
+        ).fetchone()
+        conn.close()
+
+        if not row:
+            return
+
+        try:
+            relationships = json.loads(row["relationships"] or "{}")
+        except Exception:
+            relationships = {}
+
+        relationships[other_name] = new_relationship
+
+        conn = get_connection(self.novel_name)
+        conn.execute("""
+            UPDATE characters
+            SET relationships=?, updated_chapter=?
+            WHERE name=?
+        """, (
+            json.dumps(relationships, ensure_ascii=False),
+            chapter_num,
+            name,
+        ))
+        conn.commit()
+        conn.close()
+        self._refresh_characters_md()
+
     def _refresh_characters_md(self):
         chars = self.load_characters()
         lines = ["# 人物档案\n"]
@@ -91,8 +130,12 @@ class MemoryManager:
             lines.append(f"- 致命弱点：{c['weakness']}")
             lines.append(f"- 当前位置：{c['current_location']}")
             lines.append(f"- 当前状态：{c['current_status']}")
+            if c["relationships"]:
+                lines.append(f"- 人物关系：{json.dumps(c['relationships'], ensure_ascii=False)}")
             lines.append("")
         self._write_md("characters.md", "\n".join(lines))
+
+    # ==================== 伏笔 ====================
 
     def add_foreshadowing(self, fid: str, plant_chapter: int,
                           description: str, expected_redeem: str):
@@ -141,6 +184,8 @@ class MemoryManager:
             )
         self._write_md("foreshadowing.md", "\n".join(lines))
 
+    # ==================== 摘要 ====================
+
     def add_summary(self, chapter_num: int, summary: str):
         conn = get_connection(self.novel_name)
         conn.execute("""
@@ -152,14 +197,94 @@ class MemoryManager:
         self._refresh_summaries_md()
 
     def load_recent_summaries(self, count: int = 5) -> list:
+        from core.config_loader import get as cfg
+        count = cfg("novel", "recent_summary_count", count)
+
         conn = get_connection(self.novel_name)
-        rows = conn.execute("""
+        compressed = conn.execute("""
+            SELECT chapter_num, summary FROM summaries
+            WHERE is_compressed=1
+            ORDER BY chapter_num DESC LIMIT 1
+        """).fetchone()
+
+        recent = conn.execute("""
             SELECT chapter_num, summary FROM summaries
             WHERE is_compressed=0
             ORDER BY chapter_num DESC LIMIT ?
         """, (count,)).fetchall()
         conn.close()
-        return [dict(row) for row in reversed(rows)]
+
+        result = []
+        if compressed:
+            result.append(dict(compressed))
+        result.extend([dict(r) for r in reversed(recent)])
+        return result
+
+    def compress_old_summaries(self):
+        from core.config_loader import get as cfg
+        threshold = cfg("novel", "compress_after_chapters", 20)
+        keep_recent = cfg("novel", "recent_summary_count", 5)
+
+        conn = get_connection(self.novel_name)
+        total = conn.execute(
+            "SELECT COUNT(*) as cnt FROM summaries WHERE is_compressed=0"
+        ).fetchone()["cnt"]
+
+        if total <= threshold:
+            conn.close()
+            return
+
+        to_compress = conn.execute("""
+            SELECT id, chapter_num, summary FROM summaries
+            WHERE is_compressed=0
+            ORDER BY chapter_num ASC
+            LIMIT ?
+        """, (total - keep_recent,)).fetchall()
+        conn.close()
+
+        if not to_compress:
+            return
+
+        print(f"  [压缩] 正在压缩第"
+              f"{to_compress[0]['chapter_num']}-"
+              f"{to_compress[-1]['chapter_num']}章摘要...")
+
+        from core.api_client import call_api
+        summaries_text = "\n".join([
+            f"第{r['chapter_num']}章：{r['summary']}"
+            for r in to_compress
+        ])
+
+        compressed_text = call_api(
+            system_prompt="你是小说编辑，将多章摘要压缩为简洁的阶段摘要。",
+            user_message=(
+                f"请将以下章节摘要压缩为200字以内的阶段性摘要，"
+                f"保留关键情节和人物变化：\n\n{summaries_text}"
+            ),
+            temperature=0.3,
+            max_tokens=300,
+        )
+
+        conn = get_connection(self.novel_name)
+        ids = [r["id"] for r in to_compress]
+        conn.execute(
+            f"UPDATE summaries SET is_compressed=1 "
+            f"WHERE id IN ({','.join('?' * len(ids))})",
+            ids
+        )
+
+        first_ch = to_compress[0]["chapter_num"]
+        last_ch = to_compress[-1]["chapter_num"]
+        conn.execute("""
+            INSERT INTO summaries (chapter_num, summary, is_compressed)
+            VALUES (?, ?, 1)
+        """, (last_ch,
+              f"[阶段摘要 第{first_ch}-{last_ch}章] {compressed_text}"))
+
+        conn.commit()
+        conn.close()
+        print(f"  [OK] 摘要压缩完成，第{first_ch}-{last_ch}章已合并")
+        self._refresh_summaries_md()
 
     def _refresh_summaries_md(self):
         recent = self.load_recent_summaries(10)
@@ -170,14 +295,20 @@ class MemoryManager:
             lines.append("")
         self._write_md("recent_summaries.md", "\n".join(lines))
 
+    # ==================== 章节 ====================
+
     def save_chapter(self, chapter_num: int, title: str,
-                     content: str, status: str = "draft"):
+                     content: str, status: str = "draft",
+                     plot_goal: str = "", emotion_tag: str = ""):
+        """保存章节，同时写入 plot_goal 和 emotion_tag"""
         conn = get_connection(self.novel_name)
         conn.execute("""
             INSERT OR REPLACE INTO chapters
-            (chapter_num, title, content, status, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (chapter_num, title, content, status, datetime.now()))
+            (chapter_num, title, content, status,
+             plot_goal, emotion_tag, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (chapter_num, title, content, status,
+              plot_goal, emotion_tag, datetime.now()))
         conn.commit()
         conn.close()
 
@@ -187,6 +318,26 @@ class MemoryManager:
             UPDATE chapters SET status=?, updated_at=?
             WHERE chapter_num=?
         """, (status, datetime.now(), chapter_num))
+        conn.commit()
+        conn.close()
+
+    def update_chapter_summary(self, chapter_num: int, summary: str):
+        """章节审核通过后，将摘要回写到 chapters 表"""
+        conn = get_connection(self.novel_name)
+        conn.execute("""
+            UPDATE chapters SET summary=?, updated_at=?
+            WHERE chapter_num=?
+        """, (summary, datetime.now(), chapter_num))
+        conn.commit()
+        conn.close()
+
+    def increment_retry_count(self, chapter_num: int):
+        """记录重试次数"""
+        conn = get_connection(self.novel_name)
+        conn.execute("""
+            UPDATE chapters SET retry_count = retry_count + 1
+            WHERE chapter_num=?
+        """, (chapter_num,))
         conn.commit()
         conn.close()
 
@@ -204,26 +355,12 @@ class MemoryManager:
             "world_settings": self.load_world_settings(),
             "characters": self.load_characters(),
             "active_foreshadowing": self.load_active_foreshadowing(),
-            "recent_summaries": self.load_recent_summaries(5),
+            "recent_summaries": self.load_recent_summaries(),
             "chapter_num": chapter_num,
         }
+
+    # ==================== 工具 ====================
 
     def _write_md(self, filename: str, content: str):
         path = self.data_dir / filename
         path.write_text(content, encoding="utf-8")
-
-
-if __name__ == "__main__":
-    mm = MemoryManager("测试小说")
-    mm.save_world_settings("测试世界观")
-    mm.save_character("测试角色", {
-        "role": "主角", "appearance": "英俊", "personality": "冷静",
-        "secret": "身世之谜", "weakness": "情感", "current_location": "城市",
-        "current_status": "活跃", "relationships": {}
-    })
-    mm.add_foreshadowing("F001", 1, "测试伏笔", "第10章")
-    mm.add_summary(1, "测试摘要内容")
-    ctx = mm.load_context(2)
-    print(f"[OK] 记忆模块正常，上下文字段：{list(ctx.keys())}")
-    import shutil
-    shutil.rmtree("data/测试小说", ignore_errors=True)

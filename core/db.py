@@ -65,6 +65,17 @@ def init_database(novel_name: str):
     """)
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chapter_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chapter_num INTEGER NOT NULL UNIQUE,
+            plot_goal TEXT,
+            emotion_tag TEXT DEFAULT '铺垫',
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS foreshadowing (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fid TEXT UNIQUE NOT NULL,
@@ -106,6 +117,10 @@ def init_database(novel_name: str):
         cursor.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
             "idx_chapter_num ON chapters(chapter_num)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_task_chapter_num ON chapter_tasks(chapter_num)"
         )
     except Exception:
         pass

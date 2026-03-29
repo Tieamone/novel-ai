@@ -157,9 +157,16 @@ def select_model_interactive() -> dict:
 
 def call_api(system_prompt: str, user_message: str,
              model_name: str = None,
-             max_tokens: int = 4096,
-             temperature: float = 0.8,
+             max_tokens: int = None,
+             temperature: float = None,
              retry: int = 3) -> str:
+    # 从 config 读取默认值
+    from core.config_loader import get as cfg
+    if max_tokens is None:
+        max_tokens = cfg("model", "max_tokens", 4096)
+    if temperature is None:
+        temperature = cfg("model", "temperature", 0.85)
+
     if model_name is None:
         model_name = _current_model
         provider = _current_provider

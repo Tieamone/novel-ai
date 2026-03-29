@@ -1,17 +1,14 @@
-# AI模型配置
 model:
-  provider: gemini
-  gemini_model: gemini-1.5-flash
   max_tokens: 4096
-  temperature: 0.8
+  temperature: 0.85
 
-# 小说生成参数
 novel:
   chapter_word_target: 3000
   max_retry: 3
   recent_summary_count: 5
+  compress_after_chapters: 20
+  pre_split_chapters: 50
 
-# 路径配置
 paths:
   data_dir: data
   output_dir: output

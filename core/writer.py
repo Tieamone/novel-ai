@@ -3,8 +3,10 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import re
+from pathlib import Path
 from core.api_client import call_api
 from core.memory_manager import MemoryManager
+from core.config_loader import get as cfg
 
 AUTHOR_STYLES = {
     "1": {
@@ -101,16 +103,23 @@ CONTINUE_SYSTEM_BASE = """你正在续写一章小说的后半部分。
 - 直接接着上文写，不要重复前面的内容
 - 保持和前半段完全一样的文风，像同一个人写的
 - 节奏可以比前半段稍快，把故事推向本章的结尾
-- 结尾要让读者忍不住想继续看，一个问题、一个意外、一句话都行
+- 结尾要让读者忍不住想继续看
 
 只输出正文，不要任何标注或说明。"""
+
+SUPPLEMENT_SYSTEM = """你是一位专业的中文网络小说作家，正在为一章小说补充内容。
+
+要求：
+- 在现有章节结尾处自然延伸，不重复已有内容
+- 保持完全相同的文风和节奏
+- 补充约500字，推进情节或深化场景
+- 只输出补充的正文内容"""
 
 
 def build_writer_prompt(ctx: dict, chapter_num: int,
                         plot_goal: str, emotion_tag: str,
                         author_style: dict) -> str:
     world = ctx.get("world_settings", "")[:400]
-
     chars = ctx.get("characters", [])
     char_lines = [
         f"{c['name']}（{c['role']}）：{c['personality']}，"
@@ -130,8 +139,10 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
     ) if summaries else "这是开篇第一章"
 
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
+    word_target = cfg("novel", "chapter_word_target", 3000)
+    half_target = word_target // 2
 
-    return f"""现在要写第{chapter_num}章，大概1500字左右，是完整章节的前半部分。
+    return f"""现在要写第{chapter_num}章，大概{half_target}字左右，是完整章节的前半部分。
 
 【这章要做什么】
 {plot_goal}
@@ -159,6 +170,8 @@ def build_continue_prompt(chapter_num: int, plot_goal: str,
                           emotion_tag: str, first_half: str) -> str:
     last_part = first_half[-500:] if len(first_half) > 500 else first_half
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
+    word_target = cfg("novel", "chapter_word_target", 3000)
+    half_target = word_target // 2
 
     return f"""这章要做的事：{plot_goal}
 这章的感觉：{emotion_tag} —— {emotion_guide}
@@ -166,7 +179,7 @@ def build_continue_prompt(chapter_num: int, plot_goal: str,
 前半段最后的内容（从这里接着写）：
 ...{last_part}
 
-接着写后半段，大概1500字，把这章写完。结尾要有吸引力。"""
+接着写后半段，大概{half_target}字，把这章写完。结尾要有吸引力。"""
 
 
 def clean_content(text: str) -> str:
@@ -183,41 +196,50 @@ def write_chapter(novel_name: str, chapter_num: int,
     mm = MemoryManager(novel_name)
     ctx = mm.load_context(chapter_num)
 
-    style_path = (
-        __import__('pathlib').Path("data") / novel_name / "style.txt"
-    )
+    word_target = cfg("novel", "chapter_word_target", 3000)
+    max_tokens = cfg("model", "max_tokens", 4096)
+
+    # 读取风格
+    author_style = AUTHOR_STYLES["1"]  # 默认值
+    style_path = Path("data") / novel_name / "style.txt"
     if style_path.exists():
         style_key = style_path.read_text(encoding="utf-8").strip()
-        author_style = AUTHOR_STYLES.get(style_key, AUTHOR_STYLES["1"])
+        if style_key.startswith("custom:"):
+            custom_desc = style_key[7:].strip()
+            system_prompt = f"""你是一位专业的中文网络小说作家。
+你的写作风格特点：{custom_desc}
+
+你写的东西自然流畅，像一个有经验的作者在讲故事，不端着。"""
+        else:
+            author_style = AUTHOR_STYLES.get(style_key, AUTHOR_STYLES["1"])
+            system_prompt = author_style["system"]
     else:
-        author_style = AUTHOR_STYLES["1"]
+        system_prompt = AUTHOR_STYLES["1"]["system"]
 
-    system_prompt = author_style["system"]
-
+    # 前半段
     print(f"  正在生成第{chapter_num}章（前半段·{emotion_tag}）...")
     prompt = build_writer_prompt(
         ctx, chapter_num, plot_goal, emotion_tag, author_style
     )
-
     first_half = call_api(
         system_prompt=system_prompt,
         user_message=prompt,
         temperature=0.9,
-        max_tokens=2048,
+        max_tokens=max_tokens,
     )
     first_half = clean_content(first_half)
     print(f"  前半段完成：{len(first_half)}字")
 
+    # 后半段
     print(f"  正在生成第{chapter_num}章（后半段）...")
     continue_prompt = build_continue_prompt(
         chapter_num, plot_goal, emotion_tag, first_half
     )
-
     second_half = call_api(
         system_prompt=system_prompt + "\n\n" + CONTINUE_SYSTEM_BASE,
         user_message=continue_prompt,
         temperature=0.9,
-        max_tokens=2048,
+        max_tokens=max_tokens,
     )
     second_half = clean_content(second_half)
     print(f"  后半段完成：{len(second_half)}字")
@@ -225,13 +247,36 @@ def write_chapter(novel_name: str, chapter_num: int,
     full_content = first_half + "\n\n" + second_half
     full_content = re.sub(r'\n{3,}', '\n\n', full_content)
 
+    # 字数硬约束：不足时补写
+    min_words = int(word_target * 0.8)
+    if len(full_content) < min_words:
+        shortage = min_words - len(full_content)
+        print(f"  [补写] 字数不足（{len(full_content)}/{min_words}），"
+              f"补充约{shortage}字...")
+        supplement = call_api(
+            system_prompt=SUPPLEMENT_SYSTEM,
+            user_message=(
+                f"当前章节结尾内容：\n...{full_content[-400:]}\n\n"
+                f"请在结尾处自然延伸，补充约{shortage}字。"
+            ),
+            temperature=0.88,
+            max_tokens=1024,
+        )
+        supplement = clean_content(supplement)
+        full_content = full_content + "\n\n" + supplement
+        full_content = re.sub(r'\n{3,}', '\n\n', full_content)
+        print(f"  补写完成，当前总字数：{len(full_content)}字")
+
     total = len(full_content)
     print(f"  [OK] 第{chapter_num}章完成，总字数：{total}字")
 
-    if total < 2500:
-        print(f"  [警告] 字数偏少（{total}字）")
-
-    mm.save_chapter(chapter_num, f"第{chapter_num}章", full_content, "draft")
+    # 保存时写入 plot_goal 和 emotion_tag
+    mm.save_chapter(
+        chapter_num, f"第{chapter_num}章",
+        full_content, "draft",
+        plot_goal=plot_goal,
+        emotion_tag=emotion_tag,
+    )
     return full_content
 
 

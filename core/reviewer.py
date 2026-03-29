@@ -6,6 +6,7 @@ import json
 import re
 from core.api_client import call_api
 from core.memory_manager import MemoryManager
+from core.config_loader import get as cfg
 
 REVIEWER_SYSTEM = """你是一位严格的网络小说责任编辑，职责是找出章节中的问题。
 
@@ -40,7 +41,9 @@ def build_review_prompt(ctx: dict, chapter_num: int,
                         content: str, plot_goal: str) -> str:
     chars = ctx.get("characters", [])
     chars_str = "\n".join([
-        f"【{c['name']}】性格：{c['personality']}｜状态：{c['current_status']}"
+        f"【{c['name']}】性格：{c['personality']}｜"
+        f"状态：{c['current_status']}｜"
+        f"关系：{json.dumps(c.get('relationships', {}), ensure_ascii=False)}"
         for c in chars
     ])
 
@@ -109,8 +112,13 @@ def review_chapter(novel_name: str, chapter_num: int,
 
 def write_and_review(novel_name: str, chapter_num: int,
                      plot_goal: str, emotion_tag: str = "铺垫",
-                     max_retry: int = 3) -> str:
+                     max_retry: int = None) -> str:
     from core.writer import write_chapter
+
+    if max_retry is None:
+        max_retry = cfg("novel", "max_retry", 3)
+
+    mm = MemoryManager(novel_name)
 
     for attempt in range(max_retry):
         print(f"\n  第{attempt+1}次写作尝试...")
@@ -122,17 +130,18 @@ def write_and_review(novel_name: str, chapter_num: int,
 
         if result.get("pass"):
             print(f"  [OK] 第{chapter_num}章审稿通过！")
-            mm = MemoryManager(novel_name)
             mm.update_chapter_status(chapter_num, "approved")
             return content
         else:
+            # 记录重试次数
+            mm.increment_retry_count(chapter_num)
+
             if attempt < max_retry - 1:
                 suggestions = result.get("suggestions", "")
                 plot_goal = f"{plot_goal}\n\n上次问题：{suggestions}"
                 print(f"  [重写] 准备第{attempt+2}次写作...")
             else:
                 print(f"  [警告] 连续{max_retry}次未通过，保留最后版本")
-                mm = MemoryManager(novel_name)
                 mm.update_chapter_status(chapter_num, "force_approved")
                 return content
 
