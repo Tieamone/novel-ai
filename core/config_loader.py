@@ -29,11 +29,20 @@ def get(section: str, key: str, default=None):
     return config.get(section, {}).get(key, default)
 
 
+def get_data_dir(novel_name: str = "") -> Path:
+    base = Path(get("paths", "data_dir", "data"))
+    return base / novel_name if novel_name else base
+
+
+def get_output_dir(novel_name: str = "") -> Path:
+    base = Path(get("paths", "output_dir", "output"))
+    return base / novel_name if novel_name else base
+
+
 def _get_defaults() -> dict:
     return {
         "model": {
             "max_tokens": 4096,
-            "temperature": 0.85,
         },
         "novel": {
             "chapter_word_target": 3000,

@@ -6,15 +6,17 @@ from pathlib import Path
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.db import get_connection, init_database
+from core.db import get_connection, ensure_database
 
 
 class MemoryManager:
     def __init__(self, novel_name: str):
         self.novel_name = novel_name
-        self.data_dir = Path("data") / novel_name
+        from core.config_loader import get as cfg
+        base = cfg("paths", "data_dir", "data")
+        self.data_dir = Path(base) / novel_name
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        init_database(novel_name)
+        ensure_database(novel_name)
 
     # ==================== 世界观 ====================
 
@@ -68,7 +70,10 @@ class MemoryManager:
         result = []
         for row in rows:
             d = dict(row)
-            d["relationships"] = json.loads(d["relationships"] or "{}")
+            try:
+                d["relationships"] = json.loads(d.get("relationships") or "{}")
+            except Exception:
+                d["relationships"] = {}
             result.append(d)
         return result
 
@@ -84,40 +89,43 @@ class MemoryManager:
         conn.close()
         self._refresh_characters_md()
 
-    def update_character_relationship(self, name: str,
-                                      other_name: str,
-                                      new_relationship: str,
-                                      chapter_num: int):
-        """更新人物之间的关系"""
+    def update_character_relationship(self, name_a: str, name_b: str,
+                                      relationship: str, chapter_num: int):
+        """
+        双向更新人物关系：
+        A→B 更新为 relationship
+        B→A 自动镜像（对调主谓，如"信任"变"被信任"）
+        """
+        self._set_relationship(name_a, name_b, relationship, chapter_num)
+
+        # 镜像描述：简单在原描述前加"被"或直接复用
+        mirror = _mirror_relationship(relationship)
+        self._set_relationship(name_b, name_a, mirror, chapter_num)
+
+        self._refresh_characters_md()
+
+    def _set_relationship(self, name: str, other: str,
+                          rel: str, chapter_num: int):
         conn = get_connection(self.novel_name)
         row = conn.execute(
             "SELECT relationships FROM characters WHERE name=?", (name,)
         ).fetchone()
         conn.close()
-
         if not row:
             return
-
         try:
-            relationships = json.loads(row["relationships"] or "{}")
+            rels = json.loads(row["relationships"] or "{}")
         except Exception:
-            relationships = {}
-
-        relationships[other_name] = new_relationship
-
+            rels = {}
+        rels[other] = rel
         conn = get_connection(self.novel_name)
         conn.execute("""
             UPDATE characters
             SET relationships=?, updated_chapter=?
             WHERE name=?
-        """, (
-            json.dumps(relationships, ensure_ascii=False),
-            chapter_num,
-            name,
-        ))
+        """, (json.dumps(rels, ensure_ascii=False), chapter_num, name))
         conn.commit()
         conn.close()
-        self._refresh_characters_md()
 
     def _refresh_characters_md(self):
         chars = self.load_characters()
@@ -130,8 +138,11 @@ class MemoryManager:
             lines.append(f"- 致命弱点：{c['weakness']}")
             lines.append(f"- 当前位置：{c['current_location']}")
             lines.append(f"- 当前状态：{c['current_status']}")
-            if c["relationships"]:
-                lines.append(f"- 人物关系：{json.dumps(c['relationships'], ensure_ascii=False)}")
+            if c.get("relationships"):
+                rels_str = "、".join(
+                    f"{k}：{v}" for k, v in c["relationships"].items()
+                )
+                lines.append(f"- 人物关系：{rels_str}")
             lines.append("")
         self._write_md("characters.md", "\n".join(lines))
 
@@ -199,8 +210,8 @@ class MemoryManager:
     def load_recent_summaries(self, count: int = 5) -> list:
         from core.config_loader import get as cfg
         count = cfg("novel", "recent_summary_count", count)
-
         conn = get_connection(self.novel_name)
+
         compressed = conn.execute("""
             SELECT chapter_num, summary FROM summaries
             WHERE is_compressed=1
@@ -237,15 +248,14 @@ class MemoryManager:
         to_compress = conn.execute("""
             SELECT id, chapter_num, summary FROM summaries
             WHERE is_compressed=0
-            ORDER BY chapter_num ASC
-            LIMIT ?
+            ORDER BY chapter_num ASC LIMIT ?
         """, (total - keep_recent,)).fetchall()
         conn.close()
 
         if not to_compress:
             return
 
-        print(f"  [压缩] 正在压缩第"
+        print(f"  [压缩] 压缩第"
               f"{to_compress[0]['chapter_num']}-"
               f"{to_compress[-1]['chapter_num']}章摘要...")
 
@@ -254,7 +264,6 @@ class MemoryManager:
             f"第{r['chapter_num']}章：{r['summary']}"
             for r in to_compress
         ])
-
         compressed_text = call_api(
             system_prompt="你是小说编辑，将多章摘要压缩为简洁的阶段摘要。",
             user_message=(
@@ -272,7 +281,6 @@ class MemoryManager:
             f"WHERE id IN ({','.join('?' * len(ids))})",
             ids
         )
-
         first_ch = to_compress[0]["chapter_num"]
         last_ch = to_compress[-1]["chapter_num"]
         conn.execute("""
@@ -280,7 +288,6 @@ class MemoryManager:
             VALUES (?, ?, 1)
         """, (last_ch,
               f"[阶段摘要 第{first_ch}-{last_ch}章] {compressed_text}"))
-
         conn.commit()
         conn.close()
         print(f"  [OK] 摘要压缩完成，第{first_ch}-{last_ch}章已合并")
@@ -299,16 +306,23 @@ class MemoryManager:
 
     def save_chapter(self, chapter_num: int, title: str,
                      content: str, status: str = "draft",
-                     plot_goal: str = "", emotion_tag: str = ""):
-        """保存章节，同时写入 plot_goal 和 emotion_tag"""
+                     plot_goal: str = "", emotion_tag: str = "",
+                     word_target=None):
+        from core.config_loader import get as cfg
+        if word_target is None:
+            word_target = cfg("novel", "chapter_word_target", 3000)
+        try:
+            word_target = int(word_target)
+        except Exception:
+            word_target = int(cfg("novel", "chapter_word_target", 3000))
         conn = get_connection(self.novel_name)
         conn.execute("""
             INSERT OR REPLACE INTO chapters
             (chapter_num, title, content, status,
-             plot_goal, emotion_tag, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+             plot_goal, emotion_tag, word_target, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (chapter_num, title, content, status,
-              plot_goal, emotion_tag, datetime.now()))
+              plot_goal, emotion_tag, word_target, datetime.now()))
         conn.commit()
         conn.close()
 
@@ -322,7 +336,6 @@ class MemoryManager:
         conn.close()
 
     def update_chapter_summary(self, chapter_num: int, summary: str):
-        """章节审核通过后，将摘要回写到 chapters 表"""
         conn = get_connection(self.novel_name)
         conn.execute("""
             UPDATE chapters SET summary=?, updated_at=?
@@ -331,8 +344,60 @@ class MemoryManager:
         conn.commit()
         conn.close()
 
+    def update_chapter_review_result(self, chapter_num: int, review: dict):
+        if not isinstance(review, dict):
+            review = {}
+
+        def _safe_int(v):
+            try:
+                return int(v)
+            except Exception:
+                return None
+
+        score_total = _safe_int(review.get("score_total"))
+        if score_total is None:
+            legacy_score = review.get("score")
+            if legacy_score is not None:
+                try:
+                    score_total = int(float(legacy_score))
+                    if score_total <= 10:
+                        score_total *= 10
+                except Exception:
+                    score_total = None
+
+        score_l1 = _safe_int(review.get("score_l1"))
+        score_l2 = _safe_int(review.get("score_l2"))
+        score_l3 = _safe_int(review.get("score_l3"))
+        veto_items = review.get("veto_items", [])
+        failure_attr = review.get("failure_attribution", {})
+
+        conn = get_connection(self.novel_name)
+        conn.execute("""
+            UPDATE chapters
+            SET review_score_total=?,
+                review_score_l1=?,
+                review_score_l2=?,
+                review_score_l3=?,
+                review_veto_items=?,
+                review_failure_attribution=?,
+                review_updated_at=?,
+                updated_at=?
+            WHERE chapter_num=?
+        """, (
+            score_total,
+            score_l1,
+            score_l2,
+            score_l3,
+            json.dumps(veto_items, ensure_ascii=False),
+            json.dumps(failure_attr, ensure_ascii=False),
+            datetime.now(),
+            datetime.now(),
+            chapter_num
+        ))
+        conn.commit()
+        conn.close()
+
     def increment_retry_count(self, chapter_num: int):
-        """记录重试次数"""
         conn = get_connection(self.novel_name)
         conn.execute("""
             UPDATE chapters SET retry_count = retry_count + 1
@@ -364,3 +429,37 @@ class MemoryManager:
     def _write_md(self, filename: str, content: str):
         path = self.data_dir / filename
         path.write_text(content, encoding="utf-8")
+
+
+def _mirror_relationship(rel: str) -> str:
+    """
+    生成镜像关系描述。
+    规则：在原描述前加"（对方）"前缀，保留原意但标注视角。
+    如：A→B "信任" => B→A "被信任"
+    如：A→B "怀疑并监视" => B→A "被怀疑并监视"
+    """
+    # 常见关系的镜像映射
+    mirror_map = {
+        "信任": "被信任",
+        "怀疑": "被怀疑",
+        "保护": "被保护",
+        "监视": "被监视",
+        "利用": "被利用",
+        "喜欢": "被喜欢",
+        "爱慕": "被爱慕",
+        "敌视": "被敌视",
+        "追杀": "被追杀",
+        "崇拜": "被崇拜",
+        "依赖": "被依赖",
+        "控制": "被控制",
+        "欺骗": "被欺骗",
+    }
+    # 精确匹配
+    if rel in mirror_map:
+        return mirror_map[rel]
+    # 包含匹配
+    for k, v in mirror_map.items():
+        if k in rel:
+            return rel.replace(k, v)
+    # 兜底：加"（对方视角）"
+    return f"{rel}（对方视角）"

@@ -6,8 +6,22 @@ import re
 from pathlib import Path
 from core.memory_manager import MemoryManager
 from core.db import get_connection
+from core.config_loader import get_output_dir
 
-SENSITIVE_WORDS = []
+SENSITIVE_WORDS_PATH = Path("sensitive_words.txt")
+
+
+def load_sensitive_words() -> list:
+    if not SENSITIVE_WORDS_PATH.exists():
+        return []
+
+    words = []
+    for line in SENSITIVE_WORDS_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        words.append(line)
+    return words
 
 
 def clean_for_export(text: str) -> str:
@@ -16,7 +30,7 @@ def clean_for_export(text: str) -> str:
     text = re.sub(r'\*([^*\n]+)\*', r'\1', text)
     text = re.sub(r'^\s*-{3,}\s*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'\n{3,}', '\n\n', text)
-    for word in SENSITIVE_WORDS:
+    for word in load_sensitive_words():
         text = text.replace(word, '*' * len(word))
     return text.strip()
 
@@ -31,14 +45,14 @@ def export_chapter(novel_name: str, chapter_num: int) -> str:
 
     content = clean_for_export(chapter["content"])
 
-    out_dir = Path("output") / novel_name
+    out_dir = get_output_dir(novel_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     filename = f"第{str(chapter_num).zfill(3)}章.txt"
     out_path = out_dir / filename
     out_path.write_text(content, encoding="utf-8")
 
-    print(f"  [OK] 已导出：output/{novel_name}/{filename}")
+    print(f"  [OK] 已导出：{out_path}")
     print(f"       字数：{len(content)} 字")
     return str(out_path)
 

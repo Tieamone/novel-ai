@@ -174,6 +174,7 @@ D:\novel-ai\
 
 **关键设计：**
 - 所有模块调用 `call_api()` 时不传 `model_name` 参数，自动使用用户在启动时选择的模型
+- `temperature` 由各业务调用点显式控制，`call_api()` 仅保留兜底默认值
 - 费用统计存储在模块级变量 `_session_stats`，整个会话共享
 - 失败自动重试，指数退避（1s、2s、4s）
 
@@ -194,7 +195,6 @@ max_retry = cfg("novel", "max_retry", 3)
 ```yaml
 model:
   max_tokens: 4096         # 单次最大输出token
-  temperature: 0.85        # 生成温度
 
 novel:
   chapter_word_target: 3000  # 目标字数
@@ -215,11 +215,11 @@ paths:
 **职责：** 初始化数据库、管理连接、清理重复数据。
 
 **核心函数：**
-- `init_database(novel_name)` — 建表，每次启动时调用（幂等）
+- `init_database(novel_name)` — 建表并对旧版数据库执行补列迁移（幂等）
 - `get_connection(novel_name)` — 返回 sqlite3 连接，启用 WAL 模式
 - `clean_duplicate_chapters(novel_name)` — 清理章节表中的重复记录
 
-**数据库位置：** `data/{小说名}/novel.db`
+**数据库位置：** `paths.data_dir/{小说名}/novel.db`
 
 ---
 
@@ -304,6 +304,12 @@ Step 5: 预拆分前50章任务卡（存入chapter_tasks表）
 拼接 → 总字数约3000字
 ```
 
+**字数策略：**
+- 章节目标字数来自 `config.yaml` 的 `chapter_word_target`
+- 最低阈值为目标字数的 85%
+- 不足时最多补写 2 轮
+- 不做强制截断，避免误伤结尾内容
+
 **内置作者风格：**
 
 | 编号 | 风格名 | 适合类型 |
@@ -360,15 +366,15 @@ Step 5: 预拆分前50章任务卡（存入chapter_tasks表）
 - 删除 `**加粗**` 和 `*斜体*`
 - 删除 `---` 分割线
 - 压缩多余空行
-- 敏感词过滤（词库可自定义扩充）
+- 敏感词过滤（读取根目录 `sensitive_words.txt`，词库可自定义扩充）
 
-**导出路径：** `output/{小说名}/第001章.txt`（章节号三位补零）
+**导出路径：** `paths.output_dir/{小说名}/第001章.txt`（章节号三位补零）
 
 ---
 
 ## 5. 数据库设计
 
-所有表存储于 `data/{小说名}/novel.db`（SQLite）。
+所有表存储于 `paths.data_dir/{小说名}/novel.db`（SQLite）。
 
 ### 5.1 表结构
 
@@ -449,15 +455,6 @@ content TEXT NOT NULL
 updated_at TIMESTAMP
 ```
 
-#### `tone_samples` — 风格样本（预留）
-```sql
-id INTEGER PRIMARY KEY AUTOINCREMENT
-content TEXT NOT NULL
-locked INTEGER DEFAULT 0
-```
-
----
-
 ## 6. 数据流与执行顺序
 
 ### 6.1 新建小说完整流程
@@ -533,7 +530,6 @@ GEMINI_API_KEY=AIzaSyxxxxxxxxxxxxxxxx
 ```yaml
 model:
   max_tokens: 4096
-  temperature: 0.85
 
 novel:
   chapter_word_target: 3000    # 可调整目标字数
@@ -576,13 +572,14 @@ paths:
 - [x] 中途更换写作风格
 - [x] 批量生成（支持Ctrl+C中断）
 - [x] 重复章节自动清理
+- [x] `paths.data_dir` / `paths.output_dir` 全量生效
+- [x] 旧版数据库自动补列迁移
+- [x] 敏感词词库支持根目录文件加载
 - [x] config.yaml 真正被读取
 - [x] 继续写作已有小说
 
 ### ⏳ 预留/未启用
 
-- [ ] `tone_samples` 风格样本表（已建表，暂未使用）
-- [ ] 平台特定敏感词库（框架已有，词库为空）
 - [ ] 自动续写模式（挂机全自动，可基于批量生成实现）
 
 ---

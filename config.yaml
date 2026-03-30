@@ -1,6 +1,5 @@
 model:
   max_tokens: 4096
-  temperature: 0.85
 
 novel:
   chapter_word_target: 3000

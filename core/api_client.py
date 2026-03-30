@@ -160,12 +160,12 @@ def call_api(system_prompt: str, user_message: str,
              max_tokens: int = None,
              temperature: float = None,
              retry: int = 3) -> str:
-    # 从 config 读取默认值
+    # temperature 由各业务调用点显式控制，这里只保留兜底默认值。
     from core.config_loader import get as cfg
     if max_tokens is None:
         max_tokens = cfg("model", "max_tokens", 4096)
     if temperature is None:
-        temperature = cfg("model", "temperature", 0.85)
+        temperature = 0.85
 
     if model_name is None:
         model_name = _current_model

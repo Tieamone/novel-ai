@@ -2,11 +2,11 @@
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import json
 import re
-from pathlib import Path
 from core.api_client import call_api
 from core.memory_manager import MemoryManager
-from core.config_loader import get as cfg
+from core.config_loader import get as cfg, get_data_dir
 
 AUTHOR_STYLES = {
     "1": {
@@ -97,6 +97,46 @@ EMOTION_GUIDE = {
     "铺垫": "看似平静但信息量要足，每个场景都有存在的理由，至少埋一个小钩子。",
 }
 
+WRITER_HARD_CONSTRAINTS = [
+    "必须围绕本章情节目标推进，不可偏题。",
+    "人物行为必须与既有性格/状态一致，不能无因突变。",
+    "与既有世界观冲突时，以既有设定为准，不得改设定。",
+    "本章必须有实质推进（信息新增、关系变化、冲突升级三者至少一项）。",
+]
+
+WRITER_FORBIDDEN_RULES = [
+    "禁止用“突然想起”“原来这一切”这类无铺垫硬反转收尾。",
+    "禁止连续空泛抒情或重复表达同一信息。",
+    "禁止把对手写成低智工具人来制造爽点。",
+]
+
+BEAT_PLANNER_SYSTEM = """你是网文分镜策划助手。你的任务是先做章节节拍计划（beats）。
+
+要求：
+1. 只输出 5-7 条编号节拍，每条 15-35 字。
+2. 每条要包含“发生什么 + 作用是什么（推进剧情/关系/伏笔）”。
+3. 节拍必须服务于本章目标与情绪标签。
+4. 不要输出JSON，不要解释，不要额外说明。"""
+
+SELF_CHECK_SYSTEM = """你是网文写作质检助手，请检查章节是否达标。
+
+请仅输出JSON：
+{
+  "pass": true/false,
+  "issues": ["问题1", "问题2"],
+  "need_revision": true/false
+}
+
+判定标准：
+1. 是否偏离本章目标
+2. 是否存在设定冲突/人物OOC
+3. 是否出现明显注水与重复表达
+4. 结尾是否具备阅读驱动力"""
+
+REVISION_SYSTEM = """你是小说润色与修订助手。
+你会依据问题清单直接改写章节，使其达成约束要求。
+只输出修订后的完整正文，不要解释。"""
+
 CONTINUE_SYSTEM_BASE = """你正在续写一章小说的后半部分。
 
 续写要点：
@@ -115,15 +155,182 @@ SUPPLEMENT_SYSTEM = """你是一位专业的中文网络小说作家，正在为
 - 补充约500字，推进情节或深化场景
 - 只输出补充的正文内容"""
 
+CHAPTER_MIN_RATIO = 0.85
+MAX_SUPPLEMENT_ROUNDS = 2
+
+
+def _format_rule_block(title: str, rules: list) -> str:
+    lines = [f"【{title}】"]
+    lines.extend([f"- {r}" for r in rules])
+    return "\n".join(lines)
+
+
+def _extract_json_obj(raw: str) -> dict:
+    if not raw:
+        return {}
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        obj = json.loads(match.group())
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normalize_beats(raw: str) -> str:
+    if not raw:
+        return ""
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    cleaned = []
+    for ln in lines:
+        ln = re.sub(r'^\d+[\.、\)\s]+', '', ln)
+        ln = re.sub(r'^[-*]\s*', '', ln)
+        if ln:
+            cleaned.append(ln)
+    cleaned = cleaned[:7]
+    if not cleaned:
+        return ""
+    return "\n".join([f"{i+1}. {v}" for i, v in enumerate(cleaned)])
+
+
+def _plan_chapter_beats(ctx: dict, chapter_num: int,
+                        plot_goal: str, emotion_tag: str) -> str:
+    world = (ctx.get("world_settings") or "")[:300]
+    chars = ctx.get("characters", [])
+    char_lines = []
+    for c in chars[:8]:
+        name = c.get("name", "未命名角色")
+        role = c.get("role", "")
+        status = c.get("current_status", "")
+        line = f"- {name}"
+        if role:
+            line += f"（{role}）"
+        if status:
+            line += f"：{status}"
+        char_lines.append(line)
+    chars_str = "\n".join(char_lines) if char_lines else "暂无人物信息"
+
+    prompt = f"""章节：第{chapter_num}章
+本章目标：{plot_goal}
+情绪标签：{emotion_tag}
+
+世界背景摘要：
+{world or "暂无"}
+
+关键角色：
+{chars_str}
+
+请先给出本章节拍计划。"""
+    raw = call_api(
+        system_prompt=BEAT_PLANNER_SYSTEM,
+        user_message=prompt,
+        temperature=0.6,
+        max_tokens=500,
+    )
+    return _normalize_beats(clean_content(raw))
+
+
+def _self_check_and_revise(system_prompt: str, chapter_num: int,
+                           plot_goal: str, emotion_tag: str,
+                           full_content: str, beat_plan: str,
+                           max_tokens: int) -> str:
+    hard_rules = _format_rule_block("硬约束", WRITER_HARD_CONSTRAINTS)
+    forbidden_rules = _format_rule_block("禁止项", WRITER_FORBIDDEN_RULES)
+    check_prompt = f"""请按规则检查本章质量。
+
+章节：第{chapter_num}章
+本章目标：{plot_goal}
+情绪标签：{emotion_tag}
+
+本章节拍计划：
+{beat_plan or "未提供"}
+
+{hard_rules}
+
+{forbidden_rules}
+
+正文：
+{full_content}
+"""
+    raw = call_api(
+        system_prompt=SELF_CHECK_SYSTEM,
+        user_message=check_prompt,
+        temperature=0.2,
+        max_tokens=600,
+    )
+    result = _extract_json_obj(raw)
+    if not result:
+        print("  [自检] 结果解析失败，跳过自动修订")
+        return full_content
+
+    issues = result.get("issues", [])
+    if isinstance(issues, str):
+        issues = [issues]
+    if not isinstance(issues, list):
+        issues = []
+    issues = [str(i).strip() for i in issues if str(i).strip()]
+
+    passed = bool(result.get("pass"))
+    need_revision = bool(result.get("need_revision"))
+    if passed and not need_revision:
+        print("  [自检] 通过")
+        return full_content
+
+    if not issues:
+        issues = ["与目标一致性、节奏推进或人物行为仍有改进空间"]
+    print(f"  [自检] 发现{len(issues)}项问题，执行1轮修订...")
+    issue_lines = "\n".join([f"- {x}" for x in issues])
+    revise_prompt = f"""请根据问题清单直接修订正文，输出完整章节。
+
+章节：第{chapter_num}章
+本章目标：{plot_goal}
+情绪标签：{emotion_tag}
+
+本章节拍计划：
+{beat_plan or "未提供"}
+
+{hard_rules}
+
+{forbidden_rules}
+
+问题清单：
+{issue_lines}
+
+待修订正文：
+{full_content}
+"""
+    revised = call_api(
+        system_prompt=system_prompt + "\n\n" + REVISION_SYSTEM,
+        user_message=revise_prompt,
+        temperature=0.7,
+        max_tokens=max_tokens,
+    )
+    revised = clean_content(revised)
+    if not revised:
+        print("  [自检] 修订返回为空，保留原稿")
+        return full_content
+    if len(revised) < int(len(full_content) * 0.65):
+        print("  [自检] 修订结果过短，保留原稿")
+        return full_content
+    print(f"  [自检] 修订完成：{len(revised)}字")
+    return revised
+
 
 def build_writer_prompt(ctx: dict, chapter_num: int,
                         plot_goal: str, emotion_tag: str,
-                        author_style: dict) -> str:
+                        author_style: dict,
+                        beat_plan: str = "") -> str:
     world = ctx.get("world_settings", "")[:400]
     chars = ctx.get("characters", [])
     char_lines = [
-        f"{c['name']}（{c['role']}）：{c['personality']}，"
-        f"目前在{c['current_location']}，{c['current_status']}"
+        f"{c.get('name', '未命名角色')}（{c.get('role', '角色')}）："
+        f"{c.get('personality', '性格待补全')}，"
+        f"目前在{c.get('current_location', '未知地点')}，"
+        f"{c.get('current_status', '状态未知')}"
         for c in chars
     ]
     chars_str = "\n".join(char_lines) if char_lines else "暂无人物信息"
@@ -141,6 +348,12 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
     word_target = cfg("novel", "chapter_word_target", 3000)
     half_target = word_target // 2
+    hard_rules = _format_rule_block("硬约束（必须满足）", WRITER_HARD_CONSTRAINTS)
+    forbidden_rules = _format_rule_block("禁止项（必须避免）", WRITER_FORBIDDEN_RULES)
+    beat_block = (
+        "【本章节拍计划（先按此推进）】\n"
+        f"{beat_plan or '未生成节拍，请严格围绕本章目标推进'}"
+    )
 
     return f"""现在要写第{chapter_num}章，大概{half_target}字左右，是完整章节的前半部分。
 
@@ -162,19 +375,35 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 【前面发生了什么】
 {s_str}
 
+{hard_rules}
+
+{forbidden_rules}
+
+{beat_block}
+
 开始写吧。第一行是章节标题（第{chapter_num}章 加上你想的标题），然后直接进入正文。
 写到一个自然的停顿点就停，后半段另外写。"""
 
 
 def build_continue_prompt(chapter_num: int, plot_goal: str,
-                          emotion_tag: str, first_half: str) -> str:
+                          emotion_tag: str, first_half: str,
+                          beat_plan: str = "") -> str:
     last_part = first_half[-500:] if len(first_half) > 500 else first_half
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
     word_target = cfg("novel", "chapter_word_target", 3000)
     half_target = word_target // 2
+    hard_rules = _format_rule_block("硬约束（必须满足）", WRITER_HARD_CONSTRAINTS)
+    forbidden_rules = _format_rule_block("禁止项（必须避免）", WRITER_FORBIDDEN_RULES)
 
     return f"""这章要做的事：{plot_goal}
 这章的感觉：{emotion_tag} —— {emotion_guide}
+
+本章节拍计划（后半段优先收束与推进）：
+{beat_plan or "未提供"}
+
+{hard_rules}
+
+{forbidden_rules}
 
 前半段最后的内容（从这里接着写）：
 ...{last_part}
@@ -201,7 +430,7 @@ def write_chapter(novel_name: str, chapter_num: int,
 
     # 读取风格
     author_style = AUTHOR_STYLES["1"]  # 默认值
-    style_path = Path("data") / novel_name / "style.txt"
+    style_path = get_data_dir(novel_name) / "style.txt"
     if style_path.exists():
         style_key = style_path.read_text(encoding="utf-8").strip()
         if style_key.startswith("custom:"):
@@ -216,10 +445,18 @@ def write_chapter(novel_name: str, chapter_num: int,
     else:
         system_prompt = AUTHOR_STYLES["1"]["system"]
 
+    print(f"  正在规划第{chapter_num}章节拍...")
+    beat_plan = _plan_chapter_beats(ctx, chapter_num, plot_goal, emotion_tag)
+    if beat_plan:
+        beat_count = len([ln for ln in beat_plan.splitlines() if ln.strip()])
+        print(f"  节拍规划完成：{beat_count}条")
+    else:
+        print("  [提示] 节拍规划未返回有效结果，本章按目标直接推进")
+
     # 前半段
     print(f"  正在生成第{chapter_num}章（前半段·{emotion_tag}）...")
     prompt = build_writer_prompt(
-        ctx, chapter_num, plot_goal, emotion_tag, author_style
+        ctx, chapter_num, plot_goal, emotion_tag, author_style, beat_plan
     )
     first_half = call_api(
         system_prompt=system_prompt,
@@ -233,7 +470,7 @@ def write_chapter(novel_name: str, chapter_num: int,
     # 后半段
     print(f"  正在生成第{chapter_num}章（后半段）...")
     continue_prompt = build_continue_prompt(
-        chapter_num, plot_goal, emotion_tag, first_half
+        chapter_num, plot_goal, emotion_tag, first_half, beat_plan
     )
     second_half = call_api(
         system_prompt=system_prompt + "\n\n" + CONTINUE_SYSTEM_BASE,
@@ -247,12 +484,14 @@ def write_chapter(novel_name: str, chapter_num: int,
     full_content = first_half + "\n\n" + second_half
     full_content = re.sub(r'\n{3,}', '\n\n', full_content)
 
-    # 字数硬约束：不足时补写
-    min_words = int(word_target * 0.8)
-    if len(full_content) < min_words:
+    # 字数策略：至少达到目标字数的 85%，最多补写两轮，不做强制截断。
+    min_words = int(word_target * CHAPTER_MIN_RATIO)
+    supplement_round = 0
+    while len(full_content) < min_words and supplement_round < MAX_SUPPLEMENT_ROUNDS:
         shortage = min_words - len(full_content)
+        supplement_round += 1
         print(f"  [补写] 字数不足（{len(full_content)}/{min_words}），"
-              f"补充约{shortage}字...")
+              f"第{supplement_round}轮补充约{shortage}字...")
         supplement = call_api(
             system_prompt=SUPPLEMENT_SYSTEM,
             user_message=(
@@ -263,9 +502,23 @@ def write_chapter(novel_name: str, chapter_num: int,
             max_tokens=1024,
         )
         supplement = clean_content(supplement)
+        if not supplement:
+            print("  [补写] 未获得有效补写内容，停止补写")
+            break
         full_content = full_content + "\n\n" + supplement
         full_content = re.sub(r'\n{3,}', '\n\n', full_content)
         print(f"  补写完成，当前总字数：{len(full_content)}字")
+
+    full_content = _self_check_and_revise(
+        system_prompt=system_prompt,
+        chapter_num=chapter_num,
+        plot_goal=plot_goal,
+        emotion_tag=emotion_tag,
+        full_content=full_content,
+        beat_plan=beat_plan,
+        max_tokens=max_tokens,
+    )
+    full_content = re.sub(r'\n{3,}', '\n\n', full_content)
 
     total = len(full_content)
     print(f"  [OK] 第{chapter_num}章完成，总字数：{total}字")
@@ -274,6 +527,7 @@ def write_chapter(novel_name: str, chapter_num: int,
     mm.save_chapter(
         chapter_num, f"第{chapter_num}章",
         full_content, "draft",
+        word_target=word_target,
         plot_goal=plot_goal,
         emotion_tag=emotion_tag,
     )
