@@ -424,12 +424,48 @@ class MemoryManager:
             "chapter_num": chapter_num,
         }
 
+    # ★ 新增方法：获取上一章结尾，用于新章衔接
+    def get_last_chapter_ending(self, chapter_num: int, chars: int = 200) -> str:
+        """
+        获取上一章最后 N 字，供新章开头衔接使用。
+        chapter_num 为当前要写的章节号，自动读取 chapter_num-1 的内容。
+        """
+        prev_num = chapter_num - 1
+        if prev_num < 1:
+            return ""
+        conn = get_connection(self.novel_name)
+        row = conn.execute(
+            "SELECT content FROM chapters WHERE chapter_num=?",
+            (prev_num,)
+        ).fetchone()
+        conn.close()
+        if not row or not row["content"]:
+            return ""
+        content = row["content"]
+        return content[-chars:] if len(content) > chars else content
+
     # ==================== 工具 ====================
 
     def _write_md(self, filename: str, content: str):
         path = self.data_dir / filename
         path.write_text(content, encoding="utf-8")
-
+def get_last_chapter_ending(self, current_chapter_num: int, chars: int = 500) -> str:
+    """获取上一章结尾片段，用于续写衔接。"""
+    prev_num = current_chapter_num - 1
+    if prev_num < 1:
+        return ""
+    try:
+        conn = get_connection(self.novel_name)
+        row = conn.execute(
+            "SELECT content FROM chapters WHERE chapter_num = ?",
+            (prev_num,)
+        ).fetchone()
+        conn.close()
+        if row and row["content"]:
+            return row["content"][-chars:]
+        return ""
+    except Exception:
+        return ""
 
 def _mirror_relationship(rel: str) -> str:
     """

@@ -102,21 +102,31 @@ WRITER_HARD_CONSTRAINTS = [
     "人物行为必须与既有性格/状态一致，不能无因突变。",
     "与既有世界观冲突时，以既有设定为准，不得改设定。",
     "本章必须有实质推进（信息新增、关系变化、冲突升级三者至少一项）。",
+    "本章必须包含至少2轮实质性对话（非主角自言自语或对幻象说话），每轮对话至少来回3句，且内容推动情节或揭示人物性格；若本章任务卡内无在场配角，须在章节开头安排一个合理的配角出现理由。",
+    "单章新出现的专有名词/设定概念不超过3个；新概念首次出现时必须通过角色感官或行为来锚定，禁止使用直接解释性旁白。",
 ]
 
 WRITER_FORBIDDEN_RULES = [
-    "禁止用“突然想起”“原来这一切”这类无铺垫硬反转收尾。",
-    "禁止连续空泛抒情或重复表达同一信息。",
-    "禁止把对手写成低智工具人来制造爽点。",
+    '禁止用"突然想起"或"原来这一切"这类无铺垫硬反转收尾。',
+    '禁止连续空泛抒情或重复表达同一信息。',
+    '禁止把对手写成低智工具人来制造爽点。',
+    '禁止在相邻两段内使用结构相似的比喻句（如连续出现"像X，也像Y"句式）；平叙段落每500字内比喻/拟人等修辞句不超过2处，情绪高潮场景可适当放宽但不得超过4处。',
+    '禁止在同一段落内连续引入两个及以上新专有名词或世界设定概念。',
 ]
 
+# ★ 修改点1：BEAT_PLANNER增加行动节拍硬约束
 BEAT_PLANNER_SYSTEM = """你是网文分镜策划助手。你的任务是先做章节节拍计划（beats）。
 
 要求：
 1. 只输出 5-7 条编号节拍，每条 15-35 字。
-2. 每条要包含“发生什么 + 作用是什么（推进剧情/关系/伏笔）”。
+2. 每条要包含"发生什么 + 作用是什么（推进剧情/关系/伏笔）"。
 3. 节拍必须服务于本章目标与情绪标签。
-4. 不要输出JSON，不要解释，不要额外说明。"""
+4. 不要输出JSON，不要解释，不要额外说明。
+
+节拍硬约束（必须满足）：
+- 5-7条节拍中，至少2条必须是"角色主动做出选择并产生外部可见结果"的行动节拍。
+- 禁止节拍全为"角色感知/观察/思考"，必须有至少1条明确的主动行动节拍。
+- 最后一条节拍必须体现章节结束时情节状态的可量化变化：主角掌握了新信息、位置发生了移动、与某人关系出现转折，三者至少满足其一。"""
 
 SELF_CHECK_SYSTEM = """你是网文写作质检助手，请检查章节是否达标。
 
@@ -131,7 +141,9 @@ SELF_CHECK_SYSTEM = """你是网文写作质检助手，请检查章节是否达
 1. 是否偏离本章目标
 2. 是否存在设定冲突/人物OOC
 3. 是否出现明显注水与重复表达
-4. 结尾是否具备阅读驱动力"""
+4. 结尾是否具备阅读驱动力
+5. 是否包含至少2轮实质性对话（非自言自语/对幻象）
+6. 是否存在比喻/修辞句堆砌（平叙段每500字超过2处即视为超标）"""
 
 REVISION_SYSTEM = """你是小说润色与修订助手。
 你会依据问题清单直接改写章节，使其达成约束要求。
@@ -320,10 +332,12 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
     return revised
 
 
+# ★ 修改点2：build_writer_prompt 增加 prev_chapter_ending 参数和衔接约束
 def build_writer_prompt(ctx: dict, chapter_num: int,
                         plot_goal: str, emotion_tag: str,
                         author_style: dict,
-                        beat_plan: str = "") -> str:
+                        beat_plan: str = "",
+                        prev_chapter_ending: str = "") -> str:
     world = ctx.get("world_settings", "")[:400]
     chars = ctx.get("characters", [])
     char_lines = [
@@ -355,6 +369,19 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
         f"{beat_plan or '未生成节拍，请严格围绕本章目标推进'}"
     )
 
+    # 上一章结尾衔接块（仅在非第一章时显示）
+    transition_block = ""
+    if prev_chapter_ending and chapter_num > 1:
+        transition_block = f"""
+【上一章结尾（必须自然衔接）】
+...{prev_chapter_ending}
+
+衔接规则：
+- 本章第一段必须与上一章结尾在时间/空间/情绪上形成逻辑连续。
+- 若场景发生切换，必须用一句话交代：时间跳跃了多久，或主角如何到达新地点。
+- 禁止开头直接出现新场景而不解释转场原因。
+"""
+
     return f"""现在要写第{chapter_num}章，大概{half_target}字左右，是完整章节的前半部分。
 
 【这章要做什么】
@@ -374,7 +401,7 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 
 【前面发生了什么】
 {s_str}
-
+{transition_block}
 {hard_rules}
 
 {forbidden_rules}
@@ -445,6 +472,13 @@ def write_chapter(novel_name: str, chapter_num: int,
     else:
         system_prompt = AUTHOR_STYLES["1"]["system"]
 
+    # ★ 修改点3：获取上一章结尾用于衔接
+    prev_chapter_ending = ""
+    if chapter_num > 1:
+        prev_chapter_ending = mm.get_last_chapter_ending(chapter_num)
+        if prev_chapter_ending:
+            print(f"  [衔接] 已获取第{chapter_num - 1}章结尾（{len(prev_chapter_ending)}字）")
+
     print(f"  正在规划第{chapter_num}章节拍...")
     beat_plan = _plan_chapter_beats(ctx, chapter_num, plot_goal, emotion_tag)
     if beat_plan:
@@ -456,7 +490,8 @@ def write_chapter(novel_name: str, chapter_num: int,
     # 前半段
     print(f"  正在生成第{chapter_num}章（前半段·{emotion_tag}）...")
     prompt = build_writer_prompt(
-        ctx, chapter_num, plot_goal, emotion_tag, author_style, beat_plan
+        ctx, chapter_num, plot_goal, emotion_tag, author_style, beat_plan,
+        prev_chapter_ending=prev_chapter_ending
     )
     first_half = call_api(
         system_prompt=system_prompt,
