@@ -24,9 +24,24 @@ def load_config() -> dict:
     return _config
 
 
-def get(section: str, key: str, default=None):
+def get(section: str, key: str, *args, default=None):
     config = load_config()
-    return config.get(section, {}).get(key, default)
+    if not args and default is None:
+        return config.get(section, {}).get(key)
+    if not args:
+        return config.get(section, {}).get(key, default)
+    *nested_keys, fallback = args
+    if default is not None:
+        fallback = default
+    current = config.get(section, {})
+    if not isinstance(current, dict):
+        return fallback
+    current = current.get(key, fallback)
+    for nk in nested_keys:
+        if not isinstance(current, dict):
+            return fallback
+        current = current.get(nk, fallback)
+    return current
 
 
 def get_data_dir(novel_name: str = "") -> Path:

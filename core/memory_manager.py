@@ -1,4 +1,4 @@
-﻿import sqlite3
+import sqlite3
 import json
 import sys
 import os
@@ -7,6 +7,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.db import get_connection, ensure_database
+from core.utils import with_db_connection, DatabaseTransaction
 
 
 class MemoryManager:
@@ -21,52 +22,48 @@ class MemoryManager:
     # ==================== 世界观 ====================
 
     def save_world_settings(self, content: str):
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            INSERT OR REPLACE INTO world_settings (id, content, updated_at)
-            VALUES (1, ?, ?)
-        """, (content, datetime.now()))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    INSERT OR REPLACE INTO world_settings (id, content, updated_at)
+                    VALUES (1, ?, ?)
+                """, (content, datetime.now()))
         self._write_md("settings.md", f"# 世界观设定\n\n{content}")
 
     def load_world_settings(self) -> str:
-        conn = get_connection(self.novel_name)
-        row = conn.execute(
-            "SELECT content FROM world_settings WHERE id=1"
-        ).fetchone()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            row = conn.execute(
+                "SELECT content FROM world_settings WHERE id=1"
+            ).fetchone()
         return row["content"] if row else ""
 
     # ==================== 人物 ====================
 
     def save_character(self, name: str, data: dict):
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            INSERT OR REPLACE INTO characters
-            (name, role, appearance, personality, secret, weakness,
-             current_location, current_status, relationships, updated_chapter)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            name,
-            data.get("role", ""),
-            data.get("appearance", ""),
-            data.get("personality", ""),
-            data.get("secret", ""),
-            data.get("weakness", ""),
-            data.get("current_location", ""),
-            data.get("current_status", ""),
-            json.dumps(data.get("relationships", {}), ensure_ascii=False),
-            data.get("updated_chapter", 0),
-        ))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    INSERT OR REPLACE INTO characters
+                    (name, role, appearance, personality, secret, weakness,
+                     current_location, current_status, relationships, updated_chapter)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    name,
+                    data.get("role", ""),
+                    data.get("appearance", ""),
+                    data.get("personality", ""),
+                    data.get("secret", ""),
+                    data.get("weakness", ""),
+                    data.get("current_location", ""),
+                    data.get("current_status", ""),
+                    json.dumps(data.get("relationships", {}), ensure_ascii=False),
+                    data.get("updated_chapter", 0),
+                ))
         self._refresh_characters_md()
 
     def load_characters(self) -> list:
-        conn = get_connection(self.novel_name)
-        rows = conn.execute("SELECT * FROM characters").fetchall()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            rows = conn.execute("SELECT * FROM characters").fetchall()
         result = []
         for row in rows:
             d = dict(row)
@@ -79,38 +76,29 @@ class MemoryManager:
 
     def update_character_status(self, name: str, location: str,
                                 status: str, chapter_num: int):
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            UPDATE characters
-            SET current_location=?, current_status=?, updated_chapter=?
-            WHERE name=?
-        """, (location, status, chapter_num, name))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    UPDATE characters
+                    SET current_location=?, current_status=?, updated_chapter=?
+                    WHERE name=?
+                """, (location, status, chapter_num, name))
         self._refresh_characters_md()
 
     def update_character_relationship(self, name_a: str, name_b: str,
                                       relationship: str, chapter_num: int):
-        """
-        双向更新人物关系：
-        A→B 更新为 relationship
-        B→A 自动镜像（对调主谓，如"信任"变"被信任"）
-        """
+        """双向更新人物关系：A→B + 自动镜像 B→A"""
         self._set_relationship(name_a, name_b, relationship, chapter_num)
-
-        # 镜像描述：简单在原描述前加"被"或直接复用
         mirror = _mirror_relationship(relationship)
         self._set_relationship(name_b, name_a, mirror, chapter_num)
-
         self._refresh_characters_md()
 
     def _set_relationship(self, name: str, other: str,
                           rel: str, chapter_num: int):
-        conn = get_connection(self.novel_name)
-        row = conn.execute(
-            "SELECT relationships FROM characters WHERE name=?", (name,)
-        ).fetchone()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            row = conn.execute(
+                "SELECT relationships FROM characters WHERE name=?", (name,)
+            ).fetchone()
         if not row:
             return
         try:
@@ -118,14 +106,13 @@ class MemoryManager:
         except Exception:
             rels = {}
         rels[other] = rel
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            UPDATE characters
-            SET relationships=?, updated_chapter=?
-            WHERE name=?
-        """, (json.dumps(rels, ensure_ascii=False), chapter_num, name))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    UPDATE characters
+                    SET relationships=?, updated_chapter=?
+                    WHERE name=?
+                """, (json.dumps(rels, ensure_ascii=False), chapter_num, name))
 
     def _refresh_characters_md(self):
         chars = self.load_characters()
@@ -150,39 +137,38 @@ class MemoryManager:
 
     def add_foreshadowing(self, fid: str, plant_chapter: int,
                           description: str, expected_redeem: str):
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            INSERT OR IGNORE INTO foreshadowing
-            (fid, plant_chapter, description, expected_redeem, status)
-            VALUES (?, ?, ?, ?, 'active')
-        """, (fid, plant_chapter, description, expected_redeem))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                try:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO foreshadowing
+                        (fid, plant_chapter, description, expected_redeem, status)
+                        VALUES (?, ?, ?, ?, 'active')
+                    """, (fid, plant_chapter, description, expected_redeem))
+                except Exception:
+                    pass
         self._refresh_foreshadowing_md()
 
     def redeem_foreshadowing(self, fid: str, chapter_num: int):
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            UPDATE foreshadowing
-            SET status='redeemed', redeemed_chapter=?
-            WHERE fid=?
-        """, (chapter_num, fid))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    UPDATE foreshadowing
+                    SET status='redeemed', redeemed_chapter=?
+                    WHERE fid=?
+                """, (chapter_num, fid))
         self._refresh_foreshadowing_md()
 
     def load_active_foreshadowing(self) -> list:
-        conn = get_connection(self.novel_name)
-        rows = conn.execute(
-            "SELECT * FROM foreshadowing WHERE status='active'"
-        ).fetchall()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            rows = conn.execute(
+                "SELECT * FROM foreshadowing WHERE status='active'"
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def _refresh_foreshadowing_md(self):
-        conn = get_connection(self.novel_name)
-        rows = conn.execute("SELECT * FROM foreshadowing").fetchall()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            rows = conn.execute("SELECT * FROM foreshadowing").fetchall()
         lines = ["# 伏笔追踪\n",
                  "| ID | 埋下章节 | 描述 | 预计兑现 | 状态 |",
                  "|---|---|---|---|---|"]
@@ -198,32 +184,30 @@ class MemoryManager:
     # ==================== 摘要 ====================
 
     def add_summary(self, chapter_num: int, summary: str):
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            INSERT INTO summaries (chapter_num, summary)
-            VALUES (?, ?)
-        """, (chapter_num, summary))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    INSERT OR REPLACE INTO summaries (chapter_num, summary)
+                    VALUES (?, ?)
+                """, (chapter_num, summary))
         self._refresh_summaries_md()
 
     def load_recent_summaries(self, count: int = 5) -> list:
         from core.config_loader import get as cfg
         count = cfg("novel", "recent_summary_count", count)
-        conn = get_connection(self.novel_name)
+        with with_db_connection(self.novel_name) as conn:
 
-        compressed = conn.execute("""
-            SELECT chapter_num, summary FROM summaries
-            WHERE is_compressed=1
-            ORDER BY chapter_num DESC LIMIT 1
-        """).fetchone()
+            compressed = conn.execute("""
+                SELECT chapter_num, summary FROM summaries
+                WHERE is_compressed=1
+                ORDER BY chapter_num DESC LIMIT 1
+            """).fetchone()
 
-        recent = conn.execute("""
-            SELECT chapter_num, summary FROM summaries
-            WHERE is_compressed=0
-            ORDER BY chapter_num DESC LIMIT ?
-        """, (count,)).fetchall()
-        conn.close()
+            recent = conn.execute("""
+                SELECT chapter_num, summary FROM summaries
+                WHERE is_compressed=0
+                ORDER BY chapter_num DESC LIMIT ?
+            """, (count,)).fetchall()
 
         result = []
         if compressed:
@@ -232,65 +216,83 @@ class MemoryManager:
         return result
 
     def compress_old_summaries(self):
-        from core.config_loader import get as cfg
-        threshold = cfg("novel", "compress_after_chapters", 20)
-        keep_recent = cfg("novel", "recent_summary_count", 5)
-
-        conn = get_connection(self.novel_name)
-        total = conn.execute(
-            "SELECT COUNT(*) as cnt FROM summaries WHERE is_compressed=0"
-        ).fetchone()["cnt"]
-
-        if total <= threshold:
-            conn.close()
-            return
-
-        to_compress = conn.execute("""
-            SELECT id, chapter_num, summary FROM summaries
-            WHERE is_compressed=0
-            ORDER BY chapter_num ASC LIMIT ?
-        """, (total - keep_recent,)).fetchall()
-        conn.close()
-
-        if not to_compress:
-            return
-
-        print(f"  [压缩] 压缩第"
-              f"{to_compress[0]['chapter_num']}-"
-              f"{to_compress[-1]['chapter_num']}章摘要...")
-
         from core.api_client import call_api
-        summaries_text = "\n".join([
-            f"第{r['chapter_num']}章：{r['summary']}"
-            for r in to_compress
-        ])
-        compressed_text = call_api(
-            system_prompt="你是小说编辑，将多章摘要压缩为简洁的阶段摘要。",
-            user_message=(
-                f"请将以下章节摘要压缩为200字以内的阶段性摘要，"
-                f"保留关键情节和人物变化：\n\n{summaries_text}"
-            ),
-            temperature=0.3,
-            max_tokens=300,
-        )
+        from core.config_loader import get as cfg
 
-        conn = get_connection(self.novel_name)
-        ids = [r["id"] for r in to_compress]
-        conn.execute(
-            f"UPDATE summaries SET is_compressed=1 "
-            f"WHERE id IN ({','.join('?' * len(ids))})",
-            ids
-        )
-        first_ch = to_compress[0]["chapter_num"]
-        last_ch = to_compress[-1]["chapter_num"]
-        conn.execute("""
-            INSERT INTO summaries (chapter_num, summary, is_compressed)
-            VALUES (?, ?, 1)
-        """, (last_ch,
-              f"[阶段摘要 第{first_ch}-{last_ch}章] {compressed_text}"))
-        conn.commit()
-        conn.close()
-        print(f"  [OK] 摘要压缩完成，第{first_ch}-{last_ch}章已合并")
+        with with_db_connection(self.novel_name) as conn:
+            to_compress = conn.execute("""
+                SELECT id, chapter_num, summary FROM summaries
+                WHERE is_compressed=0
+                ORDER BY chapter_num
+            """).fetchall()
+
+        if len(to_compress) < 5:
+            return
+
+        BATCH_SIZE = 10
+        all_compressed_texts = []
+        total_batches = (len(to_compress) + BATCH_SIZE - 1) // BATCH_SIZE
+
+        for batch_idx in range(0, len(to_compress), BATCH_SIZE):
+            batch = to_compress[batch_idx:batch_idx + BATCH_SIZE]
+            current_batch_num = batch_idx // BATCH_SIZE + 1
+
+            first_ch = batch[0]["chapter_num"]
+            last_ch = batch[-1]["chapter_num"]
+
+            batch_parts = []
+            for r in batch:
+                batch_parts.append(f"第{r['chapter_num']}章：{r['summary']}")
+            summaries_text = "\n".join(batch_parts)
+            del batch_parts
+
+            print(f"  [压缩] 正在处理第{current_batch_num}/{total_batches}批 "
+                  f"（第{first_ch}-{last_ch}章，共{len(batch)}条）...")
+
+            compressed_text = call_api(
+                system_prompt=(
+                    "你是专业小说编辑，负责压缩章节摘要。\n"
+                    "要求：\n"
+                    "1. 压缩为250字以内的阶段性摘要\n"
+                    "2. 必须保留：主要人物当前位置与状态、已揭示的关键信息、"
+                    "主要人物关系的最新变化、已激活但未兑现的伏笔线索\n"
+                    "3. 用'谁+在哪+做了什么+知道了什么'的结构来组织信息\n"
+                    "4. 直接输出摘要内容，不加前缀"
+                ),
+                user_message=(
+                    f"请将第{first_ch}-{last_ch}章的摘要压缩为阶段性摘要：\n\n"
+                    f"{summaries_text}"
+                ),
+                temperature=0.3,
+                max_tokens=400,
+            )
+
+            del summaries_text
+            all_compressed_texts.append({
+                "first_ch": first_ch,
+                "last_ch": last_ch,
+                "ids": [r["id"] for r in batch],
+                "text": compressed_text
+            })
+
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                for compressed in all_compressed_texts:
+                    conn.execute(
+                        f"UPDATE summaries SET is_compressed=1 "
+                        f"WHERE id IN ({','.join('?' * len(compressed['ids']))})",
+                        compressed["ids"]
+                    )
+                    conn.execute("""
+                        INSERT INTO summaries (chapter_num, summary, is_compressed)
+                        VALUES (?, ?, 1)
+                    """, (compressed["last_ch"],
+                          f"[阶段摘要 第{compressed['first_ch']}-{compressed['last_ch']}章] {compressed['text']}"))
+
+        overall_first = to_compress[0]["chapter_num"]
+        overall_last = to_compress[-1]["chapter_num"]
+        del to_compress, all_compressed_texts
+        print(f"  [OK] 摘要压缩完成，第{overall_first}-{overall_last}章已合并（共{total_batches}批）")
         self._refresh_summaries_md()
 
     def _refresh_summaries_md(self):
@@ -305,7 +307,7 @@ class MemoryManager:
     # ==================== 章节 ====================
 
     def save_chapter(self, chapter_num: int, title: str,
-                     content: str, status: str = "draft",
+                     content: str, status: str = "草稿",
                      plot_goal: str = "", emotion_tag: str = "",
                      word_target=None):
         from core.config_loader import get as cfg
@@ -315,34 +317,31 @@ class MemoryManager:
             word_target = int(word_target)
         except Exception:
             word_target = int(cfg("novel", "chapter_word_target", 3000))
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            INSERT OR REPLACE INTO chapters
-            (chapter_num, title, content, status,
-             plot_goal, emotion_tag, word_target, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (chapter_num, title, content, status,
-              plot_goal, emotion_tag, word_target, datetime.now()))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    INSERT OR REPLACE INTO chapters
+                    (chapter_num, title, content, status,
+                     plot_goal, emotion_tag, word_target, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (chapter_num, title, content, status,
+                      plot_goal, emotion_tag, word_target, datetime.now()))
 
     def update_chapter_status(self, chapter_num: int, status: str):
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            UPDATE chapters SET status=?, updated_at=?
-            WHERE chapter_num=?
-        """, (status, datetime.now(), chapter_num))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    UPDATE chapters SET status=?, updated_at=?
+                    WHERE chapter_num=?
+                """, (status, datetime.now(), chapter_num))
 
     def update_chapter_summary(self, chapter_num: int, summary: str):
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            UPDATE chapters SET summary=?, updated_at=?
-            WHERE chapter_num=?
-        """, (summary, datetime.now(), chapter_num))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    UPDATE chapters SET summary=?, updated_at=?
+                    WHERE chapter_num=?
+                """, (summary, datetime.now(), chapter_num))
 
     def update_chapter_review_result(self, chapter_num: int, review: dict):
         if not isinstance(review, dict):
@@ -371,51 +370,67 @@ class MemoryManager:
         veto_items = review.get("veto_items", [])
         failure_attr = review.get("failure_attribution", {})
 
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            UPDATE chapters
-            SET review_score_total=?,
-                review_score_l1=?,
-                review_score_l2=?,
-                review_score_l3=?,
-                review_veto_items=?,
-                review_failure_attribution=?,
-                review_updated_at=?,
-                updated_at=?
-            WHERE chapter_num=?
-        """, (
-            score_total,
-            score_l1,
-            score_l2,
-            score_l3,
-            json.dumps(veto_items, ensure_ascii=False),
-            json.dumps(failure_attr, ensure_ascii=False),
-            datetime.now(),
-            datetime.now(),
-            chapter_num
-        ))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    UPDATE chapters
+                    SET review_score_total=?,
+                        review_score_l1=?,
+                        review_score_l2=?,
+                        review_score_l3=?,
+                        review_veto_items=?,
+                        review_failure_attribution=?,
+                        review_updated_at=?,
+                        updated_at=?
+                    WHERE chapter_num=?
+                """, (
+                    score_total,
+                    score_l1,
+                    score_l2,
+                    score_l3,
+                    json.dumps(veto_items, ensure_ascii=False),
+                    json.dumps(failure_attr, ensure_ascii=False),
+                    datetime.now(),
+                    datetime.now(),
+                    chapter_num
+                ))
 
     def increment_retry_count(self, chapter_num: int):
-        conn = get_connection(self.novel_name)
-        conn.execute("""
-            UPDATE chapters SET retry_count = retry_count + 1
-            WHERE chapter_num=?
-        """, (chapter_num,))
-        conn.commit()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    UPDATE chapters SET retry_count = retry_count + 1
+                    WHERE chapter_num=?
+                """, (chapter_num,))
 
     def load_chapter(self, chapter_num: int) -> dict:
-        conn = get_connection(self.novel_name)
-        row = conn.execute(
-            "SELECT * FROM chapters WHERE chapter_num=?",
-            (chapter_num,)
-        ).fetchone()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            row = conn.execute(
+                "SELECT * FROM chapters WHERE chapter_num=?",
+                (chapter_num,)
+            ).fetchone()
         return dict(row) if row else {}
 
+    def delete_chapter(self, chapter_num: int):
+        """
+        删除章节的数据库记录及其摘要。
+        任务卡重置（status→待处理）由调用方负责。
+        注意：伏笔记录不自动回滚，需人工处理。
+        """
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute(
+                    "DELETE FROM chapters WHERE chapter_num=?", (chapter_num,)
+                )
+                conn.execute(
+                    "DELETE FROM summaries WHERE chapter_num=?", (chapter_num,)
+                )
+
     def load_context(self, chapter_num: int) -> dict:
+        """
+        加载写作上下文，供 writer/reviewer 使用。
+        包含：世界观、人物、活跃伏笔、近期摘要、章节号。
+        """
         return {
             "world_settings": self.load_world_settings(),
             "characters": self.load_characters(),
@@ -424,21 +439,15 @@ class MemoryManager:
             "chapter_num": chapter_num,
         }
 
-    # ★ 新增方法：获取上一章结尾，用于新章衔接
-    def get_last_chapter_ending(self, chapter_num: int, chars: int = 200) -> str:
-        """
-        获取上一章最后 N 字，供新章开头衔接使用。
-        chapter_num 为当前要写的章节号，自动读取 chapter_num-1 的内容。
-        """
+    def get_last_chapter_ending(self, chapter_num: int, chars: int = 250) -> str:
         prev_num = chapter_num - 1
         if prev_num < 1:
             return ""
-        conn = get_connection(self.novel_name)
-        row = conn.execute(
-            "SELECT content FROM chapters WHERE chapter_num=?",
-            (prev_num,)
-        ).fetchone()
-        conn.close()
+        with with_db_connection(self.novel_name) as conn:
+            row = conn.execute(
+                "SELECT content FROM chapters WHERE chapter_num=?",
+                (prev_num,)
+            ).fetchone()
         if not row or not row["content"]:
             return ""
         content = row["content"]
@@ -449,32 +458,14 @@ class MemoryManager:
     def _write_md(self, filename: str, content: str):
         path = self.data_dir / filename
         path.write_text(content, encoding="utf-8")
-def get_last_chapter_ending(self, current_chapter_num: int, chars: int = 500) -> str:
-    """获取上一章结尾片段，用于续写衔接。"""
-    prev_num = current_chapter_num - 1
-    if prev_num < 1:
-        return ""
-    try:
-        conn = get_connection(self.novel_name)
-        row = conn.execute(
-            "SELECT content FROM chapters WHERE chapter_num = ?",
-            (prev_num,)
-        ).fetchone()
-        conn.close()
-        if row and row["content"]:
-            return row["content"][-chars:]
-        return ""
-    except Exception:
-        return ""
+
 
 def _mirror_relationship(rel: str) -> str:
     """
     生成镜像关系描述。
-    规则：在原描述前加"（对方）"前缀，保留原意但标注视角。
+    规则：在原描述前加"被"，或使用预定义的镜像词。
     如：A→B "信任" => B→A "被信任"
-    如：A→B "怀疑并监视" => B→A "被怀疑并监视"
     """
-    # 常见关系的镜像映射
     mirror_map = {
         "信任": "被信任",
         "怀疑": "被怀疑",
@@ -489,13 +480,14 @@ def _mirror_relationship(rel: str) -> str:
         "依赖": "被依赖",
         "控制": "被控制",
         "欺骗": "被欺骗",
+        "支持": "被支持",
+        "排斥": "被排斥",
+        "吸引": "被吸引",
+        "警惕": "被警惕",
     }
-    # 精确匹配
     if rel in mirror_map:
         return mirror_map[rel]
-    # 包含匹配
     for k, v in mirror_map.items():
         if k in rel:
             return rel.replace(k, v)
-    # 兜底：加"（对方视角）"
     return f"{rel}（对方视角）"

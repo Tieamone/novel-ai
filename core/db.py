@@ -88,7 +88,7 @@ def init_database(novel_name: str):
             chapter_num INTEGER NOT NULL UNIQUE,
             plot_goal TEXT,
             emotion_tag TEXT DEFAULT '铺垫',
-            status TEXT DEFAULT 'pending',
+            status TEXT DEFAULT '待处理',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -120,6 +120,19 @@ def init_database(novel_name: str):
             id INTEGER PRIMARY KEY,
             content TEXT NOT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS model_switch_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            switch_type TEXT NOT NULL,
+            old_model TEXT,
+            new_model TEXT,
+            trigger_reason TEXT,
+            failure_count INTEGER DEFAULT 0,
+            chapter_num INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -198,10 +211,17 @@ def _migrate(conn, cursor):
         try:
             cursor.execute(
                 "ALTER TABLE chapter_tasks "
-                "ADD COLUMN status TEXT DEFAULT 'pending'"
+                "ADD COLUMN status TEXT DEFAULT '待处理'"
             )
         except Exception:
             pass
+
+    try:
+        cursor.execute(
+            "UPDATE chapter_tasks SET status='待处理' WHERE status='pending'"
+        )
+    except Exception:
+        pass
 
     conn.commit()
 

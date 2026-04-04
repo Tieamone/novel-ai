@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import os
 import shutil
 import json
@@ -9,6 +9,7 @@ from core.planner import run_planner, extend_tasks
 from core.reviewer import write_and_review
 from core.exporter import export_chapter, export_all
 from core.db import get_connection, clean_duplicate_chapters
+from core.utils import with_db_connection, DatabaseTransaction, execute_with_retry
 from core.config_loader import get as cfg
 
 MAX_NOVEL_NAME_LEN = 64
@@ -18,10 +19,16 @@ WINDOWS_RESERVED_NAMES = {
     "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 }
-TASK_PENDING = "pending"
-TASK_IN_PROGRESS = "in_progress"
-TASK_COMPLETED = "completed"
-TASK_REVIEW_FAILED = "review_failed"
+TASK_PENDING = "待处理"
+TASK_IN_PROGRESS = "进行中"
+TASK_COMPLETED = "已完成"
+TASK_REVIEW_FAILED = "审稿失败"
+
+CHAPTER_STATUS_DRAFT = "草稿"
+CHAPTER_STATUS_APPROVED = "已审核"
+CHAPTER_STATUS_FORCE_APPROVED = "强制通过"
+CHAPTER_STATUS_REVIEW_FAILED = "审稿失败"
+CHAPTER_STATUS_DRAFT_ISSUES = "草稿(有问题)"
 
 
 def _data_dir(novel_name: str) -> Path:
@@ -30,6 +37,17 @@ def _data_dir(novel_name: str) -> Path:
 
 def _output_dir(novel_name: str) -> Path:
     return Path(cfg("paths", "output_dir", "output")) / novel_name
+
+
+def _get_target_chapters(novel_name: str) -> int:
+    """读取小说目标章数。新建时由策划器写入，旧小说默认100。"""
+    path = _data_dir(novel_name) / "target_chapters.txt"
+    if path.exists():
+        try:
+            return int(path.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+    return 100
 
 
 def _validate_novel_name(novel_name: str) -> str:
@@ -53,7 +71,7 @@ def _validate_novel_name(novel_name: str) -> str:
 def _list_novels() -> list:
     """
     扫描已有小说，兼容旧库（没有 novel_info 时显示友好提示）。
-    返回 [(novel_name, display_name, genre)] 列表。
+    返回 [(novel_name, genre)] 列表。
     """
     data_base = Path(cfg("paths", "data_dir", "data"))
     if not data_base.exists():
@@ -66,13 +84,12 @@ def _list_novels() -> list:
         name = d.name
         genre = "未记录"
         try:
-            conn = get_connection(name)
-            row = conn.execute(
-                "SELECT genre FROM novel_info WHERE id=1"
-            ).fetchone()
-            conn.close()
-            if row and row["genre"]:
-                genre = row["genre"]
+            with with_db_connection(name) as conn:
+                row = conn.execute(
+                    "SELECT genre FROM novel_info WHERE id=1"
+                ).fetchone()
+                if row and row["genre"]:
+                    genre = row["genre"]
         except Exception:
             pass
         novels.append((name, genre))
@@ -83,172 +100,166 @@ def _list_novels() -> list:
 def _upsert_task_status(novel_name: str, chapter_num: int,
                         plot_goal: str, emotion_tag: str,
                         status: str):
-    conn = get_connection(novel_name)
-    conn.execute("""
-        INSERT OR REPLACE INTO chapter_tasks
-        (chapter_num, plot_goal, emotion_tag, status)
-        VALUES (?, ?, ?, ?)
-    """, (chapter_num, plot_goal, emotion_tag, status))
-    conn.commit()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        with DatabaseTransaction(conn):
+            conn.execute("""
+                INSERT OR REPLACE INTO chapter_tasks
+                (chapter_num, plot_goal, emotion_tag, status)
+                VALUES (?, ?, ?, ?)
+            """, (chapter_num, plot_goal, emotion_tag, status))
 
 
 def _claim_task_for_writing(novel_name: str, chapter_num: int,
                             plot_goal: str, emotion_tag: str) -> tuple:
     """
-    原子认领任务：
-    仅允许 pending -> in_progress。
-    返回 (是否成功, 当前状态)。
+    原子认领任务（并发安全）：
+    - 使用 BEGIN IMMEDIATE 获取排他锁，防止竞态条件
+    - 使用 execute_with_retry 自动重试数据库锁定错误
+    - 仅允许 pending -> in_progress 的状态转换
+    - 返回 (是否成功, 当前状态)
     """
-    conn = get_connection(novel_name)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("""
-            INSERT OR IGNORE INTO chapter_tasks
-            (chapter_num, plot_goal, emotion_tag, status)
-            VALUES (?, ?, ?, ?)
-        """, (chapter_num, plot_goal, emotion_tag, TASK_PENDING))
-
-        row = conn.execute("""
-            SELECT plot_goal, emotion_tag, status
-            FROM chapter_tasks
-            WHERE chapter_num=?
-        """, (chapter_num,)).fetchone()
-
-        saved_goal = ((row["plot_goal"] if row else "") or "").strip()
-        saved_tag = ((row["emotion_tag"] if row else "") or "").strip()
-        final_goal = saved_goal or plot_goal
-        final_tag = saved_tag or emotion_tag or "铺垫"
-
-        cur = conn.execute("""
-            UPDATE chapter_tasks
-            SET plot_goal=?, emotion_tag=?, status=?
-            WHERE chapter_num=? AND COALESCE(status, ?) = ?
-        """, (
-            final_goal, final_tag, TASK_IN_PROGRESS,
-            chapter_num, TASK_PENDING, TASK_PENDING
-        ))
-        conn.commit()
-
-        if cur.rowcount == 1:
-            return True, TASK_IN_PROGRESS
-
-        row2 = conn.execute(
-            "SELECT status FROM chapter_tasks WHERE chapter_num=?",
-            (chapter_num,),
-        ).fetchone()
-        status = row2["status"] if row2 and row2["status"] else TASK_PENDING
-        return False, status
-    except Exception:
+    with with_db_connection(novel_name) as conn:
         try:
-            conn.rollback()
+            execute_with_retry(conn, "BEGIN IMMEDIATE")
+
+            execute_with_retry(conn, """
+                INSERT OR IGNORE INTO chapter_tasks
+                (chapter_num, plot_goal, emotion_tag, status)
+                VALUES (?, ?, ?, ?)
+            """, (chapter_num, plot_goal, emotion_tag, TASK_PENDING))
+
+            row = execute_with_retry(conn, """
+                SELECT plot_goal, emotion_tag, status
+                FROM chapter_tasks
+                WHERE chapter_num=?
+            """, (chapter_num,)).fetchone()
+
+            saved_goal = ((row["plot_goal"] if row else "") or "").strip()
+            saved_tag = ((row["emotion_tag"] if row else "") or "").strip()
+            final_goal = saved_goal or plot_goal
+            final_tag = saved_tag or emotion_tag or "铺垫"
+
+            cur = execute_with_retry(conn, """
+                UPDATE chapter_tasks
+                SET plot_goal=?, emotion_tag=?, status=?
+                WHERE chapter_num=? AND COALESCE(status, ?) = ?
+            """, (
+                final_goal, final_tag, TASK_IN_PROGRESS,
+                chapter_num, TASK_PENDING, TASK_PENDING
+            ))
+            conn.commit()
+
+            if cur.rowcount == 1:
+                return True, TASK_IN_PROGRESS
+
+            row2 = execute_with_retry(conn,
+                "SELECT status FROM chapter_tasks WHERE chapter_num=?",
+                (chapter_num,),
+            ).fetchone()
+            status = row2["status"] if row2 and row2["status"] else TASK_PENDING
+            return False, status
         except Exception:
-            pass
-        raise
-    finally:
-        conn.close()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
 
 def _update_task_status(novel_name: str, chapter_num: int, status: str):
-    conn = get_connection(novel_name)
-    cur = conn.execute("""
-        UPDATE chapter_tasks
-        SET status=?
-        WHERE chapter_num=?
-    """, (status, chapter_num))
-    if cur.rowcount == 0:
-        row = conn.execute("""
-            SELECT plot_goal, emotion_tag FROM chapters
-            WHERE chapter_num=?
-        """, (chapter_num,)).fetchone()
-        plot_goal = row["plot_goal"] if row else ""
-        emotion_tag = row["emotion_tag"] if row else "铺垫"
-        conn.execute("""
-            INSERT OR REPLACE INTO chapter_tasks
-            (chapter_num, plot_goal, emotion_tag, status)
-            VALUES (?, ?, ?, ?)
-        """, (chapter_num, plot_goal, emotion_tag, status))
-    conn.commit()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        with DatabaseTransaction(conn):
+            cur = conn.execute("""
+                UPDATE chapter_tasks
+                SET status=?
+                WHERE chapter_num=?
+            """, (status, chapter_num))
+            if cur.rowcount == 0:
+                row = conn.execute("""
+                    SELECT plot_goal, emotion_tag FROM chapters
+                    WHERE chapter_num=?
+                """, (chapter_num,)).fetchone()
+                plot_goal = row["plot_goal"] if row else ""
+                emotion_tag = row["emotion_tag"] if row else "铺垫"
+                conn.execute("""
+                    INSERT OR REPLACE INTO chapter_tasks
+                    (chapter_num, plot_goal, emotion_tag, status)
+                    VALUES (?, ?, ?, ?)
+                """, (chapter_num, plot_goal, emotion_tag, status))
 
 
 def _get_chapter_status(novel_name: str, chapter_num: int) -> str:
-    conn = get_connection(novel_name)
-    row = conn.execute(
-        "SELECT status FROM chapters WHERE chapter_num=?",
-        (chapter_num,),
-    ).fetchone()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        row = conn.execute(
+            "SELECT status FROM chapters WHERE chapter_num=?",
+            (chapter_num,),
+        ).fetchone()
     return row["status"] if row else ""
 
 
 def _has_chapter_summary(novel_name: str, chapter_num: int) -> bool:
-    conn = get_connection(novel_name)
-    row = conn.execute(
-        "SELECT summary FROM chapters WHERE chapter_num=?",
-        (chapter_num,),
-    ).fetchone()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        row = conn.execute(
+            "SELECT summary FROM chapters WHERE chapter_num=?",
+            (chapter_num,),
+        ).fetchone()
     if not row:
         return False
     return bool((row["summary"] or "").strip())
 
 
 def show_progress(novel_name: str):
-    conn = get_connection(novel_name)
+    with with_db_connection(novel_name) as conn:
+        approved = conn.execute(
+            "SELECT COUNT(*) as cnt FROM chapters "
+            "WHERE status IN ('approved','force_approved')"
+        ).fetchone()["cnt"]
 
-    approved = conn.execute(
-        "SELECT COUNT(*) as cnt FROM chapters "
-        "WHERE status IN ('approved','force_approved')"
-    ).fetchone()["cnt"]
+        draft = conn.execute(
+            "SELECT COUNT(*) as cnt FROM chapters WHERE status='draft'"
+        ).fetchone()["cnt"]
 
-    draft = conn.execute(
-        "SELECT COUNT(*) as cnt FROM chapters WHERE status='draft'"
-    ).fetchone()["cnt"]
+        total_chars = conn.execute(
+            "SELECT SUM(LENGTH(content)) as s FROM chapters"
+        ).fetchone()["s"] or 0
 
-    total_chars = conn.execute(
-        "SELECT SUM(LENGTH(content)) as s FROM chapters"
-    ).fetchone()["s"] or 0
+        recent = conn.execute(
+            "SELECT chapter_num, status, LENGTH(content) as chars "
+            "FROM chapters ORDER BY chapter_num DESC LIMIT 3"
+        ).fetchall()
 
-    recent = conn.execute(
-        "SELECT chapter_num, status, LENGTH(content) as chars "
-        "FROM chapters ORDER BY chapter_num DESC LIMIT 3"
-    ).fetchall()
+        foreshadow_cnt = conn.execute(
+            "SELECT COUNT(*) as cnt FROM foreshadowing WHERE status='active'"
+        ).fetchone()["cnt"]
 
-    foreshadow_cnt = conn.execute(
-        "SELECT COUNT(*) as cnt FROM foreshadowing WHERE status='active'"
-    ).fetchone()["cnt"]
+        task_cnt = conn.execute(
+            "SELECT COUNT(*) as cnt FROM chapter_tasks"
+        ).fetchone()["cnt"]
 
-    task_cnt = conn.execute(
-        "SELECT COUNT(*) as cnt FROM chapter_tasks"
-    ).fetchone()["cnt"]
+        task_status_rows = conn.execute("""
+            SELECT COALESCE(status, ?) as status, COUNT(*) as cnt
+            FROM chapter_tasks
+            GROUP BY COALESCE(status, ?)
+        """, (TASK_PENDING, TASK_PENDING)).fetchall()
 
-    task_status_rows = conn.execute("""
-        SELECT COALESCE(status, ?) as status, COUNT(*) as cnt
-        FROM chapter_tasks
-        GROUP BY COALESCE(status, ?)
-    """, (TASK_PENDING, TASK_PENDING)).fetchall()
-
-    review_window = int(cfg("novel", "progress_review_window", 10))
-    if review_window <= 0:
-        review_window = 10
-    try:
-        review_rows = conn.execute("""
-            SELECT chapter_num,
-                   review_score_total,
-                   review_score_l1,
-                   review_score_l2,
-                   review_score_l3,
-                   review_veto_items
-            FROM chapters
-            WHERE review_score_total IS NOT NULL
-            ORDER BY chapter_num DESC
-            LIMIT ?
-        """, (review_window,)).fetchall()
-    except Exception:
-        review_rows = []
-
-    conn.close()
+        review_window = int(cfg("novel", "progress_review_window", 10))
+        if review_window <= 0:
+            review_window = 10
+        try:
+            review_rows = conn.execute("""
+                SELECT chapter_num,
+                       review_score_total,
+                       review_score_l1,
+                       review_score_l2,
+                       review_score_l3,
+                       review_veto_items
+                FROM chapters
+                WHERE review_score_total IS NOT NULL
+                ORDER BY chapter_num DESC
+                LIMIT ?
+            """, (review_window,)).fetchall()
+        except Exception:
+            review_rows = []
 
     task_status_map = {
         TASK_PENDING: 0,
@@ -303,7 +314,8 @@ def show_progress(novel_name: str):
     total_tokens = (stats["total_input_tokens"] +
                     stats["total_output_tokens"])
 
-    target = 100
+    # ★ 使用动态目标章数（新建时由策划器写入，旧小说默认100）
+    target = _get_target_chapters(novel_name)
     bar_len = 30
     filled = int(bar_len * min(approved, target) / target)
     bar = "█" * filled + "░" * (bar_len - filled)
@@ -322,10 +334,10 @@ def show_progress(novel_name: str):
     print(f"  累计字数：{total_chars:,} 字  ({chars_display})")
     print(f"  未兑现伏笔：{foreshadow_cnt} 个  |  任务卡：{task_cnt} 张")
     print("  任务状态："
-          f"pending {task_status_map[TASK_PENDING]}  |  "
-          f"in_progress {task_status_map[TASK_IN_PROGRESS]}  |  "
-          f"completed {task_status_map[TASK_COMPLETED]}  |  "
-          f"review_failed {task_status_map[TASK_REVIEW_FAILED]}")
+          f"待处理 {task_status_map[TASK_PENDING]}  |  "
+          f"进行中 {task_status_map[TASK_IN_PROGRESS]}  |  "
+          f"已完成 {task_status_map[TASK_COMPLETED]}  |  "
+          f"审稿失败 {task_status_map[TASK_REVIEW_FAILED]}")
     if quality_count:
         print(
             f"  审稿质量（最近{quality_count}章）：均分 {avg_total:.1f}/100  |  "
@@ -344,22 +356,21 @@ def show_progress(novel_name: str):
         print("  最近章节：")
         for r in reversed(recent):
             icon = "✓" if r["status"] in (
-                "approved", "force_approved") else "○"
+                CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED) else "○"
             print(f"    {icon} 第{r['chapter_num']}章  "
                   f"{r['chars']}字  [{r['status']}]")
     print("=" * 50)
 
 
 def get_next_chapter_goal(novel_name: str, chapter_num: int) -> tuple:
-    conn = get_connection(novel_name)
-    task = conn.execute(
-        "SELECT plot_goal, emotion_tag FROM chapter_tasks "
-        "WHERE chapter_num=?", (chapter_num,)
-    ).fetchone()
-    max_task = conn.execute(
-        "SELECT MAX(chapter_num) as mx FROM chapter_tasks"
-    ).fetchone()["mx"] or 0
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        task = conn.execute(
+            "SELECT plot_goal, emotion_tag FROM chapter_tasks "
+            "WHERE chapter_num=?", (chapter_num,)
+        ).fetchone()
+        max_task = conn.execute(
+            "SELECT MAX(chapter_num) as mx FROM chapter_tasks"
+        ).fetchone()["mx"] or 0
 
     if task and task["plot_goal"]:
         return task["plot_goal"], task["emotion_tag"]
@@ -367,12 +378,11 @@ def get_next_chapter_goal(novel_name: str, chapter_num: int) -> tuple:
     if chapter_num > max_task:
         print(f"  [提示] 任务卡已用完（最大第{max_task}章），正在扩展...")
         extend_tasks(novel_name, max_task + 1)
-        conn = get_connection(novel_name)
-        task = conn.execute(
-            "SELECT plot_goal, emotion_tag FROM chapter_tasks "
-            "WHERE chapter_num=?", (chapter_num,)
-        ).fetchone()
-        conn.close()
+        with with_db_connection(novel_name) as conn:
+            task = conn.execute(
+                "SELECT plot_goal, emotion_tag FROM chapter_tasks "
+                "WHERE chapter_num=?", (chapter_num,)
+            ).fetchone()
         if task and task["plot_goal"]:
             return task["plot_goal"], task["emotion_tag"]
 
@@ -392,7 +402,7 @@ def get_next_chapter_goal(novel_name: str, chapter_num: int) -> tuple:
 {outline}
 
 只按以下格式输出：
-情节目标：xxx（50字以内）
+情节目标：xxx（50字以内，只写一个核心节点）
 情绪标签：xxx（从铺垫/冲突/爽点/低谷/反转选一个）""",
         temperature=0.7,
         max_tokens=150,
@@ -407,11 +417,10 @@ def get_next_chapter_goal(novel_name: str, chapter_num: int) -> tuple:
 
 
 def generate_chapter_auto(novel_name: str):
-    conn = get_connection(novel_name)
-    row = conn.execute(
-        "SELECT MAX(chapter_num) as max_num FROM chapters"
-    ).fetchone()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        row = conn.execute(
+            "SELECT MAX(chapter_num) as max_num FROM chapters"
+        ).fetchone()
 
     last_num = row["max_num"] if row["max_num"] else 0
     next_num = last_num + 1
@@ -446,13 +455,40 @@ def generate_chapter_auto(novel_name: str):
         emotion_tag=emotion_tag,
     )
 
+    # ★ 需求1：三次重写仍未通过时，提示切换模型重新生成
+    while content:
+        chapter_status = _get_chapter_status(novel_name, next_num)
+        if chapter_status != CHAPTER_STATUS_FORCE_APPROVED:
+            break  # approved 或其他状态，正常往下走
+
+        max_retry_num = cfg("novel", "max_retry", 3)
+        print(f"\n{'=' * 50}")
+        print(f"  [提示] 第{next_num}章经{max_retry_num}次写作仍未通过审稿。")
+        print(f"  当前以最后版本暂存（强制通过）。")
+        print(f"  1. 保留当前版本继续")
+        print(f"  2. 切换模型重新生成本章")
+        print('=' * 50)
+        switch = input("请选择（默认1）：").strip()
+        if switch != "2":
+            break
+        from core.api_client import select_model_interactive
+        select_model_interactive()
+        print(f"\n[提示] 开始用新模型重新生成第{next_num}章...")
+        content = write_and_review(
+            novel_name=novel_name,
+            chapter_num=next_num,
+            plot_goal=plot_goal,
+            emotion_tag=emotion_tag,
+        )
+        # 循环回去检查新一轮结果
+
     if content:
         _save_chapter_memory(novel_name, next_num, content, plot_goal)
         export_chapter(novel_name, next_num)
         chapter_status = _get_chapter_status(novel_name, next_num)
-        if chapter_status in ("approved", "force_approved"):
+        if chapter_status in (CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED):
             _update_task_status(novel_name, next_num, TASK_COMPLETED)
-        elif chapter_status == "review_failed":
+        elif chapter_status == CHAPTER_STATUS_REVIEW_FAILED:
             _update_task_status(novel_name, next_num, TASK_REVIEW_FAILED)
         else:
             _update_task_status(novel_name, next_num, TASK_PENDING)
@@ -463,13 +499,13 @@ def generate_chapter_auto(novel_name: str):
         print(f"本次会话累计费用：¥{stats['total_cost_yuan']:.4f} 元")
     else:
         chapter_status = _get_chapter_status(novel_name, next_num)
-        if chapter_status == "review_failed":
+        if chapter_status == CHAPTER_STATUS_REVIEW_FAILED:
             _update_task_status(novel_name, next_num, TASK_REVIEW_FAILED)
-            print("\n[中断] 本章因审稿异常标记为 review_failed。")
-            print("可在章节菜单使用“恢复review_failed章节”继续处理。")
+            print("\n[中断] 本章因审稿异常标记为 审稿失败。")
+            print('可在章节菜单使用"恢复审稿失败章节"继续处理。')
         else:
             _update_task_status(novel_name, next_num, TASK_PENDING)
-            print("\n[中断] 本章未完成，任务状态已回退为 pending。")
+            print("\n[中断] 本章未完成，任务状态已回退为 待处理。")
 
 
 def _save_chapter_memory(novel_name: str, chapter_num: int,
@@ -572,23 +608,21 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
 
 
 def _trigger_compression(novel_name: str, mm: MemoryManager):
-    conn = get_connection(novel_name)
-    count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM summaries WHERE is_compressed=0"
-    ).fetchone()["cnt"]
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM summaries WHERE is_compressed=0"
+        ).fetchone()["cnt"]
     if count > cfg("novel", "compress_after_chapters", 20):
         mm.compress_old_summaries()
 
 
 def _list_chapters(novel_name: str):
-    conn = get_connection(novel_name)
-    rows = conn.execute(
-        "SELECT chapter_num, status, emotion_tag, retry_count, "
-        "LENGTH(content) as chars "
-        "FROM chapters ORDER BY chapter_num"
-    ).fetchall()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        rows = conn.execute(
+            "SELECT chapter_num, status, emotion_tag, retry_count, "
+            "LENGTH(content) as chars "
+            "FROM chapters ORDER BY chapter_num"
+        ).fetchall()
     if not rows:
         print("\n暂无章节")
         return
@@ -596,7 +630,7 @@ def _list_chapters(novel_name: str):
     print("-" * 52)
     for row in rows:
         icon = "✓" if row["status"] in (
-            "approved", "force_approved") else "○"
+            CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED) else "○"
         retry = row["retry_count"] or 0
         tag = row["emotion_tag"] or "-"
         print(f"  {icon} 第{row['chapter_num']}章  "
@@ -607,12 +641,11 @@ def _list_chapters(novel_name: str):
 
 
 def _view_tasks(novel_name: str):
-    conn = get_connection(novel_name)
-    rows = conn.execute(
-        "SELECT chapter_num, emotion_tag, status, plot_goal FROM chapter_tasks "
-        "ORDER BY chapter_num LIMIT 30"
-    ).fetchall()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        rows = conn.execute(
+            "SELECT chapter_num, emotion_tag, status, plot_goal FROM chapter_tasks "
+            "ORDER BY chapter_num LIMIT 30"
+        ).fetchall()
     if not rows:
         print("\n暂无任务卡")
         print("提示：旧小说可在继续写作时自动扩展任务卡")
@@ -627,15 +660,14 @@ def _view_tasks(novel_name: str):
 
 
 def _recover_review_failed(novel_name: str):
-    conn = get_connection(novel_name)
-    rows = conn.execute("""
-        SELECT chapter_num, title, plot_goal, emotion_tag, content,
-               retry_count, LENGTH(content) as chars
-        FROM chapters
-        WHERE status='review_failed'
-        ORDER BY chapter_num
-    """).fetchall()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        rows = conn.execute("""
+            SELECT chapter_num, title, plot_goal, emotion_tag, content,
+                   retry_count, LENGTH(content) as chars
+            FROM chapters
+            WHERE status='review_failed'
+            ORDER BY chapter_num
+        """).fetchall()
 
     if not rows:
         print("\n[提示] 当前没有 review_failed 章节")
@@ -649,9 +681,19 @@ def _recover_review_failed(novel_name: str):
               f"重试×{r['retry_count'] or 0}")
 
     try:
-        chapter_num = int(input("\n请输入要处理的章节号（0取消）：").strip())
-    except ValueError:
-        print("[错误] 请输入数字")
+        while True:
+            chapter_num_input = input("\n请输入要处理的章节号（0取消）：").strip()
+            if not chapter_num_input.isdigit():
+                print(f"  ⚠️  无效输入: '{chapter_num_input}' 不是有效的章节号")
+                print(f"  💡 提示: 请输入一个正整数，如 '5' 或 '12'，或输入 '0' 取消")
+                continue
+            chapter_num = int(chapter_num_input)
+            if chapter_num < 0:
+                print(f"  ⚠️  章节号不能为负数，您输入的是 {chapter_num}")
+                continue
+            break
+    except KeyboardInterrupt:
+        print("\n[提示] 已取消操作")
         return
 
     if chapter_num == 0:
@@ -685,16 +727,16 @@ def _recover_review_failed(novel_name: str):
         )
         mm = MemoryManager(novel_name)
         if result.get("pass"):
-            mm.update_chapter_status(chapter_num, "approved")
+            mm.update_chapter_status(chapter_num, CHAPTER_STATUS_APPROVED)
             _update_task_status(novel_name, chapter_num, TASK_COMPLETED)
             if not _has_chapter_summary(novel_name, chapter_num):
                 _save_chapter_memory(
                     novel_name, chapter_num, content, target["plot_goal"] or ""
                 )
             export_chapter(novel_name, chapter_num)
-            print(f"[OK] 第{chapter_num}章已恢复为 approved 并导出")
+            print(f"[OK] 第{chapter_num}章已恢复为 已审核 并导出")
         else:
-            mm.update_chapter_status(chapter_num, "review_failed")
+            mm.update_chapter_status(chapter_num, CHAPTER_STATUS_REVIEW_FAILED)
             _update_task_status(novel_name, chapter_num, TASK_REVIEW_FAILED)
             print(f"[提示] 第{chapter_num}章仍未通过审稿，保持 review_failed")
         return
@@ -713,16 +755,16 @@ def _recover_review_failed(novel_name: str):
                 _save_chapter_memory(novel_name, chapter_num, content, plot_goal)
             export_chapter(novel_name, chapter_num)
             chapter_status = _get_chapter_status(novel_name, chapter_num)
-            if chapter_status in ("approved", "force_approved"):
+            if chapter_status in (CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED):
                 _update_task_status(novel_name, chapter_num, TASK_COMPLETED)
-            elif chapter_status == "review_failed":
+            elif chapter_status == CHAPTER_STATUS_REVIEW_FAILED:
                 _update_task_status(novel_name, chapter_num, TASK_REVIEW_FAILED)
             else:
                 _update_task_status(novel_name, chapter_num, TASK_PENDING)
             print(f"[OK] 第{chapter_num}章重试完成")
         else:
             chapter_status = _get_chapter_status(novel_name, chapter_num)
-            if chapter_status == "review_failed":
+            if chapter_status == CHAPTER_STATUS_REVIEW_FAILED:
                 _update_task_status(novel_name, chapter_num, TASK_REVIEW_FAILED)
             else:
                 _update_task_status(novel_name, chapter_num, TASK_PENDING)
@@ -735,7 +777,7 @@ def _recover_review_failed(novel_name: str):
             print("[错误] 该章节正文为空，无法强制通过")
             return
         mm = MemoryManager(novel_name)
-        mm.update_chapter_status(chapter_num, "force_approved")
+        mm.update_chapter_status(chapter_num, CHAPTER_STATUS_FORCE_APPROVED)
         _update_task_status(novel_name, chapter_num, TASK_COMPLETED)
         if not _has_chapter_summary(novel_name, chapter_num):
             _save_chapter_memory(
@@ -772,6 +814,206 @@ def _change_style(novel_name: str):
     print(f"[OK] 风格已更换为：{AUTHOR_STYLES[choice]['name']}，下一章开始生效")
 
 
+# ★ 需求2：章节删除功能
+def _delete_chapter(novel_name: str):
+    """
+    删除指定章节的数据库记录，重置任务卡为 pending，可重新生成。
+    注意：伏笔记录不自动回滚，摘要压缩历史无法撤销。
+    """
+    with with_db_connection(novel_name) as conn:
+        rows = conn.execute(
+            "SELECT chapter_num, status, LENGTH(content) as chars, emotion_tag "
+            "FROM chapters ORDER BY chapter_num"
+        ).fetchall()
+
+    if not rows:
+        print("\n[提示] 当前没有章节可删除")
+        return
+
+    _list_chapters(novel_name)
+
+    try:
+        while True:
+            chapter_num_input = input("\n请输入要删除的章节号（0取消）：").strip()
+            if not chapter_num_input.isdigit():
+                print(f"  ⚠️  无效输入: '{chapter_num_input}' 不是有效的章节号")
+                print(f"  💡 提示: 请输入一个正整数，如 '5' 或 '12'，或输入 '0' 取消")
+                continue
+            chapter_num = int(chapter_num_input)
+            if chapter_num < 0:
+                print(f"  ⚠️  章节号不能为负数，您输入的是 {chapter_num}")
+                continue
+            break
+    except KeyboardInterrupt:
+        print("\n[提示] 已取消操作")
+        return
+
+    if chapter_num == 0:
+        return
+
+    # 检查章节是否存在
+    with with_db_connection(novel_name) as conn:
+        row = conn.execute(
+            "SELECT chapter_num, status, LENGTH(content) as chars FROM chapters WHERE chapter_num=?",
+            (chapter_num,)
+        ).fetchone()
+
+    if not row:
+        print(f"[错误] 第{chapter_num}章不存在")
+        return
+
+    print(f"\n⚠️  即将执行删除操作:")
+    print(f"   📖 小说: {novel_name}")
+    print(f"   📑 章节: 第{chapter_num}章 ({row['chars'] or 0}字)")
+    print(f"   📊 当前状态: {row['status']}")
+    print(f"   ⚠️  此操作不可撤销！\n")
+
+    confirm = input("确认删除? (输入 'yes' 确认): ").strip().lower()
+    if confirm != 'yes':
+        print("  ✅ 已取消删除操作")
+        return
+
+    confirm2 = input("  最后确认，输入 YES 执行删除：").strip()
+    if confirm2 != "YES":
+        print("  ✅ 已取消删除")
+        return
+
+    # 执行删除
+    mm = MemoryManager(novel_name)
+    mm.delete_chapter(chapter_num)
+
+    # 重置任务卡为 pending
+    _update_task_status(novel_name, chapter_num, TASK_PENDING)
+
+    # 删除导出文件（如果存在）
+    out_file = _output_dir(novel_name) / f"第{str(chapter_num).zfill(3)}章.txt"
+    if out_file.exists():
+        out_file.unlink()
+        print(f"  [OK] 已删除导出文件：{out_file.name}")
+
+    print(f"\n[OK] 第{chapter_num}章已删除，任务卡已重置为 待处理。")
+    print(f"  提示：直接选择「自动生成下一章」时会跳过此章（已有更新章节）。")
+    print(f"  若需重新生成第{chapter_num}章，请先删除第{chapter_num}章之后的所有章节，")
+    print(f"  或通过「恢复审稿失败」入口手动处理。")
+
+
+def _delete_chapters_batch(novel_name: str):
+    """
+    批量删除章节（按范围删除）。
+    复用 _delete_chapter 的核心逻辑，支持批量操作。
+    """
+    with with_db_connection(novel_name) as conn:
+        rows = conn.execute(
+            "SELECT chapter_num, status, LENGTH(content) as chars, emotion_tag "
+            "FROM chapters ORDER BY chapter_num"
+        ).fetchall()
+
+    if not rows:
+        print("\n[提示] 当前没有章节可删除")
+        return
+
+    _list_chapters(novel_name)
+
+    try:
+        print("\n请输入要删除的章节范围（例如：2-5 删除第2到第5章）")
+        range_input = input("输入章节范围（0取消）：").strip()
+        
+        if range_input == "0":
+            return
+        
+        # 解析范围
+        if "-" in range_input:
+            parts = range_input.split("-")
+            start_num = int(parts[0].strip())
+            end_num = int(parts[1].strip())
+        else:
+            # 单个数字的情况
+            start_num = int(range_input)
+            end_num = start_num
+        
+        if start_num <= 0 or end_num <= 0:
+            print("[错误] 章节号必须大于0")
+            return
+        
+        if start_num > end_num:
+            print("[错误] 起始章节不能大于结束章节")
+            return
+        
+        # 检查范围内的章节是否存在
+        existing_chapters = [row["chapter_num"] for row in rows]
+        
+        invalid_chapters = []
+        for i in range(start_num, end_num + 1):
+            if i not in existing_chapters:
+                invalid_chapters.append(i)
+        
+        if invalid_chapters:
+            print(f"[错误] 章节 {invalid_chapters} 不存在")
+            return
+        
+        # 显示将删除的章节信息
+        print(f"\n准备删除第{start_num}章到第{end_num}章，共{end_num - start_num + 1}章")
+        
+        # 获取总字数统计
+        total_chars = 0
+        for row in rows:
+            if start_num <= row["chapter_num"] <= end_num:
+                total_chars += (row["chars"] or 0)
+        
+        print(f"  当前状态：{len([r for r in rows if start_num <= r['chapter_num'] <= end_num])}章")
+        print(f"  总字数：{total_chars}字")
+        print()
+        print("  删除后效果：")
+        print("  - 章节正文和摘要将被清除")
+        print("  - 任务卡状态重置为 pending，可重新生成")
+        print("  - 导出文件（如已存在）将被删除")
+        print("  ⚠ 注意：这些章节已提取的伏笔记录不会自动撤销")
+        print()
+        
+        # 确认删除
+        confirm = input(f"  输入范围 {start_num}-{end_num} 确认删除（其他键取消）：").strip()
+        if confirm != f"{start_num}-{end_num}":
+            print("[取消] 已取消删除")
+            return
+        
+        confirm2 = input("  最后确认，输入 YES 执行删除：").strip()
+        if confirm2 != "YES":
+            print("[取消] 已取消删除")
+            return
+        
+        # 执行批量删除
+        mm = MemoryManager(novel_name)
+        deleted_count = 0
+        deleted_files = []
+        
+        for chapter_num in range(start_num, end_num + 1):
+            # 删除数据库记录
+            mm.delete_chapter(chapter_num)
+            
+            # 重置任务卡为 pending
+            _update_task_status(novel_name, chapter_num, TASK_PENDING)
+            
+            # 删除导出文件（如果存在）
+            out_file = _output_dir(novel_name) / f"第{str(chapter_num).zfill(3)}章.txt"
+            if out_file.exists():
+                out_file.unlink()
+                deleted_files.append(out_file.name)
+            
+            deleted_count += 1
+        
+        print(f"\n[OK] 已删除第{start_num}章到第{end_num}章，共{deleted_count}章")
+        print(f"  任务卡已重置为 pending")
+        if deleted_files:
+            print(f"  已删除导出文件：{len(deleted_files)}个")
+        print(f"  提示：直接选择「自动生成下一章」时会跳过已删除章节（已有更新章节）。")
+        print(f"  若需重新生成这些章节，请通过「恢复review_failed」入口手动处理。")
+        
+    except ValueError:
+        print("[错误] 请输入有效格式（如：2-5 或 3）")
+    except Exception as e:
+        print(f"[错误] 删除失败：{e}")
+
+
 def _delete_novel(novel_name: str) -> bool:
     """
     删除小说，含二次确认。
@@ -781,14 +1023,12 @@ def _delete_novel(novel_name: str) -> bool:
     data_path = _data_dir(novel_name)
     out_path = _output_dir(novel_name)
 
-    # 统计内容
     chapter_count = 0
     try:
-        conn = get_connection(novel_name)
-        chapter_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM chapters"
-        ).fetchone()["cnt"]
-        conn.close()
+        with with_db_connection(novel_name) as conn:
+            chapter_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM chapters"
+            ).fetchone()["cnt"]
     except Exception:
         pass
 
@@ -839,6 +1079,10 @@ def chapters_menu(novel_name: str):
         print("6. 更换写作风格")
         print("7. 查看详细费用统计")
         print("8. 恢复review_failed章节")
+        print("9. 删除章节（重新生成）")
+        print("10. 批量删除章节（按范围）")
+        print("11. 高级模型配置（作者/审核/读者视角模型）")
+        print("12. 查看失败统计与模型切换历史")
         print("0. 返回主菜单")
 
         choice = input("\n请选择：").strip()
@@ -848,12 +1092,27 @@ def chapters_menu(novel_name: str):
 
         elif choice == "2":
             try:
-                count = int(input("批量生成几章？").strip())
-                for i in range(count):
-                    print(f"\n===== 进度：{i+1}/{count} =====")
-                    generate_chapter_auto(novel_name)
-            except ValueError:
-                print("[错误] 请输入数字")
+                while True:
+                    count_input = input("批量生成几章？").strip()
+                    if not count_input.isdigit():
+                        print(f"  ⚠️  无效输入: '{count_input}' 不是有效的数字")
+                        print(f"  💡 提示: 请输入一个正整数，如 '3' 或 '5'")
+                        continue
+                    count = int(count_input)
+                    if count < 1:
+                        print(f"  ⚠️  数量必须 >= 1，您输入的是 {count}")
+                        continue
+                    if count > 50:
+                        print(f"  ⚠️  单次批量生成建议不超过 50 章，您输入的是 {count}")
+                        confirm_batch = input("  确认继续？(y/n): ").strip().lower()
+                        if confirm_batch != 'y':
+                            print("  ✅ 已取消批量生成")
+                            break
+                    break
+                if count >= 1 and count <= 50:
+                    for i in range(count):
+                        print(f"\n===== 进度：{i+1}/{count} =====")
+                        generate_chapter_auto(novel_name)
             except KeyboardInterrupt:
                 print("\n[提示] 已停止批量生成")
 
@@ -876,6 +1135,40 @@ def chapters_menu(novel_name: str):
 
         elif choice == "8":
             _recover_review_failed(novel_name)
+
+        elif choice == "9":
+            _delete_chapter(novel_name)  # ★ 新增
+
+        elif choice == "10":
+            _delete_chapters_batch(novel_name)
+
+        elif choice == "11":
+            from core.api_client import select_all_models_interactive
+            select_all_models_interactive()
+
+        elif choice == "12":
+            from core.api_client import get_failure_stats, get_switch_history
+            from core.api_client import get_author_model, get_reviewer_model, get_reader_reviewer_model
+            print("\n" + "=" * 60)
+            print("  失败统计与模型状态")
+            print("=" * 60)
+            print(f"\n【当前模型】")
+            print(f"  作者模型：{get_author_model()}")
+            print(f"  审核模型：{get_reviewer_model()}")
+            print(f"  读者视角模型：{get_reader_reviewer_model()}")
+            fail_stats = get_failure_stats()
+            print(f"\n【失败计数】")
+            print(f"  作者模型失败：{fail_stats['author_failures']}")
+            print(f"  审核模型失败：{fail_stats['reviewer_failures']}")
+            print(f"  读者视角失败：{fail_stats['reader_reviewer_failures']}")
+            switch_history = get_switch_history()
+            if switch_history:
+                print(f"\n【模型切换历史】（共{len(switch_history)}次）")
+                for i, entry in enumerate(switch_history[-5:], 1):
+                    import datetime
+                    ts = datetime.datetime.fromtimestamp(entry["timestamp"]).strftime("%H:%M:%S")
+                    print(f"  {i}. [{ts}] {entry['type']}: {entry['old_model']} → {entry['new_model']}")
+            print("\n" + "=" * 60)
 
         elif choice == "0":
             from core.api_client import get_session_stats
@@ -900,13 +1193,192 @@ def setup_novel():
 
 
 def _write_novel_info(novel_name: str, genre: str):
-    conn = get_connection(novel_name)
-    conn.execute("""
-        INSERT OR REPLACE INTO novel_info (id, name, genre)
-        VALUES (1, ?, ?)
-    """, (novel_name, genre))
-    conn.commit()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        with DatabaseTransaction(conn):
+            conn.execute("""
+                INSERT OR REPLACE INTO novel_info (id, name, genre)
+                VALUES (1, ?, ?)
+            """, (novel_name, genre))
+
+
+def _extract_field(content: str, field_name: str) -> str:
+    """从文本中提取字段值"""
+    import re
+    pattern = rf'{field_name}[：:]\s*(.+?)(?:\n|$)'
+    match = re.search(pattern, content)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_section(content: str, section_header: str) -> str:
+    """从文本中提取章节内容"""
+    import re
+    pattern = rf'{re.escape(section_header)}\s*\n(.*?)(?=\n【|\Z)'
+    match = re.search(pattern, content, re.DOTALL)
+    if match:
+        text = match.group(1).strip()
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        return '\n'.join(lines)
+    return ""
+
+
+def _import_from_text_file():
+    """从 newbook.txt 导入小说信息"""
+    from pathlib import Path
+
+    txt_path = Path("newbook.txt")
+    if not txt_path.exists():
+        print("\n[错误] 未找到 newbook.txt")
+        print("  请先将文件放在项目根目录（d:\\novel-ai\\）")
+        print("  文件格式参考：newbook_template.txt（如不存在将自动创建）")
+        _create_newbook_template()
+        return None
+
+    try:
+        content = txt_path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"\n[错误] 读取文件失败：{e}")
+        return None
+
+    print(f"\n{'=' * 50}")
+    print(f"  正在解析 newbook.txt...")
+    print(f"{'=' * 50}")
+
+    novel_name = _extract_field(content, "书名")
+    genre = _extract_field(content, "类型")
+    target_chapters_str = _extract_field(content, "目标章数")
+
+    try:
+        target_chapters = int(target_chapters_str) if target_chapters_str else 100
+    except ValueError:
+        target_chapters = 100
+        print(f"  [提示] 未检测到有效目标章数，默认100章")
+
+    outline = _extract_section(content, "【大纲】")
+    characters_text = _extract_section(content, "【主要角色】")
+    world_setting = _extract_section(content, "【世界观设定】")
+    timeline = _extract_section(content, "【时间线】")
+    core_conflict = _extract_section(content, "【核心冲突】")
+
+    if not novel_name:
+        print("\n[错误] 未检测到书名！请在 newbook.txt 中添加：")
+        print("  书名：你的小说名称")
+        return None
+
+    print(f"\n  解析结果预览：")
+    print(f"  {'─' * 40}")
+    print(f"  📖 书名：{novel_name}")
+    print(f"  📂 类型：{genre or '（未指定）'}")
+    print(f"  📊 目标章数：{target_chapters}")
+    print(f"  📝 大纲：{(outline[:80] + '...') if len(outline) > 80 else (outline or '（未提供）')}")
+    print(f"  👥 角色：{(characters_text[:80] + '...') if len(characters_text) > 80 else (characters_text or '（未提供）')}")
+    print(f"  🌍 世界观：{(world_setting[:60] + '...') if len(world_setting) > 60 else (world_setting or '（未提供）')}")
+
+    missing = []
+    if not timeline:
+        missing.append("时间线")
+    if not core_conflict:
+        missing.append("核心冲突")
+    if not outline:
+        missing.append("大纲")
+    if not characters_text:
+        missing.append("主要角色")
+
+    if missing:
+        print(f"\n  ⚠️  检测到缺少以下信息：{', '.join(missing)}")
+        supplement = input(f"  是否现在补充？（y/n，默认y）：").strip().lower() or "y"
+        if supplement == 'y':
+            if "大纲" in missing:
+                outline = input("  请输入大纲内容（可粘贴）：\n").strip()
+            if "主要角色" in missing:
+                characters_text = input("  请输入主要角色信息：\n").strip()
+            if "时间线" in missing:
+                timeline = input("  请输入时间线信息：\n").strip()
+            if "核心冲突" in missing:
+                core_conflict = input("  请输入核心冲突：\n").strip()
+
+    print(f"\n{'─' * 40}")
+    confirm = input(f"  确认导入《{novel_name}》？（yes/NO）：").strip()
+    if confirm.lower() != 'yes':
+        print("  已取消导入")
+        return None
+
+    return {
+        "novel_name": novel_name,
+        "genre": genre,
+        "target_chapters": target_chapters,
+        "outline": outline,
+        "characters_text": characters_text,
+        "world_setting": world_setting,
+        "timeline": timeline,
+        "core_conflict": core_conflict,
+    }
+
+
+def _parse_and_save_characters(mm, characters_text: str):
+    """解析角色文本并保存"""
+    import re
+
+    if not characters_text:
+        print("  [跳过] 角色信息为空")
+        return
+
+    lines = [ln.strip() for ln in characters_text.split('\n') if ln.strip()]
+    character_names = []
+
+    for line in lines:
+        match = re.match(r'^(\d+)[\.、\)\s]+(.+?)(?:[-—–](.+))?$', line)
+        if match:
+            name = match.group(2).strip()
+            character_names.append(name)
+
+    if character_names:
+        char_list = "\n".join([f"- {name}" for name in character_names])
+        (mm.data_dir / "character_names.txt").write_text(
+            f"# 角色名单\n\n{char_list}", encoding="utf-8"
+        )
+        (mm.data_dir / "characters.md").write_text(
+            f"# 人物档案\n\n{characters_text}", encoding="utf-8"
+        )
+        print(f"  [OK] 已保存 {len(character_names)} 个角色")
+
+
+def _create_newbook_template():
+    """创建 newbook.txt 模板文件"""
+    template = """书名：时光当铺
+类型：都市奇幻 / 悬疑
+目标章数：150
+
+【大纲】
+在这里粘贴你从其他AI获取的完整小说大纲...
+（建议包含：故事背景、主要情节线、关键转折点、结局走向）
+
+【主要角色】
+1. 林深（主角）- 心理咨询师，30岁，性格特点...
+2. 顾念（配角）- 当铺掌柜，年龄不详，神秘莫测...
+3. （继续添加其他重要角色）
+
+【世界观设定】
+拾光当铺：一家存在于时间缝隙中的神秘店铺...
+（详细描述你的世界规则、特殊设定、社会结构等）
+
+【时间线】
+- 故事开始：2025年冬，林深事业受挫
+- 核心事件：林深偶然发现当铺
+- 发展阶段：逐渐了解当铺的秘密
+- 高潮：当铺面临关闭危机
+- 结局：林深成为新任掌柜
+
+【核心冲突】
+时间 vs 命运 - 主角能否改变过去的悲剧？
+（描述推动故事发展的核心矛盾和冲突）
+"""
+
+    from pathlib import Path
+    template_path = Path("newbook_template.txt")
+    if not template_path.exists():
+        template_path.write_text(template, encoding="utf-8")
+        print(f"  ✨ 已创建模板文件：{template_path}")
+        print(f"     可复制该文件并重命名为 newbook.txt 填写内容")
 
 
 def main():
@@ -918,21 +1390,76 @@ def main():
     select_model_interactive()
 
     while True:
-        print("1. 新建小说")
+        print("\n1. 新建小说")
         print("2. 继续写作已有小说")
         print("3. 删除小说")
+        print("4. 高级模型配置（分别设置作者/审核/读者视角模型）")
         print("0. 退出")
 
         choice = input("\n请选择：").strip()
 
         if choice == "1":
-            novel_name, genre, keywords = setup_novel()
+            print("\n新建小说方式：")
+            print("  1. 交互式创建（向导模式）")
+            print("  2. 从文本文件导入（newbook.txt）")
 
-            from core.db import init_database
-            init_database(novel_name)
-            _write_novel_info(novel_name, genre)
+            mode = input("请选择（默认1）：").strip() or "1"
 
-            _, style_key = run_planner(novel_name, genre, keywords)
+            if mode == "2":
+                import_data = _import_from_text_file()
+                if not import_data:
+                    continue
+
+                novel_name = import_data["novel_name"]
+                genre = import_data["genre"]
+
+                from core.db import init_database
+                init_database(novel_name)
+                _write_novel_info(novel_name, genre)
+
+                mm = MemoryManager(novel_name)
+
+                if import_data.get("outline"):
+                    (mm.data_dir / "master_outline.md").write_text(
+                        f"# 总大纲\n\n{import_data['outline']}", encoding="utf-8"
+                    )
+                    print(f"  [OK] 大纲已保存")
+
+                if import_data.get("world_setting"):
+                    mm.save_world_settings(import_data["world_setting"])
+                    print(f"  [OK] 世界观已保存")
+
+                if import_data.get("characters_text"):
+                    _parse_and_save_characters(mm, import_data["characters_text"])
+
+                style_key = get_style_choice()
+                (mm.data_dir / "style.txt").write_text(style_key, encoding="utf-8")
+
+                target_chapters = import_data.get("target_chapters", 100)
+                (mm.data_dir / "target_chapters.txt").write_text(
+                    str(target_chapters), encoding="utf-8"
+                )
+
+                split_outline_to_tasks(
+                    import_data.get("outline", ""), novel_name,
+                    target_chapters=target_chapters,
+                    full_batch=True,
+                )
+
+                print(f"\n{'=' * 50}")
+                print(f"✅ 导入完成！《{novel_name}》已就绪")
+                print(f"目标篇幅：{target_chapters}章 | 任务卡：{target_chapters}张")
+                print(f"{'=' * 50}\n")
+
+                chapters_menu(novel_name)
+            else:
+                novel_name, genre, keywords = setup_novel()
+
+                from core.db import init_database
+                init_database(novel_name)
+                _write_novel_info(novel_name, genre)
+
+                _, style_key = run_planner(novel_name, genre, keywords)
 
             style_path = _data_dir(novel_name) / "style.txt"
             style_path.write_text(style_key, encoding="utf-8")
@@ -955,12 +1482,24 @@ def main():
                 print(f"{i}. {name}{genre_display}")
 
             try:
-                idx = int(input("\n请选择编号：").strip()) - 1
+                while True:
+                    idx_input = input("\n请选择编号：").strip()
+                    if not idx_input.isdigit():
+                        print(f"  ⚠️  无效输入: '{idx_input}' 不是有效的编号")
+                        print(f"  💡 提示: 请输入列表中的数字编号，如 '1' 或 '2'")
+                        continue
+                    idx = int(idx_input) - 1
+                    if idx < 0 or idx >= len(novels):
+                        print(f"  ⚠️  编号超出范围，有效范围: 1-{len(novels)}")
+                        continue
+                    break
                 novel_name = novels[idx][0]
                 print(f"\n继续写作《{novel_name}》")
                 chapters_menu(novel_name)
             except (ValueError, IndexError):
-                print("[错误] 无效选择")
+                print("  ⚠️  无效选择，请重新输入")
+            except KeyboardInterrupt:
+                print("\n[提示] 已取消操作")
 
         elif choice == "3":
             novels = _list_novels()
@@ -973,13 +1512,31 @@ def main():
                 print(f"{i}. {name}")
 
             try:
-                idx = int(input("\n请选择要删除的编号（0取消）：").strip())
+                while True:
+                    idx_input = input("\n请选择要删除的编号（0取消）：").strip()
+                    if not idx_input.isdigit():
+                        print(f"  ⚠️  无效输入: '{idx_input}' 不是有效的编号")
+                        print(f"  💡 提示: 请输入列表中的数字编号，或 '0' 取消")
+                        continue
+                    idx = int(idx_input)
+                    if idx == 0:
+                        break
+                    if idx < 1 or idx > len(novels):
+                        print(f"  ⚠️  编号超出范围，有效范围: 0-{len(novels)}")
+                        continue
+                    break
                 if idx == 0:
                     continue
                 novel_name = novels[idx - 1][0]
                 _delete_novel(novel_name)
             except (ValueError, IndexError):
-                print("[错误] 无效选择")
+                print("  ⚠️  无效选择，请重新输入")
+            except KeyboardInterrupt:
+                print("\n[提示] 已取消操作")
+
+        elif choice == "4":
+            from core.api_client import select_all_models_interactive
+            select_all_models_interactive()
 
         elif choice == "0":
             from core.api_client import get_session_stats, print_session_stats

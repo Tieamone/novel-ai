@@ -1,5 +1,6 @@
-﻿import sys
+import sys
 import os
+import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import re
@@ -10,9 +11,23 @@ from core.config_loader import get_output_dir
 
 SENSITIVE_WORDS_PATH = Path("sensitive_words.txt")
 
+_sensitive_words_cache = None
+_sensitive_words_cache_time = 0
+_sensitive_words_pattern = None
 
-def load_sensitive_words() -> list:
+
+def load_sensitive_words(cache_seconds: int = 300) -> list:
+    global _sensitive_words_cache, _sensitive_words_cache_time, _sensitive_words_pattern
+
+    current_time = time.time()
+    if (_sensitive_words_cache is not None and
+            current_time - _sensitive_words_cache_time < cache_seconds):
+        return _sensitive_words_cache
+
     if not SENSITIVE_WORDS_PATH.exists():
+        _sensitive_words_cache = []
+        _sensitive_words_cache_time = current_time
+        _sensitive_words_pattern = None
         return []
 
     words = []
@@ -21,6 +36,17 @@ def load_sensitive_words() -> list:
         if not line or line.startswith("#"):
             continue
         words.append(line)
+
+    _sensitive_words_cache = words
+    _sensitive_words_cache_time = current_time
+
+    if len(words) > 100:
+        _sensitive_words_pattern = re.compile(
+            '|'.join(re.escape(w) for w in words)
+        )
+    else:
+        _sensitive_words_pattern = None
+
     return words
 
 
@@ -30,8 +56,20 @@ def clean_for_export(text: str) -> str:
     text = re.sub(r'\*([^*\n]+)\*', r'\1', text)
     text = re.sub(r'^\s*-{3,}\s*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'\n{3,}', '\n\n', text)
-    for word in load_sensitive_words():
-        text = text.replace(word, '*' * len(word))
+
+    words = load_sensitive_words()
+    if not words or not text:
+        return text.strip()
+
+    global _sensitive_words_pattern
+    if _sensitive_words_pattern is not None:
+        text = _sensitive_words_pattern.sub(
+            lambda m: '*' * len(m.group()), text
+        )
+    else:
+        for word in words:
+            text = text.replace(word, '*' * len(word))
+
     return text.strip()
 
 
@@ -58,13 +96,13 @@ def export_chapter(novel_name: str, chapter_num: int) -> str:
 
 
 def export_all(novel_name: str) -> list:
-    conn = get_connection(novel_name)
-    rows = conn.execute(
-        "SELECT chapter_num FROM chapters "
-        "WHERE status IN ('approved','force_approved') "
-        "ORDER BY chapter_num"
-    ).fetchall()
-    conn.close()
+    from core.utils import with_db_connection
+    with with_db_connection(novel_name) as conn:
+        rows = conn.execute(
+            "SELECT chapter_num FROM chapters "
+            "WHERE status IN ('approved','force_approved') "
+            "ORDER BY chapter_num"
+        ).fetchall()
 
     results = []
     for row in rows:

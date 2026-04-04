@@ -38,3 +38,7 @@ Thumbs.db
 .env
 *.log
 *.db
+
+# Ignore generated outputs and sensitive local files
+output/
+sensitive_words.txt

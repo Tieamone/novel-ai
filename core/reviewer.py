@@ -1,45 +1,65 @@
-﻿import sys
+import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import json
 import re
-from core.api_client import call_api
+from core.api_client import call_reviewer_api, increment_failure_counter, reset_failure_counter, check_switch_needed
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg
+from core.reader_reviewer import reader_review_chapter
+from core.utils import with_db_connection, DatabaseTransaction, execute_with_retry
 
 REVIEW_PASS_TOTAL = 75
 REVIEW_PASS_L1 = 30
 
-REVIEWER_SYSTEM = """你是一位严格的网络小说责任编辑，职责是判断章节是否可发布。
+REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职责是判断章节是否达到发布标准。
+
+你深知好的网文应该具备哪些特质：
+- 情节推进有逻辑，人物行为有动机
+- 场景有具体的感官细节，而非空泛描述
+- 对话有潜台词，不是说明书式的信息传递
+- 情绪通过行为和生理反应展示，而不是直接贴标签
+- 每章结束时，读者会忍不住往下翻
 
 必须执行三层评分并给出结构化归因：
 
 【L1 逻辑与设定一致性】0-45分
-- 人物行为是否符合既有人设（避免核心OOC）
-- 时间线与因果是否自洽
-- 是否存在硬设定冲突（世界规则/生死状态/关键事实）
+- 人物行为是否符合既有人设（避免核心OOC，即无原因的性格突变）
+- 时间线与因果是否自洽（前后矛盾、逻辑跳跃）
+- 是否存在硬设定冲突（世界规则/生死状态/关键已知事实）
+- 场景连贯性：上一章的状态与本章开头是否衔接正常
 
 【L2 伏笔与剧情承接】0-25分
 - 历史未兑现伏笔是否被无视或误解
-- 新增伏笔是否自然、是否服务后续
-- 本章是否完成“目标导向推进”
+- 新增伏笔是否自然嵌入、服务后续
+- 本章是否完成"目标导向推进"（任务卡目标是否达成）
+- 章节内部因果是否完整：有起因、有经过、有结果或悬念
 
 【L3 可读性与网文节奏】0-30分
-- 是否存在注水、重复表达
-- 是否具备有效冲突推进/信息推进
-- 结尾是否形成阅读驱动力
+- 是否存在注水或重复表达（换了个词说同一件事，扣3-5分）
+- 是否具备有效冲突推进或信息推进
+- 结尾是否形成阅读驱动力（读者想继续看）
+- 是否存在比喻/修辞堆砌（平叙段每500字超过2处，或相邻段落出现结构相似比喻句，扣5-8分，code: metaphor_overload）
+- 是否缺少实质性对话（全章少于2轮有来有回的对话，扣3-5分）
+- 是否存在情绪标签化问题：直接用"她感到紧张/他心中涌起暖意"等方式陈述情绪，而非通过行为/生理反应展示（每处扣2-3分，code: emotion_labeling）
+- 结尾是否使用模板化收束句（"才刚刚开始"/"还很长"/"无论前方"类，扣3-5分，code: cliche_ending）
 
-一票否决项（任一命中即不通过）：
-1) 核心设定冲突（setting_conflict）
-2) 重大时间线矛盾（timeline_break）
-3) 主角或核心角色严重OOC（core_ooc）
-4) 关键承诺伏笔被硬性遗忘且导致断裂（critical_payoff_missing）
+一票否决项（任一命中即不通过，不受分数影响）：
+1) 核心设定冲突（setting_conflict）：与已建立的世界规则或关键事实直接矛盾
+2) 重大时间线矛盾（timeline_break）：事件顺序或时间跨度出现无法自圆其说的矛盾
+3) 主角或核心角色严重OOC（core_ooc）：无任何触发事件的性格或立场突变
+4) 关键承诺伏笔被硬性遗忘导致断裂（critical_payoff_missing）：读者已有强烈预期的伏笔被无视
 
 通过条件（同时满足）：
 - veto_items 为空
 - score_total >= 75
 - score_l1 >= 30
+
+评分注意事项：
+- L3分项问题可叠加扣分，但总分不得低于0
+- 如果某层没有问题，该层应给出接近满分的评分，不要无故扣分
+- 通过时 suggestions 写"质量合格"，不通过时给出可执行的修订建议
 
 严格只输出JSON，不要解释，不要Markdown：
 {
@@ -49,17 +69,17 @@ REVIEWER_SYSTEM = """你是一位严格的网络小说责任编辑，职责是�
   "score_l2": 0-25整数,
   "score_l3": 0-30整数,
   "veto_items": [
-    {"code": "setting_conflict|timeline_break|core_ooc|critical_payoff_missing", "reason": "命中理由"}
+    {"code": "setting_conflict|timeline_break|core_ooc|critical_payoff_missing", "reason": "命中理由（需引用正文具体段落）"}
   ],
-  "l1_issues": ["问题描述"],
-  "l2_issues": ["问题描述"],
-  "l3_issues": ["问题描述"],
+  "l1_issues": ["具体问题描述"],
+  "l2_issues": ["具体问题描述"],
+  "l3_issues": ["具体问题描述，注明是哪种类型（metaphor_overload/emotion_labeling/cliche_ending/注水/缺对话等）"],
   "failure_attribution": {
     "primary_layer": "L1|L2|L3|none",
-    "root_cause": "最关键失败原因，若通过写none",
+    "root_cause": "最关键失败原因（一句话），若通过写none",
     "severity": "high|medium|low|none"
   },
-  "suggestions": "失败时给出可执行修订建议；通过写质量合格"
+  "suggestions": "失败时给出具体可执行的修订建议（指出需要改哪段、怎么改）；通过写质量合格"
 }"""
 
 
@@ -202,6 +222,12 @@ def _normalize_failure_attribution(value, passed: bool,
     }
 
 
+def _is_transient_error(error):
+    """判断是否为暂时性错误（可重试恢复）"""
+    transient_keywords = ["timeout", "locked", "rate limit", "503", "502", "429"]
+    return any(kw in str(error).lower() for kw in transient_keywords)
+
+
 def _rule_pass(score_total: int, score_l1: int, veto_items: list) -> bool:
     return (not veto_items and
             score_total >= REVIEW_PASS_TOTAL and
@@ -275,6 +301,8 @@ def _normalize_review_result(raw_result: dict) -> dict:
     if all_issues:
         retry_lines.append("问题清单：")
         retry_lines.extend([f"- {x}" for x in all_issues[:6]])
+    if suggestions and suggestions != "质量合格":
+        retry_lines.append(f"修订建议：{suggestions}")
     retry_hint = "\n".join(retry_lines).strip()
 
     return {
@@ -313,36 +341,71 @@ def _persist_review_result(mm: MemoryManager, chapter_num: int, result: dict):
         print(f"  [警告] 审稿结果写入数据库失败：{e}")
 
 
+def _truncate_for_review(text: str, max_len: int = 3000) -> str:
+    """智能截断审稿内容：优先保留开头完整段落"""
+    if len(text) <= max_len:
+        return text
+
+    # 策略1: 尝试按段落截断（保留完整段落）
+    paragraphs = text.split('\n\n')
+    result = []
+    current_len = 0
+
+    for para in paragraphs:
+        if current_len + len(para) > max_len * 0.8:
+            break
+        result.append(para)
+        current_len += len(para) + 2
+
+    # 如果已收集足够内容（>70%），返回开头部分
+    if current_len >= max_len * 0.7:
+        return '\n\n'.join(result)
+
+    # 策略2: 首尾保留
+    half = max_len // 2
+    return text[:half] + "\n\n[... 中间部分已省略 ...]\n\n" + text[-half:]
+
+
 def build_review_prompt(ctx: dict, chapter_num: int,
                         content: str, plot_goal: str) -> str:
     chars = ctx.get("characters", [])
     chars_str = "\n".join([
         f"【{c.get('name', '未命名角色')}】"
-        f"性格：{c.get('personality', '未记录')}｜"
-        f"状态：{c.get('current_status', '未记录')}｜"
-        f"关系：{json.dumps(c.get('relationships', {}), ensure_ascii=False)}"
+        f"性格：{c.get('personality', '未记录')[:80]}｜"
+        f"状态：{c.get('current_status', '未记录')[:60]}｜"
+        f"位置：{c.get('current_location', '未记录')}｜"
+        f"关系：{json.dumps(c.get('relationships', {}), ensure_ascii=False)[:100]}"
         for c in chars
     ]) if chars else "（暂无人物设定）"
 
     foreshadow = ctx.get("active_foreshadowing", [])
     f_str = "\n".join(
-        [f"- {f.get('fid', '未知ID')}: {f.get('description', '')}" for f in foreshadow]
+        [f"- [{f.get('fid', '?')}] {f.get('description', '')}" for f in foreshadow[:8]]
     ) if foreshadow else "（暂无）"
+
+    recent = ctx.get("recent_summaries", [])
+    recent_str = ""
+    if recent:
+        last = recent[-1]
+        recent_str = f"\n上一章概要：{last.get('summary', '')[:200]}"
 
     return f"""=== 审稿任务 ===
 章节：第{chapter_num}章
-本章目标：{plot_goal}
+本章目标（任务卡）：{plot_goal}
 
-=== 人物设定 ===
+=== 人物设定（核对OOC和状态连贯性）===
 {chars_str}
 
-=== 未兑现伏笔 ===
+=== 未兑现伏笔（核对是否被忽略）===
 {f_str}
+
+=== 前情概要（核对衔接）===
+{recent_str or "（首章或无近期摘要）"}
 
 === 待审正文 ===
 {content}
 
-请先逐层评估再给最终JSON结论。"""
+请逐层评估后给出最终JSON结论。评分时要公正：做得好的层不要无故扣分，有问题的层要指出具体段落。"""
 
 
 def review_chapter(novel_name: str, chapter_num: int,
@@ -350,24 +413,44 @@ def review_chapter(novel_name: str, chapter_num: int,
     mm = MemoryManager(novel_name)
     ctx = mm.load_context(chapter_num)
 
-    print(f"  正在审稿第{chapter_num}章...")
+    print(f"  [责任编辑] 正在审稿第{chapter_num}章...")
     prompt = build_review_prompt(ctx, chapter_num, content, plot_goal)
 
-    raw = call_api(
-        system_prompt=REVIEWER_SYSTEM,
-        user_message=prompt,
-        temperature=0.3,
-        max_tokens=1400,
-    )
+    try:
+        raw = call_reviewer_api(
+            system_prompt=REVIEWER_SYSTEM,
+            user_message=prompt,
+            temperature=0.25,
+            max_tokens=1600,
+        )
+    except Exception as e:
+        if _is_transient_error(e):
+            print(f"  [责任编辑] ⚠️ 审稿遇到暂时性问题: {str(e)[:100]}")
+            print(f"  [责任编辑] 💡 建议稍后手动重新审稿此章节")
+            mm.update_chapter_status(chapter_num, "pending_review")
+            increment_failure_counter("reviewer")
+            return _review_error_result(
+                message=f"审稿遇到暂时性错误（{type(e).__name__}），请重试",
+                issue="审稿API调用失败（暂时性）"
+            )
+        else:
+            print(f"\n❌ [责任编辑] 审稿失败（严重错误）")
+            print(f"   详情: {str(e)[:200]}")
+            increment_failure_counter("reviewer")
+            return _review_error_result(
+                message="审稿服务不可用，请检查配置后重试",
+                issue="审稿API调用失败（严重错误）"
+            )
 
     parsed = _extract_json_obj(raw)
     if not parsed:
-        print("  [警告] 审稿返回格式异常，本轮判定为不通过")
+        print("  [责任编辑] 审稿返回格式异常，本轮判定为不通过")
         error_result = _review_error_result(
             message="审稿结果格式异常，请重试",
             issue="审稿结果格式异常，无法解析",
         )
         _persist_review_result(mm, chapter_num, error_result)
+        increment_failure_counter("reviewer")
         return error_result
 
     result = _normalize_review_result(parsed)
@@ -375,12 +458,12 @@ def review_chapter(novel_name: str, chapter_num: int,
 
     status = "通过" if result.get("pass") else "不通过"
     print(
-        f"  [审稿结果] {status} | 总分：{result['score_total']}/100 "
+        f"  [责任编辑] {status} | 总分：{result['score_total']}/100 "
         f"(L1:{result['score_l1']}/45 L2:{result['score_l2']}/25 "
         f"L3:{result['score_l3']}/30)"
     )
     if result.get("veto_triggered"):
-        print("  [一票否决] 已触发：")
+        print("  [责任编辑] 一票否决：")
         for item in result.get("veto_reasons", []):
             print(f"    - {item}")
 
@@ -396,52 +479,209 @@ def review_chapter(novel_name: str, chapter_num: int,
         issues = (result.get("l1_issues", []) +
                   result.get("l2_issues", []) +
                   result.get("l3_issues", []))
-        for issue in issues:
+        for issue in issues[:5]:
             print(f"    - {issue}")
+        if result.get("suggestions") and result["suggestions"] != "质量合格":
+            print(f"  [建议] {result['suggestions'][:200]}")
+        increment_failure_counter("reviewer")
+    else:
+        reset_failure_counter("reviewer")
 
     return result
+
+
+def _update_status_safe(novel_name: str, chapter_num: int, status: str):
+    """
+    安全更新章节状态（带重试的原子操作）。
+    用于 write_and_review 中的状态流转，确保并发安全。
+    """
+    from datetime import datetime
+    with with_db_connection(novel_name) as conn:
+        with DatabaseTransaction(conn):
+            execute_with_retry(conn, """
+                UPDATE chapters SET status=?, updated_at=?
+                WHERE chapter_num=?
+            """, (status, datetime.now(), chapter_num))
+
+
+def _increment_retry_safe(novel_name: str, chapter_num: int):
+    """安全递增重试计数（带重试的原子操作）。"""
+    with with_db_connection(novel_name) as conn:
+        with DatabaseTransaction(conn):
+            execute_with_retry(conn, """
+                UPDATE chapters SET retry_count = retry_count + 1
+                WHERE chapter_num=?
+            """, (chapter_num,))
 
 
 def write_and_review(novel_name: str, chapter_num: int,
                      plot_goal: str, emotion_tag: str = "铺垫",
                      max_retry: int = None) -> str:
+    """
+    写作→审稿（责任编辑+读者视角）→保存 的完整流程。
+
+    并发安全保障：
+    - 入口标记状态为 'writing'，标识正在处理中
+    - 所有数据库状态变更使用 execute_with_retry 防锁定失败
+    - 异常路径保证状态回退到确定性的终态（approved/force_approved/review_failed）
+    - 绝不会停留在中间不一致状态
+    """
     from core.writer import write_chapter
+    from core.api_client import get_failure_stats, check_switch_needed, get_switch_history
 
     if max_retry is None:
         max_retry = cfg("novel", "max_retry", 3)
 
     mm = MemoryManager(novel_name)
+    content = None
+
+    try:
+        _update_status_safe(novel_name, chapter_num, "writing")
+    except Exception as e:
+        print(f"  [警告] 状态标记 writing 失败（非致命）：{e}")
 
     for attempt in range(max_retry):
         print(f"\n  第{attempt+1}次写作尝试...")
-        content = write_chapter(novel_name, chapter_num,
-                                plot_goal, emotion_tag)
+
+        try:
+            content = write_chapter(novel_name, chapter_num,
+                                    plot_goal, emotion_tag)
+            reset_failure_counter("author")
+        except Exception as e:
+            print(f"  [错误] 写作调用失败：{e}")
+            increment_failure_counter("author")
+            if check_switch_needed("author"):
+                print(f"\n{'='*60}")
+                print(f"  [提示] 作者模型连续失败，建议切换模型")
+                print(f"{'='*60}")
+                from core.api_client import select_all_models_interactive, _select_single_model
+                print("\n是否切换作者模型？(y/n，默认y)")
+                choice = input().strip().lower() or "y"
+                if choice == "y":
+                    print("\n【选择新的作者模型】")
+                    author_choice = _select_single_model("作者模型", default="1")
+                    from core.api_client import set_author_model
+                    set_author_model(author_choice["model"], author_choice["provider"])
+                    reset_failure_counter("author")
+            continue
 
         result = review_chapter(novel_name, chapter_num,
                                 content, plot_goal)
 
-        if result.get("pass"):
-            print(f"  [OK] 第{chapter_num}章审稿通过！")
-            mm.update_chapter_status(chapter_num, "approved")
-            return content
-        else:
-            # 记录重试次数
-            mm.increment_retry_count(chapter_num)
+        if not result.get("pass"):
+            print(f"\n  [重写] 责任编辑不通过（{result.get('score_total', 0)}/100），跳过读者视角评估")
+            try:
+                _increment_retry_safe(novel_name, chapter_num)
+            except Exception as e:
+                print(f"  [警告] 重试计数更新失败（非致命）：{e}")
+                mm.increment_retry_count(chapter_num)
 
             if attempt < max_retry - 1:
                 retry_feedback = _build_retry_feedback(result)
                 if retry_feedback:
                     plot_goal = (
-                        f"{plot_goal}\n\n上次问题（必须修复）：\n{retry_feedback}"
+                        f"{plot_goal}\n\n"
+                        f"【上次写作问题（责任编辑），本次必须修复】\n{retry_feedback}"
                     )
-                print(f"  [重写] 准备第{attempt+2}次写作...")
+                print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
             else:
                 if result.get("review_error"):
-                    print(f"  [错误] 审稿连续{max_retry}次异常，停止自动通过")
-                    mm.update_chapter_status(chapter_num, "review_failed")
+                    print(f"  [错误] 审稿连续{max_retry}次异常，停止")
+                    try:
+                        _update_status_safe(novel_name, chapter_num, "审稿失败")
+                    except Exception as e:
+                        print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+                        mm.update_chapter_status(chapter_num, "审稿失败")
                     return ""
-                print(f"  [警告] 连续{max_retry}次未通过，保留最后版本")
-                mm.update_chapter_status(chapter_num, "force_approved")
+                
+                print(f"\n{'='*60}")
+                print(f"  [提示] 连续{max_retry}次未通过！")
+                print(f"  建议切换到更强的模型后重新生成此章节")
+                print(f"{'='*60}")
+                
+                from core.api_client import select_all_models_interactive, _select_single_model
+                print("\n是否切换模型？(y/n，默认y)")
+                choice = input().strip().lower() or "y"
+                if choice == "y":
+                    print("\n【选择新的写作/审稿模型】")
+                    model_choice = _select_single_model("综合模型", default="1")
+                    from core.api_client import set_author_model, set_reviewer_model
+                    set_author_model(model_choice["model"], model_choice["provider"])
+                    set_reviewer_model(model_choice["model"], model_choice["provider"])
+                    reset_failure_counter("author")
+                    reset_failure_counter("reviewer")
+                    print(f"\n  [OK] 已切换至 {model_choice['name']}")
+                    print(f"  请在主菜单中选择「恢复review_failed」重新生成第{chapter_num}章")
+                    
+                print(f"  [警告] 保留最后版本（强制通过）")
+                try:
+                    _update_status_safe(novel_name, chapter_num, "强制通过")
+                except Exception as e:
+                    print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+                    mm.update_chapter_status(chapter_num, "强制通过")
                 return content
 
-    return ""
+        reader_result = reader_review_chapter(novel_name, chapter_num, content)
+
+        if reader_result.get("pass"):
+            print(f"\n  [OK] 第{chapter_num}章双重审核通过！")
+            try:
+                _update_status_safe(novel_name, chapter_num, "已审核")
+            except Exception as e:
+                print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+                mm.update_chapter_status(chapter_num, "已审核")
+            return content
+        else:
+            print(f"\n  [重写] 读者视角不通过（{reader_result.get('score_total', 0)}/100）")
+            try:
+                _increment_retry_safe(novel_name, chapter_num)
+            except Exception as e:
+                print(f"  [警告] 重试计数更新失败（非致命）：{e}")
+                mm.increment_retry_count(chapter_num)
+
+            if attempt < max_retry - 1:
+                retry_feedback = _build_retry_feedback(result)
+                reader_feedback = "\n【读者视角反馈】\n" + "\n".join([f"- {i}" for i in reader_result.get("issues", [])])
+                retry_feedback = (retry_feedback or "") + reader_feedback
+                if retry_feedback:
+                    plot_goal = (
+                        f"{plot_goal}\n\n"
+                        f"【上次写作问题（读者视角），本次必须修复】\n{retry_feedback}"
+                    )
+                print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
+            else:
+                print(f"\n{'='*60}")
+                print(f"  [提示] 连续{max_retry}次未通过！")
+                print(f"  建议切换到更强的模型后重新生成此章节")
+                print(f"{'='*60}")
+                
+                from core.api_client import select_all_models_interactive, _select_single_model
+                print("\n是否切换模型？(y/n，默认y)")
+                choice = input().strip().lower() or "y"
+                if choice == "y":
+                    print("\n【选择新的写作/审稿模型】")
+                    model_choice = _select_single_model("综合模型", default="1")
+                    from core.api_client import set_author_model, set_reviewer_model
+                    set_author_model(model_choice["model"], model_choice["provider"])
+                    set_reviewer_model(model_choice["model"], model_choice["provider"])
+                    reset_failure_counter("author")
+                    reset_failure_counter("reviewer")
+                    print(f"\n  [OK] 已切换至 {model_choice['name']}")
+                    print(f"  请在主菜单中选择「恢复审稿失败」重新生成第{chapter_num}章")
+
+                print(f"  [警告] 保留最后版本（强制通过）")
+                try:
+                    _update_status_safe(novel_name, chapter_num, "强制通过")
+                except Exception as e:
+                    print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+                    mm.update_chapter_status(chapter_num, "强制通过")
+                return content
+
+    if check_switch_needed("author") or check_switch_needed("reviewer"):
+        print(f"\n{'='*60}")
+        print(f"  [提示] 检测到多次失败，建议检查模型配置")
+        fail_stats = get_failure_stats()
+        print(f"  失败统计：作者={fail_stats['author_failures']} 审核={fail_stats['reviewer_failures']} 读者视角={fail_stats['reader_reviewer_failures']}")
+        print(f"{'='*60}")
+
+    return content

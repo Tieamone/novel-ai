@@ -1,12 +1,26 @@
 model:
   max_tokens: 4096
+  author:
+    default_model: qwen3.6-plus
+    # ⭐ 推荐主模型：128K超长上下文，写作质量最高
+  reviewer:
+    default_model: qwen3.6-plus
+    # 使用 qwen3.6-plus 支持 128K 上下文窗口
+    # 可处理超长章节（>5000字）而不需要截断
+  reader_reviewer:
+    default_model: qwen3.6-plus
+    enabled: true
+    pass_threshold: 75
 
 novel:
-  chapter_word_target: 3000
+  chapter_word_target: 3500   # 目标字数（中间值）
+  chapter_word_min: 3000      # 最小字数（低于此值触发补写）
+  chapter_word_max: 4000      # 最大字数（达到此值停止补写，提示模型控制在此范围内）
   max_retry: 3
   recent_summary_count: 5
   compress_after_chapters: 20
   pre_split_chapters: 50
+  failure_switch_threshold: 3
 
 paths:
   data_dir: data
