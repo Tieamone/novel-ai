@@ -535,6 +535,9 @@ def write_and_review(novel_name: str, chapter_num: int,
     mm = MemoryManager(novel_name)
     content = None
 
+    MAX_REVIEW_RETRIES = 3
+    review_retry_count = 0
+
     try:
         _update_status_safe(novel_name, chapter_num, "writing")
     except Exception as e:
@@ -568,6 +571,30 @@ def write_and_review(novel_name: str, chapter_num: int,
         result = review_chapter(novel_name, chapter_num,
                                 content, plot_goal)
 
+        if result.get("review_error"):
+            review_retry_count += 1
+            issue_msg = result.get('issue') or result.get('retry_hint', '未知错误')
+            if review_retry_count <= MAX_REVIEW_RETRIES:
+                print(f"\n  [重试审稿] 责任编辑返回异常（{issue_msg}），第{review_retry_count}/{MAX_REVIEW_RETRIES}次重试...")
+                increment_failure_counter("reviewer")
+                if check_switch_needed("reviewer"):
+                    print(f"\n{'='*60}")
+                    print(f"  [提示] 审稿模型连续异常，建议切换模型")
+                    print(f"{'='*60}")
+                    from core.api_client import select_all_models_interactive, _select_single_model
+                    print("\n是否切换审稿模型？(y/n，默认y)")
+                    choice = input().strip().lower() or "y"
+                    if choice == "y":
+                        print("\n【选择新的审稿模型】")
+                        reviewer_choice = _select_single_model("审稿模型", default="1")
+                        from core.api_client import set_reviewer_model
+                        set_reviewer_model(reviewer_choice["model"], reviewer_choice["provider"])
+                        reset_failure_counter("reviewer")
+                continue
+            else:
+                print(f"\n  [错误] 审稿连续{MAX_REVIEW_RETRIES}次异常，降级为不通过处理")
+                pass  # 降到下面的 if not result.get("pass") 分支触发重写
+
         if not result.get("pass"):
             print(f"\n  [重写] 责任编辑不通过（{result.get('score_total', 0)}/100），跳过读者视角评估")
             try:
@@ -584,6 +611,8 @@ def write_and_review(novel_name: str, chapter_num: int,
                         f"【上次写作问题（责任编辑），本次必须修复】\n{retry_feedback}"
                     )
                 print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
+                print(f"  ⏭️ [DEBUG] 跳过读者视角评估，进入第{attempt+2}次写作循环")
+                continue  # ✅ 修复Bug2: 跳过读者视角，进入下一次写作
             else:
                 if result.get("review_error"):
                     print(f"  [错误] 审稿连续{max_retry}次异常，停止")
@@ -625,6 +654,7 @@ def write_and_review(novel_name: str, chapter_num: int,
 
         if reader_result.get("pass"):
             print(f"\n  [OK] 第{chapter_num}章双重审核通过！")
+            review_retry_count = 0
             try:
                 _update_status_safe(novel_name, chapter_num, "已审核")
             except Exception as e:

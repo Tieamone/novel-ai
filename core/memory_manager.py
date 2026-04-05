@@ -166,6 +166,71 @@ class MemoryManager:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_foreshadow_hints(self, chapter_num: int) -> list:
+        """
+        根据当前章节号，智能匹配应该在本章处理（兑现/铺垫）的伏笔。
+        
+        匹配规则：
+        1. expected_redeem 包含当前章节号或范围（如"第10-15章"，当前是12章）
+        2. expected_redeem 为"待定"或模糊表述的，按时间顺序优先展示近期该处理的
+        3. 返回格式化的提示字符串列表
+        
+        Returns:
+            list: 适合直接放入提示词的伏笔提示字符串列表
+        """
+        import re
+
+        all_active = self.load_active_foreshadowing()
+        hints = []
+
+        for f in all_active:
+            fid = f.get('fid', '')
+            desc = f.get('description', '')
+            expected = f.get('expected_redeem', '待定')
+            planted_at = f.get('plant_chapter', 0)
+
+            should_handle = False
+            handle_type = "铺垫"
+
+            if not expected or expected == "待定":
+                if chapter_num - planted_at <= 10:
+                    should_handle = True
+                    handle_type = "可铺垫"
+            else:
+                expected_str = str(expected)
+
+                range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected_str)
+                if range_match:
+                    start_ch = int(range_match.group(1))
+                    end_ch = int(range_match.group(2))
+                    if start_ch <= chapter_num <= end_ch:
+                        should_handle = True
+                        handle_type = "应兑现"
+                else:
+                    single_match = re.search(r'第?(\d+)', expected_str)
+                    if single_match:
+                        target_ch = int(single_match.group(1))
+                        if abs(target_ch - chapter_num) <= 3:
+                            should_handle = True
+                            handle_type = "应兑现" if target_ch <= chapter_num else "即将兑现"
+                    elif any(keyword in expected_str for keyword in ['高潮', '结局', '终章', '决战']):
+                        if chapter_num >= planted_at + 5:
+                            should_handle = True
+                            handle_type = "可推进"
+
+            if should_handle:
+                hint = f"[{handle_type}] {desc}"
+                if expected and expected != "待定":
+                    hint += f"（计划：{expected}）"
+                hints.append({
+                    "hint": hint,
+                    "handle_type": handle_type,
+                    "priority": 0 if handle_type == "应兑现" else (1 if handle_type == "即将兑现" else 2),
+                })
+
+        hints.sort(key=lambda x: (x["priority"], x["hint"]))
+        return [h["hint"] for h in hints]
+
     def _refresh_foreshadowing_md(self):
         with with_db_connection(self.novel_name) as conn:
             rows = conn.execute("SELECT * FROM foreshadowing").fetchall()
@@ -429,12 +494,13 @@ class MemoryManager:
     def load_context(self, chapter_num: int) -> dict:
         """
         加载写作上下文，供 writer/reviewer 使用。
-        包含：世界观、人物、活跃伏笔、近期摘要、章节号。
+        包含：世界观、人物、活跃伏笔、近期摘要、章节号、本章伏笔提示。
         """
         return {
             "world_settings": self.load_world_settings(),
             "characters": self.load_characters(),
             "active_foreshadowing": self.load_active_foreshadowing(),
+            "foreshadow_hints": self.get_foreshadow_hints(chapter_num),
             "recent_summaries": self.load_recent_summaries(),
             "chapter_num": chapter_num,
         }

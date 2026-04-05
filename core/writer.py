@@ -999,7 +999,7 @@ def write_chapter(novel_name: str, chapter_num: int,
             system_prompt=system_prompt,
             user_message=prompt,
             temperature=0.85,
-            max_tokens=min(int(word_max * 1.4), 5500),
+            max_tokens=min(int(word_max * 1.2), 4800),
         )
         full_content = clean_content(full_content)
         print(f"  ✅ 章节完成：{len(full_content)}字（单次生成）")
@@ -1019,7 +1019,7 @@ def write_chapter(novel_name: str, chapter_num: int,
             system_prompt=system_prompt,
             user_message=prompt,
             temperature=0.9,
-            max_tokens=min(int(word_max // 2 * 1.75), max_tokens_cfg),
+            max_tokens=min(int(word_max // 2 * 1.5), max_tokens_cfg),
         )
         first_half = clean_content(first_half)
         print(f"  前半段完成：{len(first_half)}字")
@@ -1034,7 +1034,7 @@ def write_chapter(novel_name: str, chapter_num: int,
             system_prompt=system_prompt + "\n\n" + CONTINUE_SYSTEM_BASE,
             user_message=continue_prompt,
             temperature=0.7,
-            max_tokens=min(int(word_max // 2 * 1.75), max_tokens_cfg),
+            max_tokens=min(int(word_max // 2 * 1.5), max_tokens_cfg),
         )
         second_half = clean_content(second_half)
         print(f"  后半段完成：{len(second_half)}字")
@@ -1094,12 +1094,40 @@ def write_chapter(novel_name: str, chapter_num: int,
     full_content = re.sub(r'\n{3,}', '\n\n', full_content)
 
     total = len(full_content)
+
+    hard_limit = int(word_max * 1.2)
+    if total > hard_limit:
+        original_total = total
+        paragraphs = full_content.split('\n\n')
+        truncated = []
+        current_len = 0
+        for para in paragraphs:
+            if current_len + len(para) > hard_limit:
+                break
+            truncated.append(para)
+            current_len += len(para)
+        if truncated:
+            full_content = '\n\n'.join(truncated)
+            total = len(full_content)
+            print(f"  [裁剪] 字数{original_total}超过硬上限{hard_limit}，已裁剪至{total}字")
+
     print(f"  [OK] 第{chapter_num}章完成，总字数：{total}字（目标：{word_min}-{word_max}）")
 
     if total < word_min:
         print(f"  ⚠️ 警告：字数不足（{total}/{word_min}），建议手动检查或重写")
-    elif total > word_max:
-        print(f"  ⚠️ 提示：字数略超上限（{total}/{word_max}），可接受范围")
+    elif total <= int(word_max * 1.1):
+        if total > word_max:
+            excess = total - word_max
+            excess_pct = (excess / word_max) * 100
+            print(f"  🟢 略超: 字数略超上限（{total}/{word_max}，+{excess_pct:.0f}%，+{excess}字）")
+    elif total <= int(word_max * 1.3):
+        excess = total - word_max
+        excess_pct = (excess / word_max) * 100
+        print(f"  🟡 标超: 字数超标（{total}/{word_max}，+{excess_pct:.0f}%，+{excess}字）| 建议检查是否可精简")
+    else:
+        excess = total - word_max
+        excess_pct = (excess / word_max) * 100
+        print(f"  🔴 严重超标: 字数严重超标（{total}/{word_max}，+{excess_pct:.0f}%，+{excess}字）| 建议重写或手动裁剪")
 
     mm.save_chapter(
         chapter_num, f"第{chapter_num}章",
