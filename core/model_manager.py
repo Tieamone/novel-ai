@@ -284,10 +284,10 @@ def get_gemini_models() -> List[Dict]:
     """返回 Gemini 模型列表（静态）"""
     return [
         {
-            "model": "gemini-1.5-flash",
-            "name": "gemini-1.5-flash（免费）",
+            "model": "gemini-2.5-flash",
+            "name": "gemini-2.5-flash（推荐）",
             "category": "free",
-            "description": "Google Gemini，免费层，推荐用于审核",
+            "description": "Google Gemini 当前稳定主力模型，适合通用文本任务",
             "context_length": 1000000,
             "input_price": 0.0,
             "output_price": 0.0,
@@ -296,10 +296,10 @@ def get_gemini_models() -> List[Dict]:
             "free_tier": True,
         },
         {
-            "model": "gemini-1.5-flash-8b",
-            "name": "gemini-1.5-flash-8b（免费）",
+            "model": "gemini-2.5-flash-lite",
+            "name": "gemini-2.5-flash-lite（快速）",
             "category": "free",
-            "description": "Google Gemini 8B，更轻量的免费选择",
+            "description": "Google Gemini 2.5 轻量版，速度更快、成本更低",
             "context_length": 1000000,
             "input_price": 0.0,
             "output_price": 0.0,
@@ -308,16 +308,16 @@ def get_gemini_models() -> List[Dict]:
             "free_tier": True,
         },
         {
-            "model": "gemini-2.0-flash",
-            "name": "gemini-2.0-flash（免费）",
-            "category": "free",
-            "description": "Google Gemini 2.0，最新免费模型",
+            "model": "gemini-2.5-pro",
+            "name": "gemini-2.5-pro（高质量）",
+            "category": "premium",
+            "description": "Google Gemini 2.5 高质量推理模型，适合复杂任务",
             "context_length": 1000000,
             "input_price": 0.0,
             "output_price": 0.0,
-            "has_free_quota": True,
+            "has_free_quota": False,
             "provider": "gemini",
-            "free_tier": True,
+            "free_tier": False,
         },
     ]
 

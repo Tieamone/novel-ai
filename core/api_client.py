@@ -121,13 +121,13 @@ MODEL_PRICING = {
     "qwen-plus":            {"input": 0.0008,  "output": 0.002},
     "qwen-max":             {"input": 0.04,    "output": 0.12},
     "qwen-long":            {"input": 0.0005,  "output": 0.002},
-    "gemini-1.5-flash":     {"input": 0.0,     "output": 0.0},   # 免费层 0 成本
-    "gemini-1.5-flash-8b":  {"input": 0.0,     "output": 0.0},   # 免费层 0 成本
-    "gemini-2.0-flash":     {"input": 0.0,     "output": 0.0},
+    "gemini-2.5-flash":     {"input": 0.0,     "output": 0.0},
+    "gemini-2.5-flash-lite":{"input": 0.0,     "output": 0.0},
+    "gemini-2.5-pro":       {"input": 0.0,     "output": 0.0},
 }
 
 # 免费层模型：RPM较低，遇到429时需大幅延长等待
-FREE_TIER_MODELS = {"gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-2.0-flash"}
+FREE_TIER_MODELS = {"gemini-2.5-flash", "gemini-2.5-flash-lite"}
 
 AVAILABLE_MODELS = {
     "1": {
@@ -159,46 +159,79 @@ AVAILABLE_MODELS = {
         "free_tier": False,
     },
     "5": {
-        "name": "Gemini 1.5 Flash【免费】（谷歌，限速15次/分钟）",
-        "model": "gemini-1.5-flash",
+        "name": "Gemini 2.5 Flash【推荐】（当前稳定版）",
+        "model": "gemini-2.5-flash",
         "provider": "gemini",
         "env_key": "GEMINI_API_KEY",
         "free_tier": True,
     },
     "6": {
-        "name": "Gemini 1.5 Flash-8B【免费·超轻量】（速度更快，质量略低）",
-        "model": "gemini-1.5-flash-8b",
+        "name": "Gemini 2.5 Flash-Lite【更快更省】",
+        "model": "gemini-2.5-flash-lite",
         "provider": "gemini",
         "env_key": "GEMINI_API_KEY",
         "free_tier": True,
     },
     "7": {
-        "name": "Gemini 2.0 Flash【免费】（最新，需科学上网）",
-        "model": "gemini-2.0-flash",
+        "name": "Gemini 2.5 Pro【高质量】",
+        "model": "gemini-2.5-pro",
         "provider": "gemini",
         "env_key": "GEMINI_API_KEY",
-        "free_tier": True,
+        "free_tier": False,
     },
 }
+
+
+def _get_api_key(*env_names: str) -> str:
+    for env_name in env_names:
+        value = os.getenv(env_name)
+        if value is None:
+            continue
+        value = value.strip().strip('"').strip("'")
+        if value:
+            return value
+    return ""
 
 
 def _format_api_error(error, api_name="API", attempt=1, max_attempts=3):
     """格式化API错误为用户友好的消息"""
     error_str = str(error)
+    error_lower = error_str.lower()
 
-    if "401" in error_str or "Unauthorized" in error_str or "invalid_api_key" in error_str:
+    if (
+        "api_key_invalid" in error_lower
+        or "api key not found" in error_lower
+        or "invalid api key" in error_lower
+    ):
+        category = "Gemini 密钥无效"
+        suggestion = (
+            "检查 GEMINI_API_KEY/GOOGLE_API_KEY 是否为有效的 Google AI Studio API Key，"
+            "并确认该密钥未被删除、未限制 Generative Language API。这个错误与输入长度无关。"
+        )
+    elif (
+        "10061" in error_lower
+        or "connecterror" in error_lower
+        or "connection refused" in error_lower
+        or "proxyerror" in error_lower
+    ):
+        category = "网络连接失败"
+        suggestion = "检查本机代理、网络连通性和防火墙配置后重试"
+    elif "401" in error_str or "Unauthorized" in error_str or "invalid_api_key" in error_str:
         category = "认证失败"
         suggestion = "请检查 config.yaml 中的 API_KEY 是否正确"
-    elif "429" in error_str or "rate" in error_str.lower() or "limit" in error_str.lower():
+    elif "429" in error_str or "rate" in error_lower or "limit" in error_lower:
         category = "请求频率超限"
         suggestion = f"等待{10*(attempt)}秒后重试，或降低调用频率"
+    elif "404" in error_str or "notfound" in error_lower or "not found" in error_lower:
+        category = "模型不存在或当前项目无权限"
+        suggestion = "检查模型名称是否仍有效；旧的 Gemini 1.5/2.0 型号可能已弃用，优先改用 gemini-2.5-flash / gemini-2.5-flash-lite / gemini-2.5-pro"
     elif "400" in error_str:
         category = "请求参数错误"
         suggestion = "检查输入内容长度是否超过模型限制"
     elif "500" in error_str or "502" in error_str or "503" in error_str:
         category = "服务端错误"
         suggestion = "稍后重试，或切换到其他可用模型"
-    elif "timeout" in error_str.lower() or "timed out" in error_str.lower():
+    elif "timeout" in error_lower or "timed out" in error_lower:
         category = "请求超时"
         suggestion = "检查网络连接，或增加超时时间"
     else:
@@ -383,7 +416,7 @@ def _call_dashscope(system_prompt, user_message, model_name,
                     max_tokens, temperature, retry):
     from dashscope import Generation
 
-    api_key = os.getenv("DASHSCOPE_API_KEY")
+    api_key = _get_api_key("DASHSCOPE_API_KEY")
     if not api_key:
         raise ValueError("未找到 DASHSCOPE_API_KEY，请检查 .env 文件")
 
@@ -437,9 +470,9 @@ def _call_gemini(system_prompt, user_message, model_name,
                  max_tokens, temperature, retry):
     from google import genai
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = _get_api_key("GEMINI_API_KEY", "GOOGLE_API_KEY")
     if not api_key:
-        raise ValueError("未找到 GEMINI_API_KEY，请检查 .env 文件")
+        raise ValueError("未找到 GEMINI_API_KEY 或 GOOGLE_API_KEY，请检查 .env 文件")
 
     is_free = model_name in FREE_TIER_MODELS
     client = genai.Client(api_key=api_key)
