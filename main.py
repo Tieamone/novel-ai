@@ -212,7 +212,7 @@ def show_progress(novel_name: str):
     with with_db_connection(novel_name) as conn:
         approved = conn.execute(
             "SELECT COUNT(*) as cnt FROM chapters "
-            "WHERE status IN ('approved','force_approved')"
+            "WHERE status IN ('已审核', '强制通过')"
         ).fetchone()["cnt"]
 
         draft = conn.execute(
@@ -547,7 +547,7 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
 }}
 
 章节内容：
-{content[:3000]}""",
+{content[:5000]}""",
         temperature=0.2,
         max_tokens=800,
     )

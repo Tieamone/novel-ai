@@ -100,7 +100,7 @@ def export_all(novel_name: str) -> list:
     with with_db_connection(novel_name) as conn:
         rows = conn.execute(
             "SELECT chapter_num FROM chapters "
-            "WHERE status IN ('approved','force_approved') "
+            "WHERE status IN ('已审核', '强制通过') "
             "ORDER BY chapter_num"
         ).fetchall()
 

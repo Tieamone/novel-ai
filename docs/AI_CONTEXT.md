@@ -1,8 +1,50 @@
 # AI 思维链 / 记忆体
 
 ## 当前上下文
-**时间**: 2026-04-04
-**任务**: 章节字数控制优化（已完成）
+**时间**: 2026-04-17
+**任务**: 模型列表更新与默认模型更换（已完成）
+
+## 本次完成的工作
+
+### 任务1: 模型列表更新与默认模型更换
+- **位置**: [data/custom_models.json](file:///d:/novel-ai/data/custom_models.json), [config.yaml](file:///d:/novel-ai/config.yaml), [core/model_manager.py](file:///d:/novel-ai/core/model_manager.py)
+- **问题背景**: 用户反馈默认使用的 `qwen3.6-plus` 模型已无额度，需要将图片中的新模型添加到使用列表，并更换默认模型
+
+### 核心修改内容
+
+#### 1. 模型配置层（data/custom_models.json）
+- **标记无额度模型**: qwen3.6-plus 的 `has_free_quota` 改为 `false`
+- **新增8个模型**:
+  - qwen3.6-flash（⭐新推荐主模型，128K上下文，快速低成本）
+  - qwen3.6-flash-2026-04-16（带日期标记的flash版本）
+  - qwen3.6-35b-a3b（35B参数MoE架构，高质量）
+  - glm-5.1（智谱GLM 5.1旗舰）
+  - qwen3.6-plus-2026-04-02（带日期标记的plus版本）
+  - gui-plus-2026-02-26（GUI专用版本）
+  - qwen-flash-character-2026-02-26（角色生成专用）
+  - qwen3.5-35b-a3b（3.5版本35B参数）
+
+#### 2. 默认配置层（config.yaml）
+- **修改默认模型**: 从 `qwen3.6-plus` 更换为 `qwen3.6-flash`
+  - `model.author.default_model`: qwen3.6-plus → qwen3.6-flash
+  - `model.reviewer.default_model`: qwen3.6-plus → qwen3.6-flash
+  - `model.reader_reviewer.default_model`: qwen3.6-plus → qwen3.6-flash
+
+#### 3. 模型分类层（core/model_manager.py）
+- **更新 MODEL_CATEGORIES**，新增6个模型映射：
+  - qwen3.6-flash → balanced（快速低成本）
+  - qwen3.6-plus → premium（高级）
+  - qwen3.6-35b-a3b → premium（高质量）
+  - qwen3.5-35b-a3b → balanced（稳定版）
+  - glm-5 → premium（智谱旗舰）
+  - glm-5.1 → premium（智谱旗舰）
+
+### 验证结果
+- 成功加载 16 个模型（13个自定义模型 + 3个Gemini模型）
+- 所有模型配置正确，分类映射完整
+
+## 下一步计划
+- （无待办任务，等待用户下一步指令）
 
 ## 本次完成的工作
 

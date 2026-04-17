@@ -1,14 +1,14 @@
 model:
   max_tokens: 4096
   author:
-    default_model: qwen3.6-plus
-    # ⭐ 推荐主模型：128K超长上下文，写作质量最高
+    default_model: qwen3.6-flash
+    # ⭐ 推荐主模型：128K上下文，快速低成本，有免费额度
   reviewer:
-    default_model: qwen3.6-plus
-    # 使用 qwen3.6-plus 支持 128K 上下文窗口
-    # 可处理超长章节（>5000字）而不需要截断
+    default_model: qwen3.6-flash
+    # 使用 qwen3.6-flash 支持 128K 上下文窗口
+    # 快速低成本，有免费额度
   reader_reviewer:
-    default_model: qwen3.6-plus
+    default_model: qwen3.6-flash
     enabled: true
     pass_threshold: 75
 

@@ -31,7 +31,8 @@ def is_high_capacity_model() -> bool:
         # 高质量模型关键词列表
         high_capacity_keywords = [
             "plus", "max", "glm", "minimax",
-            "qwen3.6", "qwen3.5-plus", "flash-character"
+            "qwen3.6", "qwen3.5-plus", "flash-character",
+            "gemini",  # Gemini 系列均为大上下文模型
         ]
         
         # 方法1: 通过模型名称判断
@@ -49,11 +50,64 @@ def is_high_capacity_model() -> bool:
         return False
 
 
+
+def _build_progress_block(chapter_num: int, target_chapters: int) -> str:
+    """
+    生成全书进度提示块，帮助 AI 感知当前所处故事阶段并调整节奏。
+    target_chapters=0 时不输出（未配置目标章数）。
+    """
+    if not target_chapters or target_chapters <= 0:
+        return ""
+    pct = round(chapter_num * 100 / target_chapters)
+    if pct <= 20:
+        phase = "开局阶段"
+        rhythm = "重点建立世界感和人物关系，植入悬念，节奏稳健，不要急着上大冲突"
+    elif pct <= 50:
+        phase = "发展前期"
+        rhythm = "矛盾开始升级，每段都要有新信息或新冲突推进，支线开始交织"
+    elif pct <= 75:
+        phase = "发展后期"
+        rhythm = "矛盾烈度明显上升，伏笔开始回收，人物关系趋于紧张，节奏加快"
+    elif pct <= 90:
+        phase = "高潮阶段"
+        rhythm = "全面爆发期，伏笔全部兑现，节奏最快，每章都要有强烈冲突或反转"
+    else:
+        phase = "收尾阶段"
+        rhythm = "矛盾收束，各条线索回归，给读者完整感和情感落地"
+    return (
+        f"【全书进度：第{chapter_num}/{target_chapters}章（{pct}%·{phase}）】\n"
+        f"节奏指引：{rhythm}"
+    )
+
+
+def _build_outline_block(outline: str, max_chars: int = 1200) -> str:
+    """
+    生成全书大纲提示块。outline 为空时返回空字符串。
+    max_chars 控制传入提示词的最大长度（大模型可放宽）。
+    """
+    if not outline:
+        return ""
+    trimmed = outline[:max_chars]
+    if len(outline) > max_chars:
+        trimmed += "\n…（大纲后续略）"
+    return (
+        "【全书大纲（把握宏观走向，当前章节内容要服务于整体节奏，不要提前交代结局）】\n"
+        + trimmed
+    )
+
+
 def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
                               author_style, beat_plan, prev_chapter_ending="",
                               word_min=3000, word_max=4000) -> str:
     """构建一次性生成整章的prompt（用于大模型）"""
-    world = ctx.get("world_settings", "")[:500]
+    # ── 进度 & 大纲（新增）──────────────────────────────────────
+    progress_block = _build_progress_block(chapter_num, ctx.get("target_chapters", 0))
+    outline_block  = _build_outline_block(ctx.get("outline", ""), max_chars=1500)
+
+    # ── 世界观（放宽截断：大模型上下文充足）────────────────────
+    world = ctx.get("world_settings", "")[:2000]
+
+    # ── 人物（关系条数从3条放宽到5条）──────────────────────────
     chars = ctx.get("characters", [])
     char_lines = []
     for c in chars:
@@ -65,22 +119,19 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
         rels = c.get("relationships", {})
         rel_str = ""
         if rels:
-            rel_pairs = [f"{k}：{v}" for k, v in list(rels.items())[:3]]
+            rel_pairs = [f"{k}：{v}" for k, v in list(rels.items())[:5]]
             rel_str = f"，关系[{' / '.join(rel_pairs)}]"
         char_lines.append(
             f"{name}（{role}）：{personality}｜在{location}｜{status}{rel_str}"
         )
     chars_str = "\n".join(char_lines) if char_lines else "暂无人物信息"
 
-    foreshadow = ctx.get("active_foreshadowing", [])
-    f_str = "\n".join(
-        [f"- [{f.get('fid', '?')}] {f.get('description', '')}" for f in foreshadow[:6]]
-    ) if foreshadow else "暂无"
-
+    # ── 伏笔（统一使用优先级排序后的 hints，不再重复原始列表）──
     foreshadow_hints = ctx.get("foreshadow_hints", [])
-    fs_hint_block = ""
     if foreshadow_hints:
-        fs_hint_block = "\n【本章必须处理的伏笔】\n" + "\n".join([f"- {h}" for h in foreshadow_hints])
+        f_block = "【伏笔提示（按优先级排序，逾期/久悬的必须本章处理）】\n" + "\n".join([f"- {h}" for h in foreshadow_hints])
+    else:
+        f_block = "（暂无需处理的伏笔）"
 
     summaries = ctx.get("recent_summaries", [])
     s_str = "\n".join(
@@ -88,7 +139,6 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
     ) if summaries else "这是开篇第一章"
 
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
-    word_target = cfg("novel", "chapter_word_target", 3000)
     hard_rules = _format_rule_block("硬约束（必须满足）", WRITER_HARD_CONSTRAINTS)
     forbidden_rules = _format_rule_block("禁止项（必须避免）", WRITER_FORBIDDEN_RULES)
     beat_block = (
@@ -109,7 +159,14 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
 4. 若上一章结尾是情绪性语句，本章开头必须先给出具体行动而非重复情绪
 5. 开头第一句话要有画面感，让读者立刻能想象出场景"""
 
-    return f"""现在要写第{chapter_num}章的完整内容，{word_min}-{word_max}字。
+    # 进度/大纲放在最前，让 AI 先建立宏观认知
+    header = ""
+    if progress_block:
+        header += progress_block + "\n\n"
+    if outline_block:
+        header += outline_block + "\n\n"
+
+    return f"""{header}现在要写第{chapter_num}章的完整内容，{word_min}-{word_max}字。
 
 【本章要做什么】
 {plot_goal}
@@ -123,9 +180,7 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
 【人物现状（写作时通过行动和对话体现性格，不要贴标签）】
 {chars_str}
 
-【还没兑现的伏笔（可以自然带进去，不要强塞）】
-{f_str}
-{fs_hint_block}
+{f_block}
 
 【前面发生了什么】
 {s_str}
@@ -581,7 +636,10 @@ def _count_matching_words(text1: str, text2: str) -> int:
 
 def _plan_chapter_beats(ctx: dict, chapter_num: int,
                         plot_goal: str, emotion_tag: str) -> str:
-    world = (ctx.get("world_settings") or "")[:300]
+    # ── 进度感知（节拍规划也需要知道故事处于哪个阶段）──────────
+    progress_block = _build_progress_block(chapter_num, ctx.get("target_chapters", 0))
+
+    world = (ctx.get("world_settings") or "")[:600]
     chars = ctx.get("characters", [])
     char_lines = []
     for c in chars[:8]:
@@ -599,16 +657,22 @@ def _plan_chapter_beats(ctx: dict, chapter_num: int,
         char_lines.append(line)
     chars_str = "\n".join(char_lines) if char_lines else "暂无人物信息"
 
-    # 最近摘要（给节拍规划一点前情上下文）
+    # 最近摘要
     recent = ctx.get("recent_summaries", [])
     recent_str = ""
     if recent:
         last = recent[-1]
-        recent_str = f"\n上一章概要：{last.get('summary', '')[:150]}"
+        recent_str = f"\n上一章概要：{last.get('summary', '')[:200]}"
+
+    # 大纲摘要（给节拍规划提供宏观方向，截短避免 prompt 过长）
+    outline = ctx.get("outline", "")
+    outline_str = f"\n全书大纲摘要：{outline[:400]}" if outline else ""
+
+    progress_str = f"\n{progress_block}" if progress_block else ""
 
     prompt = f"""章节：第{chapter_num}章
 本章目标：{plot_goal}
-情绪标签：{emotion_tag}
+情绪标签：{emotion_tag}{progress_str}{outline_str}
 
 世界背景摘要：
 {world or "暂无"}
@@ -765,7 +829,14 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
                         beat_plan: str = "",
                         prev_chapter_ending: str = "",
                         word_min=3000, word_max=4000) -> str:
-    world = ctx.get("world_settings", "")[:500]
+    # ── 进度 & 大纲（小模型上下文有限，大纲截短到600字）────────
+    progress_block = _build_progress_block(chapter_num, ctx.get("target_chapters", 0))
+    outline_block  = _build_outline_block(ctx.get("outline", ""), max_chars=600)
+
+    # ── 世界观（小模型放宽到1000字）────────────────────────────
+    world = ctx.get("world_settings", "")[:1000]
+
+    # ── 人物（关系条数从3条放宽到5条）──────────────────────────
     chars = ctx.get("characters", [])
     char_lines = []
     for c in chars:
@@ -777,22 +848,19 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
         rels = c.get("relationships", {})
         rel_str = ""
         if rels:
-            rel_pairs = [f"{k}：{v}" for k, v in list(rels.items())[:3]]
+            rel_pairs = [f"{k}：{v}" for k, v in list(rels.items())[:5]]
             rel_str = f"，关系[{' / '.join(rel_pairs)}]"
         char_lines.append(
             f"{name}（{role}）：{personality}｜在{location}｜{status}{rel_str}"
         )
     chars_str = "\n".join(char_lines) if char_lines else "暂无人物信息"
 
-    foreshadow = ctx.get("active_foreshadowing", [])
-    f_str = "\n".join(
-        [f"- [{f.get('fid', '?')}] {f.get('description', '')}" for f in foreshadow[:6]]
-    ) if foreshadow else "暂无"
-
+    # ── 伏笔（统一使用优先级排序后的 hints）────────────────────
     foreshadow_hints = ctx.get("foreshadow_hints", [])
-    fs_hint_block = ""
     if foreshadow_hints:
-        fs_hint_block = "\n【本章必须处理的伏笔】\n" + "\n".join([f"- {h}" for h in foreshadow_hints])
+        f_block = "【伏笔提示（按优先级排序，逾期/久悬的必须本章处理）】\n" + "\n".join([f"- {h}" for h in foreshadow_hints])
+    else:
+        f_block = "（暂无需处理的伏笔）"
 
     summaries = ctx.get("recent_summaries", [])
     s_str = "\n".join(
@@ -800,7 +868,6 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
     ) if summaries else "这是开篇第一章"
 
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
-    word_target = cfg("novel", "chapter_word_target", 3500)
     half_min = word_min // 2
     half_max = word_max // 2
     hard_rules = _format_rule_block("硬约束（必须满足）", WRITER_HARD_CONSTRAINTS)
@@ -823,7 +890,13 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 4. 若上一章结尾是情绪性语句，本章开头必须先给出具体行动而非重复情绪
 5. 开头第一句话要有画面感，让读者立刻能想象出场景"""
 
-    return f"""现在要写第{chapter_num}章，{half_min}-{half_max}字，是完整章节的前半部分。
+    header = ""
+    if progress_block:
+        header += progress_block + "\n\n"
+    if outline_block:
+        header += outline_block + "\n\n"
+
+    return f"""{header}现在要写第{chapter_num}章，{half_min}-{half_max}字，是完整章节的前半部分。
 
 【本章要做什么】
 {plot_goal}
@@ -837,9 +910,7 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 【人物现状（写作时通过行动和对话体现性格，不要贴标签）】
 {chars_str}
 
-【还没兑现的伏笔（可以自然带进去，不要强塞）】
-{f_str}
-{fs_hint_block}
+{f_block}
 
 【前面发生了什么】
 {s_str}
@@ -999,7 +1070,7 @@ def write_chapter(novel_name: str, chapter_num: int,
             system_prompt=system_prompt,
             user_message=prompt,
             temperature=0.85,
-            max_tokens=min(int(word_max * 1.2), 4800),
+            max_tokens=min(int(word_max * 1.75), 7000),
         )
         full_content = clean_content(full_content)
         print(f"  ✅ 章节完成：{len(full_content)}字（单次生成）")

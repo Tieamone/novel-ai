@@ -4,7 +4,7 @@
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Generator, Any
+from typing import Generator
 from core.db import get_connection
 
 
@@ -93,40 +93,20 @@ def execute_with_retry(
     raise last_exception
 
 
-def safe_db_execute(
-    conn: sqlite3.Connection,
-    sql: str,
-    params: tuple = (),
-    fetch: bool = False
-) -> Any:
-    """
-    安全的数据库执行封装
-    
-    Args:
-        conn: 数据库连接
-        sql: SQL语句
-        params: 参数化查询参数
-        fetch: 是否返回结果
-        
-    Returns:
-        查询结果或受影响行数
-    """
-    cursor = conn.execute(sql, params)
-    if fetch:
-        return cursor.fetchall()
-    return cursor.rowcount
-
-
 class DatabaseTransaction:
-    """数据库事务管理器"""
-    
+    """
+    数据库事务管理器。
+    使用 BEGIN IMMEDIATE 在事务开始时即获取写锁，
+    避免延迟加锁导致的并发写入冲突。
+    """
+
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
-        
+
     def __enter__(self):
-        self.conn.execute("BEGIN TRANSACTION")
+        self.conn.execute("BEGIN IMMEDIATE")
         return self
-        
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is None:
             self.conn.commit()

@@ -283,22 +283,10 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
     else:
         reset_failure_counter("reader_reviewer")
 
-    # 保存评估结果到数据库（扩展章节表）
+    # 保存评估结果到数据库（列已由 db.py _migrate 统一管理）
     try:
         with with_db_connection(novel_name) as conn:
             with DatabaseTransaction(conn):
-                # 检查是否有reader_review相关列
-                cursor = conn.execute("PRAGMA table_info(chapters)")
-                columns = {row[1] for row in cursor.fetchall()}
-
-                if "reader_review_score" not in columns:
-                    try:
-                        conn.execute("ALTER TABLE chapters ADD COLUMN reader_review_score INTEGER")
-                        conn.execute("ALTER TABLE chapters ADD COLUMN reader_review_passed INTEGER")
-                        conn.execute("ALTER TABLE chapters ADD COLUMN reader_review_issues TEXT")
-                    except Exception:
-                        pass
-
                 conn.execute("""
                     UPDATE chapters
                     SET reader_review_score=?,

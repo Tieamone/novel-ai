@@ -15,6 +15,12 @@ MODEL_CATEGORIES = {
     "qwen-plus": {"category": "balanced", "priority": 2, "display_name": "qwen-plus（平衡推荐）"},
     "qwen-max": {"category": "premium", "priority": 3, "display_name": "qwen-max（高级）"},
     "qwen-long": {"category": "long_context", "priority": 4, "display_name": "qwen-long（长上下文）"},
+    "qwen3.6-flash": {"category": "balanced", "priority": 2, "display_name": "qwen3.6-flash（快速低成本）"},
+    "qwen3.6-plus": {"category": "premium", "priority": 3, "display_name": "qwen3.6-plus（高级）"},
+    "qwen3.6-35b-a3b": {"category": "premium", "priority": 3, "display_name": "qwen3.6-35b-a3b（高质量）"},
+    "qwen3.5-35b-a3b": {"category": "balanced", "priority": 2, "display_name": "qwen3.5-35b-a3b（稳定版）"},
+    "glm-5": {"category": "premium", "priority": 3, "display_name": "glm-5（智谱旗舰）"},
+    "glm-5.1": {"category": "premium", "priority": 3, "display_name": "glm-5.1（智谱旗舰）"},
 }
 
 # 默认定价（兜底用）
@@ -190,46 +196,6 @@ def _parse_model_info_from_api(model_data: Dict) -> Optional[Dict]:
     }
 
 
-def _parse_model_info(model_data: Dict) -> Optional[Dict]:
-    """解析单个模型数据（备用函数）"""
-    model_id = model_data.get('model_id', '')
-    if not model_id:
-        return None
-
-    # 从已知分类获取信息
-    category_info = MODEL_CATEGORIES.get(model_id, {})
-
-    # 尝试获取模型描述
-    description = model_data.get('description', '')
-
-    # 尝试获取上下文长度
-    context_length = model_data.get('max_context_length', 0)
-
-    # 获取定价信息（如果有的话）
-    pricing = model_data.get('pricing', {})
-    input_price = pricing.get('input', {}).get('price_per_token', DEFAULT_PRICING['input'])
-    output_price = pricing.get('output', {}).get('price_per_token', DEFAULT_PRICING['output'])
-
-    # 检查是否有免费额度
-    has_free_quota = False
-    quota_info = model_data.get('quota', {})
-    if quota_info:
-        free_remaining = quota_info.get('free_remaining', 0)
-        has_free_quota = free_remaining > 0
-
-    return {
-        "model": model_id,
-        "name": category_info.get("display_name", model_id),
-        "category": category_info.get("category", "general"),
-        "description": description,
-        "context_length": context_length,
-        "input_price": input_price,
-        "output_price": output_price,
-        "has_free_quota": has_free_quota,
-        "provider": "dashscope",
-    }
-
-
 def _get_default_qwen_models() -> List[Dict]:
     """返回默认模型列表（兜底方案）"""
     return [
@@ -344,7 +310,7 @@ def filter_models_for_usage(models: List[Dict], usage: str, top_k: int = 5) -> L
     usage_rules = {
         "author": {
             # 作者模型：优先高级、平衡模型，有免费额度的排在前面
-            "categories": ["premium", "balanced"],
+            "categories": ["premium", "balanced", "free"],
             "prefer_free": True,
             "exclude_vl": True,  # 排除多模态模型
             "exclude_math": True,  # 排除数学模型
@@ -352,7 +318,7 @@ def filter_models_for_usage(models: List[Dict], usage: str, top_k: int = 5) -> L
         },
         "reviewer": {
             # 审核模型：优先轻量、性价比高，有免费额度的排在前面
-            "categories": ["cost_effective", "balanced"],
+            "categories": ["cost_effective", "balanced", "free"],
             "prefer_free": True,
             "exclude_vl": True,
             "exclude_math": False,  # 数学模型可能更严谨
@@ -360,7 +326,7 @@ def filter_models_for_usage(models: List[Dict], usage: str, top_k: int = 5) -> L
         },
         "reader_reviewer": {
             # 读者视角模型：优先平衡、高级模型
-            "categories": ["balanced", "premium"],
+            "categories": ["balanced", "premium", "free"],
             "prefer_free": True,
             "exclude_vl": True,
             "exclude_math": True,
@@ -376,7 +342,7 @@ def filter_models_for_usage(models: List[Dict], usage: str, top_k: int = 5) -> L
         # 检查分类
         if m["category"] not in rules["categories"]:
             continue
-        
+
         # 排除特定类型模型
         model_name = m["model"].lower()
         if rules["exclude_vl"] and ("vl" in model_name or "vision" in model_name):
@@ -385,14 +351,16 @@ def filter_models_for_usage(models: List[Dict], usage: str, top_k: int = 5) -> L
             continue
         if rules["exclude_coder"] and "coder" in model_name:
             continue
-        
+
         filtered.append(m)
 
-    # 排序：有免费额度的优先，然后按分类优先级
+    # 排序：有免费额度的优先，然后按分类优先级（free 类别排最后，避免盖过付费高质量模型）
     def sort_key(m):
         free_priority = 0 if m.get("has_free_quota", False) else 1
-        category_priority = rules["categories"].index(m["category"])
-        return (free_priority, category_priority)
+        cat = m["category"]
+        cats = rules["categories"]
+        category_priority = cats.index(cat) if cat in cats else len(cats)
+        return (category_priority, free_priority)
 
     filtered.sort(key=sort_key)
 
@@ -436,6 +404,7 @@ def model_list_to_menu_format(models: List[Dict]) -> Dict[str, Dict]:
             "free_tier": model.get("free_tier", False),
             "has_free_quota": model.get("has_free_quota", False),
             "env_key": "DASHSCOPE_API_KEY" if model["provider"] == "dashscope" else "GEMINI_API_KEY",
+            "context_length": model.get("context_length", 0),  # 保留，供 is_high_capacity_model 使用
         }
     return menu
 

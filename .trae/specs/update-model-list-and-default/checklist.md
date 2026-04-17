@@ -1,0 +1,9 @@
+- [x] custom_models.json 包含所有图片中的模型
+- [x] qwen3.6-plus 的 has_free_quota 已标记为 false
+- [x] 所有新增模型都有正确的 category、description、context_length、定价信息
+- [x] config.yaml 的 author.default_model 已更换为新模型
+- [x] config.yaml 的 reviewer.default_model 已更换为新模型
+- [x] config.yaml 的 reader_reviewer.default_model 已更换为新模型
+- [x] model_manager.py 的 MODEL_CATEGORIES 包含新模型映射
+- [x] 运行 python -c "from core.model_manager import discover_all_models; print(len(discover_all_models()))" 能正确加载所有模型
+- [x] Git commit message 使用中文并符合语义化标准

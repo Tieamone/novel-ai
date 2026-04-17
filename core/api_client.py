@@ -454,7 +454,7 @@ def _call_dashscope(system_prompt, user_message, model_name,
             raise
         except Exception as e:
             err_info = _format_api_error(e, "DashScope", attempt + 1, retry)
-            print(f"\n❌ [{err_info['category']}] {api_name if 'api_name' in dir() else 'DashScope'}")
+            print(f"\n❌ [{err_info['category']}] DashScope")
             print(f"   详情: {err_info['message'][:200]}")
             print(f"   建议: {err_info['suggestion']}")
             if attempt < retry - 1:
@@ -628,16 +628,23 @@ def select_model_interactive() -> dict:
     _author_provider = selected["provider"]
     _session_stats["model_used"] = selected["model"]
 
-    # 为审核模型和读者视角模型设置默认值
-    _reviewer_model = "qwen-turbo"
-    _reviewer_provider = "dashscope"
-    _reader_reviewer_model = "qwen-plus"
-    _reader_reviewer_provider = "dashscope"
+    # 仅在审核模型仍为初始默认值时才设置默认值，避免覆盖用户的高级配置
+    _INITIAL_REVIEWER = "qwen-turbo"
+    _INITIAL_READER = "qwen-plus"
+    reviewer_is_default = (_reviewer_model == _INITIAL_REVIEWER)
+    reader_is_default = (_reader_reviewer_model == _INITIAL_READER)
+
+    if reviewer_is_default:
+        _reviewer_model = _INITIAL_REVIEWER
+        _reviewer_provider = "dashscope"
+    if reader_is_default:
+        _reader_reviewer_model = _INITIAL_READER
+        _reader_reviewer_provider = "dashscope"
 
     print(f"\n[OK] 作者模型已选择：{selected['name']}")
     print(f"     模型代码：{selected['model']}")
-    print(f"     审核模型默认：qwen-turbo")
-    print(f"     读者视角模型默认：qwen-plus")
+    print(f"     审核模型：{_reviewer_model}{'（默认）' if reviewer_is_default else '（已保留自定义配置）'}")
+    print(f"     读者视角模型：{_reader_reviewer_model}{'（默认）' if reader_is_default else '（已保留自定义配置）'}")
     if selected.get("free_tier"):
         print("     [免费层] 限速约15次/分钟，遇到429错误会自动等待60秒重试")
     print("     正在验证模型可用性...")

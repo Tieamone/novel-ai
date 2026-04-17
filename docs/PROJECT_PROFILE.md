@@ -52,6 +52,11 @@ d:\novel-ai/
   - [x] max_tokens 动态计算（基于 word_max，而非固定倍数）
   - [x] 字数补写增加上限保护（达到 word_max 时停止）
   - [x] 日志输出显示目标范围和超标/不足警告
+- [x] **模型列表更新与默认模型更换**（2026-04-17）：
+  - [x] 将 qwen3.6-plus 标记为无额度（has_free_quota=false）
+  - [x] 新增8个模型到使用列表：qwen3.6-flash、qwen3.6-flash-2026-04-16、qwen3.6-35b-a3b、glm-5.1、qwen3.6-plus-2026-04-02、gui-plus-2026-02-26、qwen-flash-character-2026-02-26、qwen3.5-35b-a3b
+  - [x] 默认模型从 qwen3.6-plus 更换为 qwen3.6-flash（有免费额度）
+  - [x] 更新 model_manager.py 的 MODEL_CATEGORIES 以支持新模型分类
 
 ### 开发中功能
 - （无）
