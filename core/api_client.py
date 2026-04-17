@@ -412,6 +412,29 @@ def call_api(system_prompt: str, user_message: str,
         raise ValueError(f"未知的provider: {provider}")
 
 
+def _is_thinking_model(model_name: str) -> bool:
+    """判断是否为深度思考/混合思考模型"""
+    thinking_patterns = [
+        "qwen3.6-",      # Qwen 3.6系列都是深度思考模型
+        "qwen3.5-35b",   # 开源版大参数模型
+        "qwen3.5-397b",
+        "qwen3.5-120b",
+        "qwen3-next",    # 仅思考模式模型
+        "qwq-",           # QwQ推理模型
+        "glm-5",         # GLM-5系列
+        "glm-4.7",
+        "glm-4.6",
+        "glm-4.5",
+        "deepseek-r1",   # DeepSeek推理模型
+        "deepseek-v3.2",
+        "kimi-k2",       # Kimi K2
+        "MiniMax-M2.5",  # MiniMax M2.5
+        "MiniMax-M2.1",
+    ]
+    model_lower = model_name.lower()
+    return any(p in model_lower for p in thinking_patterns)
+
+
 def _call_dashscope(system_prompt, user_message, model_name,
                     max_tokens, temperature, retry):
     from dashscope import Generation
@@ -425,16 +448,29 @@ def _call_dashscope(system_prompt, user_message, model_name,
         {"role": "user", "content": user_message},
     ]
 
+    is_thinking = _is_thinking_model(model_name)
+
     for attempt in range(retry):
         try:
-            response = Generation.call(
-                api_key=api_key,
-                model=model_name,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                result_format="message",
-            )
+            if is_thinking:
+                response = Generation.call(
+                    api_key=api_key,
+                    model=model_name,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    result_format="message",
+                    enable_thinking=False,
+                )
+            else:
+                response = Generation.call(
+                    api_key=api_key,
+                    model=model_name,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    result_format="message",
+                )
             if response.status_code == 200:
                 usage = response.usage or {}
                 input_tokens = getattr(usage, "input_tokens", 0) or 0
