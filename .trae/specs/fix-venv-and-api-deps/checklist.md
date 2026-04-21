@@ -1,0 +1,7 @@
+- [x] 虚拟环境 venv/Scripts/ 目录包含 python.exe、pip.exe、activate、activate.bat、activate.ps1
+- [x] requirements.txt 文件存在于项目根目录，包含 dashscope、google-genai、python-dotenv、requests
+- [x] 虚拟环境中 `python -c "import dashscope"` 执行成功
+- [x] 虚拟环境中 `python -c "from google import genai"` 执行成功
+- [x] 虚拟环境中 `python -c "from dotenv import load_dotenv"` 执行成功
+- [x] 激活虚拟环境后运行 `python main.py` 能正常显示模型选择菜单
+- [x] 选择 dashscope 模型后验证不再报 `No module named 'dashscope'`
