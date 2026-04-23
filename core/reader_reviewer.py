@@ -9,64 +9,72 @@ from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg
 from core.utils import with_db_connection, DatabaseTransaction
 
-READER_REVIEWER_SYSTEM = """你是一位资深的网络小说读者，阅读过数千本网文，对读者的阅读体验有深刻的理解。
+READER_REVIEWER_SYSTEM = """你是一位阅读过数千本网文的资深读者，你最受不了的就是一眼看出是AI写的网文。
 
-你的职责是从读者的视角对刚完成的章节进行批判性评估。你不是在找语法错误，而是在找：
-1. 作为读者，我读这一章时会感到困惑吗？
-2. 这一章的剧情推进符合我的期待吗？
-3. 这一章和前文的衔接自然吗？
-4. 整体画风和前面一致吗？
+你对以下这些东西有天然的厌恶：
+- 角色一句话不说就直接"感到紧张/心中涌起暖意/不禁有些感动"——你觉得这些句子像贴标签，不像真人的反应
+- 深吸一口气平复情绪、握紧拳头下定决心——你见过这两句话至少一万遍了
+- 章节结尾写"这一切才刚刚开始/前方的路还很长/无论前方有多少困难"——你觉得这是在敷衍读者
+- 全章句子长度差不多，读起来像在背书，没有节奏起伏
 
-你需要给出诚实的反馈，但不要吹毛求疵。作为读者，你更在意的是阅读体验的流畅性和故事的吸引力。"""
+除了AI痕迹，你也在意真实的阅读体验：
+- 这章有没有推进什么实质性的东西（信息、关系、冲突）
+- 和上一章的衔接自不自然，有没有突兀的跳跃
+- 人物说话像不像这个人、文风前后一不一致
+- 读完这章你想不想翻下一章
+
+你的评估要诚实，但不要鸡蛋里挑骨头——小问题不影响阅读体验的不用扣分。"""
 
 READER_REVIEW_PROMPT = """请从读者视角评估以下章节。
 
-=== 上一章内容（供参考） ===
+=== 上一章结尾（供衔接参考，约800字）===
 {prev_chapter_content}
 
 === 当前要评估的章节 ===
 {current_chapter_content}
 
-=== 评估标准 ===
-请从以下四个维度进行评分（0-100分），每项25分：
+=== 评估标准（共100分，四个维度各25分）===
 
-1. 剧情逻辑连贯性与合理性（25分）
-   - 剧情发展是否符合逻辑？
-   - 人物行为是否有合理的动机？
-   - 是否有明显的逻辑漏洞或矛盾？
+【1. AI痕迹与真实感】25分
+作为读者你最敏感这一项，以下每发现一处扣3-5分：
+- 情绪标签直陈：直接写"她感到/他不禁/她心中涌起"而非用行为/生理反应表达
+- 高频烂俗动作：深吸一口气平复情绪、握紧拳头下定决心、瞳孔收缩察觉危险
+- 模板收束句：这才刚开始/路还很长/无论前方有多少困难/故事远未结束
+- 对称句式堆砌：虽然…但依然/一方面…另一方面（连续出现2次以上）
+- 句子节奏单调：全章句子长度高度均匀，读起来像背书
 
-2. 与前文内容的关联性与一致性（25分）
-   - 和上一章的衔接是否自然？
-   - 人物状态、场景设定是否与前文一致？
-   - 是否有遗忘前文重要设定的情况？
+【2. 剧情逻辑与推进实质】25分
+- 人物行为是否有合理动机，有无逻辑漏洞
+- 这章推进了什么实质内容（信息新增/关系变化/冲突升级），还是原地踏步
+- 是否有让读者想继续看下一章的悬念或钩子
 
-3. 整体画风的统一性与稳定性（25分）
-   - 文风、叙事节奏是否和前文保持一致？
-   - 人物性格、对话风格是否统一？
-   - 是否有突兀的风格变化？
+【3. 前后一致性与衔接】25分
+- 和上一章的衔接是否自然（状态、场景、情绪是否连贯）
+- 人物性格、说话方式是否与前文一致
+- 是否有遗忘前文重要设定或状态的情况
 
-4. 阅读体验与吸引力（25分）
-   - 这一章读起来流畅吗？
-   - 是否有让读者想继续看下一章的钩子？
-   - 是否有明显的注水或拖沓？
+【4. 整体阅读流畅度】25分
+- 叙事节奏（快慢）是否合适，有无明显注水或拖沓
+- 对话是否自然，有没有"说明书式对话"（角色互相解释信息给读者听）
+- 场景描写是否有具体细节，还是全是抽象空洞的描述
 
-=== 一票否决项（任一命中则直接不通过） ===
-- 出现明显的剧情崩坏，人物行为完全不可理喻
-- 和前文出现重大矛盾（如死亡人物复活、设定彻底冲突）
-- 文风突变到读者无法接受的程度
+=== 一票否决项（任一命中则直接不通过）===
+- 剧情崩坏：人物行为完全不可理喻且无任何铺垫
+- 重大设定矛盾：与前文已建立的事实直接冲突（死亡人物复活等）
+- 文风突变：叙事视角、人称或整体风格发生无法接受的剧变
 
 请严格按以下JSON格式输出，不要任何其他内容：
 {{
   "pass": true/false,
   "score_total": 0-100,
+  "score_ai_authenticity": 0-25,
   "score_logic": 0-25,
   "score_consistency": 0-25,
-  "score_style": 0-25,
-  "score_experience": 0-25,
+  "score_readability": 0-25,
   "veto_triggered": false,
   "veto_reason": "",
-  "issues": ["具体问题1", "具体问题2"],
-  "suggestions": "具体的改进建议"
+  "issues": ["具体问题（引用原文句子）", "具体问题2"],
+  "suggestions": "具体可执行的改进建议"
 }}"""
 
 
@@ -132,20 +140,39 @@ def _truncate_content(text: str, max_len: int, label: str = "内容") -> str:
 
 
 def _normalize_review_result(raw_result: dict) -> dict:
+    # 新版字段（AI真实感）+ 旧版字段兼容（score_style/score_experience）
+    score_ai  = _to_int(raw_result.get("score_ai_authenticity"), 0, 0, 25)
     score_logic = _to_int(raw_result.get("score_logic"), 0, 0, 25)
     score_consistency = _to_int(raw_result.get("score_consistency"), 0, 0, 25)
+    # readability 优先取新字段，兜底取旧字段
+    score_readability = _to_int(
+        raw_result.get("score_readability") or raw_result.get("score_experience"),
+        0, 0, 25
+    )
+    # style 字段（旧版兼容，不计入新总分）
     score_style = _to_int(raw_result.get("score_style"), 0, 0, 25)
-    score_experience = _to_int(raw_result.get("score_experience"), 0, 0, 25)
 
     total_raw = raw_result.get("score_total")
     if total_raw is None:
-        score_total = score_logic + score_consistency + score_style + score_experience
+        # 新版：四维求和
+        if score_ai > 0:
+            score_total = score_ai + score_logic + score_consistency + score_readability
+        else:
+            # 旧版兼容
+            score_total = score_logic + score_consistency + score_style + score_readability
     else:
         score_total = _to_int(total_raw, 0, 0, 100)
 
-    expected_total = score_logic + score_consistency + score_style + score_experience
-    if expected_total and abs(score_total - expected_total) > 10:
-        score_total = expected_total
+    # 子项合计校验（偏差超过10分时以子项合计为准）
+    if score_ai > 0:
+        expected = score_ai + score_logic + score_consistency + score_readability
+    else:
+        expected = score_logic + score_consistency + score_style + score_readability
+    if expected and abs(score_total - expected) > 10:
+        score_total = expected
+
+    # Bug修复12: 分数范围强制夹值
+    score_total = max(0, min(100, score_total))
 
     pass_threshold = cfg("model", "reader_reviewer", "pass_threshold", 75)
     model_pass = bool(raw_result.get("pass"))
@@ -161,17 +188,19 @@ def _normalize_review_result(raw_result: dict) -> dict:
 
     suggestions = str(raw_result.get("suggestions", "")).strip()
     if not suggestions:
-        suggestions = "质量合格" if final_pass else "优先修复逻辑和一致性问题"
+        suggestions = "质量合格" if final_pass else "优先修复AI痕迹和逻辑问题"
 
     veto_reason = str(raw_result.get("veto_reason", "")).strip()
 
     return {
         "pass": final_pass,
         "score_total": score_total,
+        "score_ai_authenticity": score_ai,
         "score_logic": score_logic,
         "score_consistency": score_consistency,
-        "score_style": score_style,
-        "score_experience": score_experience,
+        "score_readability": score_readability,
+        "score_style": score_style,          # 旧版兼容字段，保留不删
+        "score_experience": score_readability,  # 旧版兼容字段，保留不删
         "veto_triggered": veto_triggered,
         "veto_reason": veto_reason,
         "issues": issues,
@@ -211,9 +240,25 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
 
     print(f"  [读者视角] 正在评估第{chapter_num}章...")
 
+    # Bug修复9: 上一章只传结尾800字，避免两章全文撑爆 token 窗口
+    if prev_chapter_content and len(prev_chapter_content) > 800:
+        prev_snippet = "...（省略前段）...\n" + prev_chapter_content[-800:]
+    else:
+        prev_snippet = prev_chapter_content or "（首章，无上一章）"
+
+    # 当前章节：超长时保留首800+尾800（审稿最关注开头和结尾）
+    if len(current_content) > 3000:
+        current_snippet = (
+            current_content[:1200]
+            + "\n\n[... 中间部分已省略 ...]\n\n"
+            + current_content[-1200:]
+        )
+    else:
+        current_snippet = current_content
+
     prompt = READER_REVIEW_PROMPT.format(
-        prev_chapter_content=prev_chapter_content or "（首章，无上一章）",
-        current_chapter_content=current_content
+        prev_chapter_content=prev_snippet,
+        current_chapter_content=current_snippet
     )
 
     try:
@@ -266,10 +311,11 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
 
     # 打印评估结果
     status = "通过" if result.get("pass") else "不通过"
+    ai_score = result.get("score_ai_authenticity", 0)
     print(
         f"  [读者视角] {status} | 总分：{result['score_total']}/100 "
-        f"(逻辑:{result['score_logic']}/25 一致:{result['score_consistency']}/25 "
-        f"风格:{result['score_style']}/25 体验:{result['score_experience']}/25)"
+        f"(真实感:{ai_score}/25 逻辑:{result['score_logic']}/25 "
+        f"一致:{result['score_consistency']}/25 流畅:{result.get('score_readability', result.get('score_experience', 0))}/25)"
     )
 
     if result.get("veto_triggered"):

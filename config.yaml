@@ -1,27 +1,27 @@
 model:
   max_tokens: 4096
   # api_region 控制 DashScope 接入节点：
-  #   intl    → 新加坡（https://dashscope-intl.aliyuncs.com）【默认，推荐海外/国际用户】
-  #   beijing → 华北2（https://dashscope.aliyuncs.com）
+  #   beijing → 华北2（https://dashscope.aliyuncs.com）    【中国大陆用户使用此项】
+  #   intl    → 新加坡（https://dashscope-intl.aliyuncs.com）
   #   us      → 美国（https://dashscope-us.aliyuncs.com）
+  # 留空则自动探测可用节点
   # 也可在 .env 中直接设置 DASHSCOPE_BASE_URL 覆盖此配置
-  api_region: intl
+  api_region: beijing
   author:
     default_model: qwen3.6-flash
     # ⭐ 推荐主模型：128K上下文，快速低成本，有免费试用额度
     # 其他可选试用模型：qwen3.6-plus, qwen3.6-35b-a3b, glm-5.1
   reviewer:
     default_model: qwen3.6-flash
-    # 审稿模型，使用 qwen3.6-flash 支持 128K 上下文窗口
   reader_reviewer:
     default_model: qwen3.6-flash
     enabled: true
     pass_threshold: 75
 
 novel:
-  chapter_word_target: 3500   # 目标字数（中间值）
-  chapter_word_min: 3000      # 最小字数（低于此值触发补写）
-  chapter_word_max: 4000      # 最大字数（达到此值停止补写）
+  chapter_word_target: 3500
+  chapter_word_min: 3000
+  chapter_word_max: 4000
   max_retry: 3
   recent_summary_count: 5
   compress_after_chapters: 20

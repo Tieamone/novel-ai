@@ -39,7 +39,8 @@ class MemoryManager:
 
     # ==================== 人物 ====================
 
-    def save_character(self, name: str, data: dict):
+    def save_character(self, name: str, data: dict, _batch: bool = False):
+        """保存人物档案。_batch=True 时跳过 MD 刷新，批量操作后手动调 refresh_characters_md()"""
         with with_db_connection(self.novel_name) as conn:
             with DatabaseTransaction(conn):
                 conn.execute("""
@@ -59,6 +60,15 @@ class MemoryManager:
                     json.dumps(data.get("relationships", {}), ensure_ascii=False),
                     data.get("updated_chapter", 0),
                 ))
+        if not _batch:
+            self._refresh_characters_md()
+
+    def save_characters_batch(self, characters: list):
+        """批量保存人物档案，最后只刷新一次 MD（比循环调 save_character 更高效）"""
+        for char_data in characters:
+            name = char_data.get("name", "")
+            if name:
+                self.save_character(name, char_data, _batch=True)
         self._refresh_characters_md()
 
     def load_characters(self) -> list:
@@ -537,8 +547,11 @@ class MemoryManager:
         加载写作上下文，供 writer/reviewer 使用。
         包含：世界观、人物、活跃伏笔、近期摘要、章节号、本章伏笔提示、
               全书大纲、目标章数（用于进度感知和节奏控制）。
+
+        优化Bug5: 合并静态数据（大纲、目标章数）为单次文件读取，
+        减少对慢变数据的重复 IO。
         """
-        # 加载全书大纲
+        # 静态数据：大纲和目标章数（文件读取，不走DB）
         outline = ""
         outline_path = self.data_dir / "master_outline.md"
         if outline_path.exists():
@@ -547,7 +560,6 @@ class MemoryManager:
             except Exception:
                 outline = ""
 
-        # 加载目标章数
         target_chapters = 0
         target_path = self.data_dir / "target_chapters.txt"
         if target_path.exists():
@@ -558,16 +570,125 @@ class MemoryManager:
             except Exception:
                 target_chapters = 0
 
+        # 优化Bug6: 合并 4 次独立 DB 连接为单次批量查询
+        world_settings = ""
+        characters = []
+        active_foreshadowing = []
+        recent_summaries = []
+        from core.config_loader import get as cfg
+        summary_count = cfg("novel", "recent_summary_count", 5)
+
+        with with_db_connection(self.novel_name) as conn:
+            # 世界观
+            row = conn.execute(
+                "SELECT content FROM world_settings WHERE id=1"
+            ).fetchone()
+            if row:
+                world_settings = row["content"]
+
+            # 人物
+            rows = conn.execute("SELECT * FROM characters").fetchall()
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["relationships"] = json.loads(d.get("relationships") or "{}")
+                except Exception:
+                    d["relationships"] = {}
+                characters.append(d)
+
+            # 活跃伏笔
+            f_rows = conn.execute(
+                "SELECT * FROM foreshadowing WHERE status='active'"
+            ).fetchall()
+            active_foreshadowing = [dict(r) for r in f_rows]
+
+            # 近期摘要（压缩版 + 最新N条非压缩）
+            compressed = conn.execute("""
+                SELECT chapter_num, summary FROM summaries
+                WHERE is_compressed=1
+                ORDER BY chapter_num DESC LIMIT 1
+            """).fetchone()
+            recent = conn.execute("""
+                SELECT chapter_num, summary FROM summaries
+                WHERE is_compressed=0
+                ORDER BY chapter_num DESC LIMIT ?
+            """, (summary_count,)).fetchall()
+
+            if compressed:
+                recent_summaries.append(dict(compressed))
+            recent_summaries.extend([dict(r) for r in reversed(recent)])
+
+        # 伏笔提示（基于已加载的活跃伏笔，不再额外查 DB）
+        foreshadow_hints = self._get_foreshadow_hints_from_list(
+            active_foreshadowing, chapter_num
+        )
+
         return {
-            "world_settings":       self.load_world_settings(),
-            "characters":           self.load_characters(),
-            "active_foreshadowing": self.load_active_foreshadowing(),
-            "foreshadow_hints":     self.get_foreshadow_hints(chapter_num),
-            "recent_summaries":     self.load_recent_summaries(),
+            "world_settings":       world_settings,
+            "characters":           characters,
+            "active_foreshadowing": active_foreshadowing,
+            "foreshadow_hints":     foreshadow_hints,
+            "recent_summaries":     recent_summaries,
             "chapter_num":          chapter_num,
             "outline":              outline,
             "target_chapters":      target_chapters,
         }
+
+    def _get_foreshadow_hints_from_list(self, active_list: list, chapter_num: int) -> list:
+        """从已加载的伏笔列表计算提示（复用 get_foreshadow_hints 逻辑，避免重复查 DB）"""
+        import re
+        MAX_HINTS = 8
+        URGENT_AGE = 20
+        NORMAL_AGE = 10
+        hints = []
+        for f in active_list:
+            desc        = f.get('description', '')
+            expected    = f.get('expected_redeem', '待定')
+            planted_at  = max(f.get('plant_chapter', 1) or 1, 1)
+            age         = chapter_num - planted_at
+            should_handle = False
+            handle_type   = "可铺垫"
+            priority      = 4
+            expected_clean = str(expected).strip() if expected else ""
+            if not expected_clean or expected_clean == "待定":
+                should_handle = True
+                if age >= URGENT_AGE:
+                    handle_type, priority = "久悬未兑现", 2
+                elif age >= NORMAL_AGE:
+                    handle_type, priority = "待推进", 3
+                else:
+                    handle_type, priority = "可铺垫", 4
+            else:
+                range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected_clean)
+                if range_match:
+                    s, e = int(range_match.group(1)), int(range_match.group(2))
+                    if s <= chapter_num <= e:
+                        should_handle, handle_type, priority = True, "应兑现", 0
+                    elif chapter_num > e:
+                        should_handle, handle_type, priority = True, "逾期未兑现", 0
+                else:
+                    single = re.search(r'第?(\d+)', expected_clean)
+                    if single:
+                        t = int(single.group(1))
+                        if chapter_num > t:
+                            should_handle, handle_type, priority = True, "逾期未兑现", 0
+                        elif abs(t - chapter_num) <= 3:
+                            should_handle = True
+                            handle_type = "应兑现" if t <= chapter_num else "即将兑现"
+                            priority = 0 if t <= chapter_num else 1
+                    elif any(kw in expected_clean for kw in ['高潮', '结局', '终章', '决战']):
+                        if age >= 5:
+                            should_handle, handle_type, priority = True, "可推进", 5
+            if should_handle:
+                hint = f"[{handle_type}] {desc}"
+                if expected_clean and expected_clean != "待定":
+                    hint += f"（计划：{expected_clean}）"
+                hints.append({"hint": hint, "handle_type": handle_type, "priority": priority, "age": age})
+        hints.sort(key=lambda x: (x["priority"], -x["age"]))
+        urgent  = [h for h in hints if h["priority"] <= 2]
+        others  = [h for h in hints if h["priority"] >  2]
+        selected = urgent + others[:max(0, MAX_HINTS - len(urgent))]
+        return [h["hint"] for h in selected]
 
     def get_last_chapter_ending(self, chapter_num: int, chars: int = 400) -> str:
         prev_num = chapter_num - 1

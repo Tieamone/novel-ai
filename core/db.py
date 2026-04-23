@@ -111,7 +111,8 @@ def init_database(novel_name: str):
             chapter_num INTEGER NOT NULL,
             summary TEXT NOT NULL,
             is_compressed INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chapter_num, is_compressed)
         )
     """)
 
@@ -145,6 +146,12 @@ def init_database(novel_name: str):
         cursor.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
             "idx_task_chapter_num ON chapter_tasks(chapter_num)"
+        )
+        # Fix Bug9: summaries 按 (chapter_num, is_compressed) 唯一，
+        # 防止同一章节重复插入非压缩摘要堆积数据
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_summary_chapter_compressed ON summaries(chapter_num, is_compressed)"
         )
     except Exception:
         pass
@@ -219,6 +226,15 @@ def _migrate(conn, cursor):
     try:
         cursor.execute(
             "UPDATE chapter_tasks SET status='待处理' WHERE status='pending'"
+        )
+    except Exception:
+        pass
+
+    # Fix Bug9: 为旧数据库的 summaries 表补加唯一索引
+    try:
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_summary_chapter_compressed ON summaries(chapter_num, is_compressed)"
         )
     except Exception:
         pass

@@ -483,13 +483,18 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
 
     while attempt < retry:
         try:
+            # Bug修复8: GLM系列不支持 enable_thinking 字段（会报400）
+            # Qwen3.x 系列用 extra_body 关闭思考模式，节省token
+            is_qwen_thinking = is_thinking and not any(
+                p in model_name.lower() for p in ("glm-", "gui-plus")
+            )
             kwargs = dict(
                 model=model_name,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
-            if is_thinking:
+            if is_qwen_thinking:
                 kwargs["extra_body"] = {"enable_thinking": False}
 
             response = client.chat.completions.create(**kwargs)

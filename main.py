@@ -2,6 +2,8 @@ import sys
 import os
 import shutil
 import json
+import signal
+import logging
 from pathlib import Path
 
 from core.memory_manager import MemoryManager
@@ -417,13 +419,28 @@ def get_next_chapter_goal(novel_name: str, chapter_num: int) -> tuple:
 
 
 def generate_chapter_auto(novel_name: str):
+    global _current_novel_name, _current_chapter_num
+    # Bug修复5: 改从 chapter_tasks 找最小的待处理章节，
+    # 避免 MAX(chapters) + 1 在中间有空缺时跳号
     with with_db_connection(novel_name) as conn:
-        row = conn.execute(
-            "SELECT MAX(chapter_num) as max_num FROM chapters"
-        ).fetchone()
+        pending_row = conn.execute("""
+            SELECT MIN(chapter_num) as next_num FROM chapter_tasks
+            WHERE status IN (?, ?)
+        """, (TASK_PENDING, "待处理")).fetchone()
 
-    last_num = row["max_num"] if row["max_num"] else 0
-    next_num = last_num + 1
+        if pending_row and pending_row["next_num"]:
+            next_num = pending_row["next_num"]
+        else:
+            # 兜底：fallback 到旧逻辑（所有任务已完成或任务表为空）
+            row = conn.execute(
+                "SELECT MAX(chapter_num) as max_num FROM chapters"
+            ).fetchone()
+            last_num = row["max_num"] if (row and row["max_num"]) else 0
+            next_num = last_num + 1
+
+    # 记录当前写作章节，供 Ctrl+C 处理器使用
+    _current_novel_name = novel_name
+    _current_chapter_num = next_num
 
     print(f"\n正在获取第{next_num}章任务...")
     plot_goal, emotion_tag = get_next_chapter_goal(novel_name, next_num)
@@ -482,6 +499,9 @@ def generate_chapter_auto(novel_name: str):
         )
         # 循环回去检查新一轮结果
 
+    # 章节完成/中断后清除全局追踪
+    _current_chapter_num = None
+
     if content:
         _save_chapter_memory(novel_name, next_num, content, plot_goal)
         export_chapter(novel_name, next_num)
@@ -516,8 +536,10 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
     mm = MemoryManager(novel_name)
     print("  正在提取章节记忆...")
 
-    raw = call_api(
-        system_prompt="你是小说编辑，提取章节关键信息，只输出JSON。",
+    # Bug修复6: 改用审核模型（更稳定的JSON输出），max_tokens提升到1200
+    from core.api_client import call_reviewer_api as _call_reviewer_api
+    raw = _call_reviewer_api(
+        system_prompt="你是小说编辑，提取章节关键信息，只输出JSON，不要Markdown代码块。",
         user_message=f"""分析以下章节，严格按JSON格式输出：
 
 {{
@@ -547,9 +569,9 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
 }}
 
 章节内容：
-{content[:5000]}""",
-        temperature=0.2,
-        max_tokens=800,
+{content[:8000]}""",
+        temperature=0.15,
+        max_tokens=1200,
     )
 
     match = re.search(r'\{.*\}', raw, re.DOTALL)
@@ -1381,10 +1403,74 @@ def _create_newbook_template():
         print(f"     可复制该文件并重命名为 newbook.txt 填写内容")
 
 
+# ==================== 日志配置（Fix Bug10） ====================
+def _setup_logging():
+    """初始化日志：控制台输出 INFO，文件记录 DEBUG（含 API 错误）"""
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / "run.log"
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+
+    # 只向文件写日志，不干扰 print 的控制台输出
+    logger = logging.getLogger("novel_ai")
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        logger.addHandler(file_handler)
+
+    return logger
+
+
+# ==================== Ctrl+C 状态回滚（Fix Bug7） ====================
+_current_novel_name: str = None
+_current_chapter_num: int = None
+
+
+def _register_sigint_handler():
+    """注册 Ctrl+C 处理器，保证章节状态正常回滚"""
+    def _handle_sigint(sig, frame):
+        print("\n\n[中断] 检测到 Ctrl+C，正在回滚章节状态...")
+        if _current_novel_name and _current_chapter_num:
+            try:
+                with with_db_connection(_current_novel_name) as conn:
+                    with DatabaseTransaction(conn):
+                        conn.execute(
+                            "UPDATE chapter_tasks SET status='待处理' "
+                            "WHERE chapter_num=? AND status='进行中'",
+                            (_current_chapter_num,)
+                        )
+                        conn.execute(
+                            "UPDATE chapters SET status='草稿' "
+                            "WHERE chapter_num=? AND status='writing'",
+                            (_current_chapter_num,)
+                        )
+                print(f"[OK] 第{_current_chapter_num}章状态已回滚为【待处理】")
+            except Exception as e:
+                print(f"[警告] 状态回滚失败（可在章节菜单手动恢复）：{e}")
+        from core.api_client import print_session_stats, get_session_stats
+        stats = get_session_stats()
+        if stats["total_calls"] > 0:
+            print_session_stats()
+        print("已安全退出。")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+
 def main():
     print("\n" + "=" * 50)
     print("       AI 网文写作系统 v1.0")
     print("=" * 50)
+
+    _setup_logging()
+    _register_sigint_handler()
 
     from core.api_client import select_model_interactive
     select_model_interactive()

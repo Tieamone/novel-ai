@@ -37,13 +37,21 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
 - 章节内部因果是否完整：有起因、有经过、有结果或悬念
 
 【L3 可读性与网文节奏】0-30分
-- 是否存在注水或重复表达（换了个词说同一件事，扣3-5分）
-- 是否具备有效冲突推进或信息推进
-- 结尾是否形成阅读驱动力（读者想继续看）
-- 是否存在比喻/修辞堆砌（平叙段每500字超过2处，或相邻段落出现结构相似比喻句，扣5-8分，code: metaphor_overload）
-- 是否缺少实质性对话（全章少于2轮有来有回的对话，扣3-5分）
-- 是否存在情绪标签化问题：直接用"她感到紧张/他心中涌起暖意"等方式陈述情绪，而非通过行为/生理反应展示（每处扣2-3分，code: emotion_labeling）
-- 结尾是否使用模板化收束句（"才刚刚开始"/"还很长"/"无论前方"类，扣3-5分，code: cliche_ending）
+
+→ AI痕迹检测（最高优先级，每类每处扣2-4分）：
+- 情绪标签直陈（emotion_labeling）：直接写"她感到紧张/他心中涌起/她不禁感动/他意识到"，而非通过行为或生理反应表达
+- 高频烂俗动作（cliche_action）：深吸一口气平复情绪、握紧拳头下定决心、瞳孔收缩察觉危险、喉咙发紧、脑海浮现
+- 模板收束句（cliche_ending）："这才刚开始/路还很长/无论前方有多少困难/故事远未结束"，每出现一次扣3-5分
+- 心理陈述结尾（psych_ending）：以"她决定了/他知道该怎么做了"等直接心理陈述收章，扣3分
+- 对称句式滥用（parallel_abuse）：连续出现"虽然…但依然/一方面…另一方面"超过2次，扣2-3分
+- 句子节奏单调（rhythm_flat）：全章句子长度高度均匀，缺乏长短句交错的节奏变化，扣2-3分
+
+→ 质量检测：
+- 注水或重复表达：换了个词说同一件事（扣3-5分）
+- 有效推进：是否有冲突升级、信息新增或关系变化（无推进扣5分）
+- 结尾驱动力：读者读完想不想翻下一章
+- 比喻堆砌（metaphor_overload）：平叙段每500字超过2处比喻/拟人（扣5-8分）
+- 缺实质性对话：全章少于2轮有来有回的对话（扣3-5分）
 
 一票否决项（任一命中即不通过，不受分数影响）：
 1) 核心设定冲突（setting_conflict）：与已建立的世界规则或关键事实直接矛盾
@@ -73,7 +81,7 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
   ],
   "l1_issues": ["具体问题描述"],
   "l2_issues": ["具体问题描述"],
-  "l3_issues": ["具体问题描述，注明是哪种类型（metaphor_overload/emotion_labeling/cliche_ending/注水/缺对话等）"],
+  "l3_issues": ["具体问题描述，注明类型（emotion_labeling/cliche_action/cliche_ending/psych_ending/parallel_abuse/rhythm_flat/metaphor_overload/注水/缺对话等），并引用原文具体句子"],
   "failure_attribution": {
     "primary_layer": "L1|L2|L3|none",
     "root_cause": "最关键失败原因（一句话），若通过写none",
@@ -611,7 +619,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                         f"【上次写作问题（责任编辑），本次必须修复】\n{retry_feedback}"
                     )
                 print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
-                print(f"  ⏭️ [DEBUG] 跳过读者视角评估，进入第{attempt+2}次写作循环")
+
                 continue  # ✅ 修复Bug2: 跳过读者视角，进入下一次写作
             else:
                 if result.get("review_error"):
@@ -670,13 +678,18 @@ def write_and_review(novel_name: str, chapter_num: int,
                 mm.increment_retry_count(chapter_num)
 
             if attempt < max_retry - 1:
-                retry_feedback = _build_retry_feedback(result)
-                reader_feedback = "\n【读者视角反馈】\n" + "\n".join([f"- {i}" for i in reader_result.get("issues", [])])
-                retry_feedback = (retry_feedback or "") + reader_feedback
-                if retry_feedback:
+                # Bug修复7: 读者视角失败时只用 reader_result 的问题，
+                # 不再混入已通过的责任编辑结果（可能含"质量合格"等无效信息）
+                reader_issues = reader_result.get("issues", [])
+                reader_suggestions = reader_result.get("suggestions", "")
+                reader_feedback_parts = [f"- {i}" for i in reader_issues if i]
+                if reader_suggestions and reader_suggestions not in ("", "质量合格"):
+                    reader_feedback_parts.append(f"- 建议：{reader_suggestions}")
+                if reader_feedback_parts:
                     plot_goal = (
                         f"{plot_goal}\n\n"
-                        f"【上次写作问题（读者视角），本次必须修复】\n{retry_feedback}"
+                        f"【上次写作问题（读者视角），本次必须修复）】\n"
+                        + "\n".join(reader_feedback_parts)
                     )
                 print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
             else:

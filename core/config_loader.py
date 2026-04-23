@@ -25,23 +25,48 @@ def load_config() -> dict:
 
 
 def get(section: str, key: str, *args, default=None):
+    """
+    安全的多级 key 访问，任一层不是 dict 或 key 不存在都返回默认值。
+    Bug修复12: 原版在中间层为 None 时会 TypeError，现在每层都做 isinstance 检查。
+
+    用法：
+        get("model", "max_tokens")              → config["model"]["max_tokens"]
+        get("model", "max_tokens", 4096)        → 带默认值
+        get("model", "reader_reviewer", "pass_threshold", 75)  → 三层嵌套
+        get("model", "reader_reviewer", "pass_threshold", default=75)  → 同上
+    """
     config = load_config()
-    if not args and default is None:
-        return config.get(section, {}).get(key)
-    if not args:
-        return config.get(section, {}).get(key, default)
-    *nested_keys, fallback = args
-    if default is not None:
+
+    # 确定最终 fallback
+    if args:
+        *nested_keys, fallback = args
+        if default is not None:
+            fallback = default
+    else:
+        nested_keys = []
         fallback = default
-    current = config.get(section, {})
-    if not isinstance(current, dict):
+
+    # 第一层
+    val = config.get(section)
+    if val is None:
         return fallback
-    current = current.get(key, fallback)
+
+    # 第二层
+    if not isinstance(val, dict):
+        return fallback
+    val = val.get(key)
+    if val is None:
+        return fallback
+
+    # 后续嵌套层
     for nk in nested_keys:
-        if not isinstance(current, dict):
+        if not isinstance(val, dict):
             return fallback
-        current = current.get(nk, fallback)
-    return current
+        val = val.get(nk)
+        if val is None:
+            return fallback
+
+    return val
 
 
 def get_data_dir(novel_name: str = "") -> Path:
@@ -58,13 +83,24 @@ def _get_defaults() -> dict:
     return {
         "model": {
             "max_tokens": 4096,
+            "api_region": "beijing",
+            "author": {"default_model": "qwen3.6-flash"},
+            "reviewer": {"default_model": "qwen3.6-flash"},
+            "reader_reviewer": {
+                "default_model": "qwen3.6-flash",
+                "enabled": True,
+                "pass_threshold": 75,
+            },
         },
         "novel": {
             "chapter_word_target": 3000,
+            "chapter_word_min": 2500,
+            "chapter_word_max": 3500,
             "max_retry": 3,
             "recent_summary_count": 5,
             "compress_after_chapters": 20,
             "pre_split_chapters": 50,
+            "failure_switch_threshold": 3,
         },
         "paths": {
             "data_dir": "data",

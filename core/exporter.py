@@ -1,9 +1,9 @@
 import sys
 import os
 import time
+import re
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import re
 from pathlib import Path
 from core.memory_manager import MemoryManager
 from core.db import get_connection
@@ -51,12 +51,28 @@ def load_sensitive_words(cache_seconds: int = 300) -> list:
 
 
 def clean_for_export(text: str) -> str:
+    """
+    清理 AI 生成物中的 Markdown 残留和系统标签，输出纯净正文。
+    """
+    # 去除【系统提示】类标签
     text = re.sub(r'【[^】]*】', '', text)
+    # 去除 **加粗**
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    # 去除 *斜体*（不跨行）
     text = re.sub(r'\*([^*\n]+)\*', r'\1', text)
+    # 去除 ## 标题符号
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # 去除 --- 分隔线
     text = re.sub(r'^\s*-{3,}\s*$', '', text, flags=re.MULTILINE)
+    # 去除 `行内代码`
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # 合并多余空行
     text = re.sub(r'\n{3,}', '\n\n', text)
+    # 去除章节结尾 AI 偶发的说明文字（"（本章完）"之后的模型旁白）
+    text = re.sub(r'\n+[（(]?本章完[）)].*$', '', text, flags=re.DOTALL)
 
+    # 敏感词替换
+    # Bug修复13: 改用 □ 代替 *，中文字符宽度一致，更难猜测原词
     words = load_sensitive_words()
     if not words or not text:
         return text.strip()
@@ -64,13 +80,22 @@ def clean_for_export(text: str) -> str:
     global _sensitive_words_pattern
     if _sensitive_words_pattern is not None:
         text = _sensitive_words_pattern.sub(
-            lambda m: '*' * len(m.group()), text
+            lambda m: '□' * len(m.group()), text
         )
     else:
         for word in words:
-            text = text.replace(word, '*' * len(word))
+            text = text.replace(word, '□' * len(word))
 
     return text.strip()
+
+
+def _sanitize_path_name(name: str) -> str:
+    """
+    Bug修复11: 将文件系统不支持的字符替换为下划线。
+    Windows 额外禁止：\\ / : * ? " < > |
+    """
+    sanitized = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', name)
+    return sanitized.strip("._") or "未命名"
 
 
 def export_chapter(novel_name: str, chapter_num: int) -> str:
@@ -83,7 +108,9 @@ def export_chapter(novel_name: str, chapter_num: int) -> str:
 
     content = clean_for_export(chapter["content"])
 
-    out_dir = get_output_dir(novel_name)
+    # Bug修复11: 小说名含特殊字符时安全创建目录（Windows 尤其重要）
+    safe_novel_name = _sanitize_path_name(novel_name)
+    out_dir = get_output_dir(safe_novel_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     filename = f"第{str(chapter_num).zfill(3)}章.txt"
