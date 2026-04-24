@@ -8,6 +8,7 @@
 import os
 import time
 import argparse
+import re
 from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -125,6 +126,33 @@ class FanqieUploader:
             print(f"导航到小说页面失败: {e}")
             return False
     
+    def get_current_chapter_count(self):
+        """
+        获取番茄小说后台当前章节数
+        """
+        print("正在获取当前章节数...")
+        
+        try:
+            # 进入章节管理页面
+            chapter_tab = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//a[contains(text(), '章节管理')]"))
+            )
+            chapter_tab.click()
+            
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "chapter-list"))
+            )
+            
+            # 查找章节列表中的章节数
+            chapter_items = self.driver.find_elements(By.CLASS_NAME, "chapter-item")
+            chapter_count = len(chapter_items)
+            
+            print(f"当前小说已有 {chapter_count} 章")
+            return chapter_count
+        except Exception as e:
+            print(f"获取章节数失败: {e}")
+            return 0
+    
     def upload_chapter(self, chapter_file):
         """
         上传单个章节
@@ -207,13 +235,41 @@ class FanqieUploader:
             if not self.navigate_to_novel():
                 return False
             
+            # 获取当前章节数
+            current_chapter_count = self.get_current_chapter_count()
+            print(f"番茄小说后台当前章节数: {current_chapter_count}")
+            
+            # 筛选需要上传的章节
+            chapters_to_upload = []
             for chapter_file in self.chapter_files:
+                # 从文件名中提取章节号
+                filename = os.path.basename(chapter_file)
+                chapter_num_match = re.search(r'第(\d+)章', filename)
+                if chapter_num_match:
+                    chapter_num = int(chapter_num_match.group(1))
+                    if chapter_num > current_chapter_count:
+                        chapters_to_upload.append((chapter_num, chapter_file))
+            
+            # 按章节号排序
+            chapters_to_upload.sort(key=lambda x: x[0])
+            chapters_to_upload = [file for _, file in chapters_to_upload]
+            
+            if not chapters_to_upload:
+                print("没有需要上传的新章节")
+                return True
+            
+            print(f"找到 {len(chapters_to_upload)} 个需要上传的新章节")
+            for file in chapters_to_upload:
+                print(f"  - {os.path.basename(file)}")
+            
+            # 上传新章节
+            for chapter_file in chapters_to_upload:
                 if not self.upload_chapter(chapter_file):
                     print(f"上传失败，继续处理下一个章节")
                 # 等待一段时间，避免触发反爬
                 time.sleep(5)
             
-            print("所有章节上传完成！")
+            print("所有新章节上传完成！")
             return True
         finally:
             self.driver.quit()
