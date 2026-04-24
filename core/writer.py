@@ -124,9 +124,10 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
     # ── 世界观（放宽截断：大模型上下文充足）────────────────────
     world = ctx.get("world_settings", "")[:2000]
 
-    # ── 人物（关系条数从3条放宽到5条）──────────────────────────
+    # ── 人物（含行为约束强化块）──────────────────────────────
     chars = ctx.get("characters", [])
     char_lines = []
+    behavior_rules = []   # 关键人物的行为硬约束，单独提取出来强调
     for c in chars:
         name = c.get("name", "未命名角色")
         role = c.get("role", "角色")
@@ -134,6 +135,8 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
         location = c.get("current_location", "未知地点")
         status = c.get("current_status", "状态未知")
         rels = c.get("relationships", {})
+        secret = c.get("secret", "")
+        weakness = c.get("weakness", "")
         rel_str = ""
         if rels:
             rel_pairs = [f"{k}：{v}" for k, v in list(rels.items())[:5]]
@@ -141,7 +144,32 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
         char_lines.append(
             f"{name}（{role}）：{personality}｜在{location}｜{status}{rel_str}"
         )
+        # 提取行为约束：从 personality / secret / weakness 中抽取"行为模式"关键句
+        behavior_clues = []
+        for field in [personality, secret, weakness]:
+            if not field:
+                continue
+            # 含有行为关键词的字段，提升为约束
+            behavior_keywords = ["先", "才", "绝不", "从不", "习惯", "必须", "一定",
+                                  "方式", "模式", "面对", "遇到", "处理", "分析", "观察"]
+            if any(kw in field for kw in behavior_keywords):
+                behavior_clues.append(field[:120])
+        if behavior_clues and role in ("主角", "主要角色", "配角", "反派"):
+            rules_text = "；".join(behavior_clues)
+            behavior_rules.append(f"【{name}】{rules_text}")
+
     chars_str = "\n".join(char_lines) if char_lines else "暂无人物信息"
+
+    # 行为约束块：如果有提取到，单独列为强约束
+    if behavior_rules:
+        behavior_constraint_block = (
+            "【人物行为硬约束——违反任一条即构成 OOC，审稿必然不通过】\n"
+            + "\n".join([f"⚠️  {r}" for r in behavior_rules])
+            + "\n\n写这些人物时，必须在行动前体现出上述行为模式。"
+            + "如果情节要求某人物做出与其行为模式相反的事，必须先写出触发这个改变的具体原因。"
+        )
+    else:
+        behavior_constraint_block = ""
 
     # ── 伏笔（统一使用优先级排序后的 hints，不再重复原始列表）──
     foreshadow_hints = ctx.get("foreshadow_hints", [])
@@ -197,6 +225,7 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
 【人物现状（写作时通过行动和对话体现性格，不要贴标签）】
 {chars_str}
 
+{behavior_constraint_block}
 {f_block}
 
 【前面发生了什么】
@@ -944,6 +973,7 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
     # ── 人物（关系条数从3条放宽到5条）──────────────────────────
     chars = ctx.get("characters", [])
     char_lines = []
+    behavior_rules = []
     for c in chars:
         name = c.get("name", "未命名角色")
         role = c.get("role", "角色")
@@ -951,6 +981,8 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
         location = c.get("current_location", "未知地点")
         status = c.get("current_status", "状态未知")
         rels = c.get("relationships", {})
+        secret = c.get("secret", "")
+        weakness = c.get("weakness", "")
         rel_str = ""
         if rels:
             rel_pairs = [f"{k}：{v}" for k, v in list(rels.items())[:5]]
@@ -958,7 +990,23 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
         char_lines.append(
             f"{name}（{role}）：{personality}｜在{location}｜{status}{rel_str}"
         )
+        # 提取行为约束
+        behavior_keywords = ["先", "才", "绝不", "从不", "习惯", "必须", "一定",
+                              "方式", "模式", "面对", "遇到", "处理", "分析", "观察"]
+        for field in [personality, secret, weakness]:
+            if field and any(kw in field for kw in behavior_keywords):
+                if role in ("主角", "主要角色", "配角", "反派"):
+                    behavior_rules.append(f"【{name}】{field[:120]}")
+                break
     chars_str = "\n".join(char_lines) if char_lines else "暂无人物信息"
+    if behavior_rules:
+        behavior_constraint_block = (
+            "【人物行为硬约束——违反即 OOC，审稿不通过】\n"
+            + "\n".join([f"⚠️  {r}" for r in behavior_rules])
+            + "\n\n如果情节要求违反上述行为模式，必须先写出明确的触发原因。"
+        )
+    else:
+        behavior_constraint_block = ""
 
     # ── 伏笔（统一使用优先级排序后的 hints）────────────────────
     foreshadow_hints = ctx.get("foreshadow_hints", [])
@@ -1015,6 +1063,7 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 【人物现状（写作时通过行动和对话体现性格，不要贴标签）】
 {chars_str}
 
+{behavior_constraint_block}
 {f_block}
 
 【前面发生了什么】
