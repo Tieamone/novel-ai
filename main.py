@@ -24,12 +24,15 @@ WINDOWS_RESERVED_NAMES = {
 TASK_PENDING = "待处理"
 TASK_IN_PROGRESS = "进行中"
 TASK_COMPLETED = "已完成"
-TASK_REVIEW_FAILED = "审稿失败"
-
-CHAPTER_STATUS_DRAFT = "草稿"
-CHAPTER_STATUS_APPROVED = "已审核"
-CHAPTER_STATUS_FORCE_APPROVED = "强制通过"
-CHAPTER_STATUS_REVIEW_FAILED = "审稿失败"
+from core.writer import AUTHOR_STYLES
+from core.db import (
+    CHAPTER_STATUS_DRAFT, CHAPTER_STATUS_WRITING,
+    CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED,
+    CHAPTER_STATUS_REVIEW_FAILED, CHAPTER_STATUS_PENDING_REVIEW,
+    TASK_STATUS_PENDING, TASK_STATUS_IN_PROGRESS,
+    TASK_STATUS_COMPLETED, TASK_STATUS_FAILED,
+)
+TASK_REVIEW_FAILED = CHAPTER_STATUS_REVIEW_FAILED  # 向后兼容别名
 CHAPTER_STATUS_DRAFT_ISSUES = "草稿(有问题)"
 
 
@@ -39,6 +42,24 @@ def _data_dir(novel_name: str) -> Path:
 
 def _output_dir(novel_name: str) -> Path:
     return Path(cfg("paths", "output_dir", "output")) / novel_name
+
+
+def _save_outline_with_backup(data_dir, outline_text: str):
+    """
+    保存总大纲，同时在 outlines_backup/ 目录下保留历史版本。
+    修复：大纲无版本控制——修改大纲后旧内容直接丢失的问题。
+    """
+    import datetime
+    outline_path = data_dir / "master_outline.md"
+    backup_dir   = data_dir / "outlines_backup"
+    if outline_path.exists():
+        backup_dir.mkdir(exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        (backup_dir / f"outline_{ts}.md").write_text(
+            outline_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    outline_path.write_text(f"# 总大纲\n\n{outline_text}", encoding="utf-8")
+
 
 
 def _get_target_chapters(novel_name: str) -> int:
@@ -218,7 +239,7 @@ def show_progress(novel_name: str):
         ).fetchone()["cnt"]
 
         draft = conn.execute(
-            "SELECT COUNT(*) as cnt FROM chapters WHERE status='draft'"
+            "SELECT COUNT(*) as cnt FROM chapters WHERE status='草稿' OR status='pending'"
         ).fetchone()["cnt"]
 
         total_chars = conn.execute(
@@ -307,10 +328,7 @@ def show_progress(novel_name: str):
         if raw_style.startswith("custom:"):
             style_name = "自定义风格"
         else:
-            from core.writer import AUTHOR_STYLES
             style_name = AUTHOR_STYLES.get(raw_style, {}).get("name", "未知")
-
-    from core.api_client import get_session_stats
     stats = get_session_stats()
     cost = stats["total_cost_yuan"]
     total_tokens = (stats["total_input_tokens"] +
@@ -394,7 +412,6 @@ def get_next_chapter_goal(novel_name: str, chapter_num: int) -> tuple:
         return "按照大纲继续推进剧情", "铺垫"
 
     outline = outline_path.read_text(encoding="utf-8")
-    from core.api_client import call_api
     import re
     result = call_api(
         system_prompt="你是小说策划师，根据大纲拆解章节任务。",
@@ -488,7 +505,6 @@ def generate_chapter_auto(novel_name: str):
         switch = input("请选择（默认1）：").strip()
         if switch != "2":
             break
-        from core.api_client import select_model_interactive
         select_model_interactive()
         print(f"\n[提示] 开始用新模型重新生成第{next_num}章...")
         content = write_and_review(
@@ -512,7 +528,6 @@ def generate_chapter_auto(novel_name: str):
             _update_task_status(novel_name, next_num, TASK_REVIEW_FAILED)
         else:
             _update_task_status(novel_name, next_num, TASK_PENDING)
-        from core.api_client import get_session_stats
         stats = get_session_stats()
         print(f"\n[完成] 第{next_num}章已生成并导出")
         print(f"文件：{_output_dir(novel_name)}/第{str(next_num).zfill(3)}章.txt")
@@ -528,66 +543,146 @@ def generate_chapter_auto(novel_name: str):
             print("\n[中断] 本章未完成，任务状态已回退为 待处理。")
 
 
+
+def _robust_json_extract(text: str) -> dict:
+    """
+    从模型输出中稳健提取 JSON 对象。
+    修复: 原贪婪正则 r'{.*}' 容易匹配错误片段。
+    改为首个 { 括号计数匹配对应闭括号。
+    """
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i+1])
+                except Exception:
+                    cleaned = chr(10).join(
+                        line for line in text[start:i+1].splitlines()
+                        if not line.strip().startswith('//')
+                    )
+                    try:
+                        return json.loads(cleaned)
+                    except Exception:
+                        return None
+    return None
+
+
+def _build_memory_prompt(chapter_num: int, content: str, mm) -> str:
+    """构建章节记忆提取 prompt，包含已知角色列表以防止重复创建"""
+    try:
+        known = mm._load_characters()
+        known_names = '、'.join([c.get('name', '') for c in known if c.get('name')]) or '无'
+    except Exception:
+        known_names = '无'
+
+    return f"""分析以下章节，严格按JSON格式输出（不要Markdown代码块，不要注释）：
+
+{{
+  "summary": "100字以内情节摘要",
+  "character_updates": [{{"name": "角色名", "location": "当前位置", "status": "当前状态（详细）"}}],
+  "relationship_updates": [{{"name": "角色A", "with": "角色B", "new_relationship": "新关系描述"}}],
+  "new_foreshadowing": [{{"fid": "F{chapter_num:03d}_1", "description": "伏笔描述（具体）", "expected_redeem": "预计兑现章节范围"}}],
+  "redeemed_foreshadowing": ["已兑现伏笔ID"],
+  "new_characters": [
+    {{
+      "name": "角色名（仅本章首次出现的全新角色）",
+      "role": "配角/龙套/反派",
+      "personality": "核心性格特质（至少30字，含行为倾向）",
+      "appearance": "外貌简要描述",
+      "first_chapter": {chapter_num}
+    }}
+  ]
+}}
+
+【重要】已知角色（不要出现在 new_characters 里）：{known_names}
+
+章节内容：
+{content[:8000]}"""
+
+
+
+
+def _robust_json_extract(text: str) -> dict:
+    """稳健提取 JSON：用括号计数代替贪婪正则，修复错误片段截取问题"""
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                fragment = text[start:i+1]
+                try:
+                    return __import__('json').loads(fragment)
+                except Exception:
+                    import re
+                    cleaned = re.sub(r'//[^\n]*', '', fragment)
+                    try:
+                        return __import__('json').loads(cleaned)
+                    except Exception:
+                        return None
+    return None
+
+
+def _build_memory_prompt(chapter_num: int, content: str, mm) -> str:
+    """构建章节记忆提取 prompt，含已知角色列表防止重复入库"""
+    try:
+        known = mm._load_characters()
+        known_names = '、'.join([c.get('name', '') for c in known if c.get('name')]) or '无'
+    except Exception:
+        known_names = '无'
+    return (
+        "分析以下章节，严格按JSON格式输出（不要Markdown代码块）：\n\n"
+        "{\n"
+        '  "summary": "100字以内情节摘要",\n'
+        '  "character_updates": [{"name": "角色名", "location": "位置", "status": "状态"}],\n'
+        '  "relationship_updates": [{"name": "角色A", "with": "角色B", "new_relationship": "新关系"}],\n'
+        f'  "new_foreshadowing": [{{"fid": "F{chapter_num:03d}_1", "description": "伏笔描述", "expected_redeem": "预计章节"}}],\n'
+        '  "redeemed_foreshadowing": ["已兑现伏笔ID列表"],\n'
+        '  "new_characters": [\n'
+        '    {"name": "仅本章首次出现的全新角色名", "role": "配角/龙套/反派",\n'
+        '     "personality": "核心性格特质（至少30字，含行为倾向）",\n'
+        '     "appearance": "外貌描述",\n'
+        f'     "first_chapter": {chapter_num}}}\n'
+        '  ]\n'
+        "}\n\n"
+        f"【重要】已知角色（不要出现在 new_characters 里）：{known_names}\n\n"
+        f"章节内容：\n{content[:8000]}"
+    )
+
+
 def _save_chapter_memory(novel_name: str, chapter_num: int,
                          content: str, plot_goal: str = "") -> str:
-    from core.api_client import call_api
     import json
     import re
     mm = MemoryManager(novel_name)
     print("  正在提取章节记忆...")
 
     # Bug修复6: 改用审核模型（更稳定的JSON输出），max_tokens提升到1200
-    from core.api_client import call_reviewer_api as _call_reviewer_api
     raw = _call_reviewer_api(
         system_prompt="你是小说编辑，提取章节关键信息，只输出JSON，不要Markdown代码块。",
-        user_message=f"""分析以下章节，严格按JSON格式输出：
-
-{{
-  "summary": "100字以内情节摘要",
-  "character_updates": [
-    {{
-      "name": "角色名",
-      "location": "当前位置",
-      "status": "当前状态"
-    }}
-  ],
-  "relationship_updates": [
-    {{
-      "name": "角色A",
-      "with": "角色B",
-      "new_relationship": "新的关系描述"
-    }}
-  ],
-  "new_foreshadowing": [
-    {{
-      "fid": "F{chapter_num:03d}_1",
-      "description": "伏笔描述",
-      "expected_redeem": "预计兑现章节"
-    }}
-  ],
-  "redeemed_foreshadowing": ["已兑现伏笔ID，没有则为空列表"]
-}}
-
-章节内容：
-{content[:8000]}""",
+        user_message=_build_memory_prompt(chapter_num, content, mm),
         temperature=0.15,
         max_tokens=1200,
     )
 
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not match:
-        mm.add_summary(chapter_num, raw[:200])
+    data = _robust_json_extract(raw)
+    if data is None:
+        fallback = re.sub(r'[\{\}\[\]]', '', raw).strip()[:200]
+        mm.add_summary(chapter_num, fallback or "摘要提取失败")
         print("  [OK] 摘要已保存（简单模式）")
         _trigger_compression(novel_name, mm)
-        return raw[:200]
-
-    try:
-        data = json.loads(match.group())
-    except Exception:
-        mm.add_summary(chapter_num, raw[:200])
-        print("  [OK] 摘要已保存（简单模式）")
-        _trigger_compression(novel_name, mm)
-        return raw[:200]
+        return fallback
 
     summary = data.get("summary", "")
     mm.add_summary(chapter_num, summary)
@@ -624,6 +719,35 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
         if fid:
             mm.redeem_foreshadowing(fid, chapter_num)
             print(f"  [OK] 伏笔兑现：{fid}")
+
+    # 新角色自动入库（Fix: 写作中新出现的配角/龙套之前完全不入库）
+    for nc in data.get("new_characters", []):
+        name = nc.get("name", "").strip()
+        role = nc.get("role", "龙套").strip()
+        personality = nc.get("personality", "").strip()
+        if not name or len(name) < 2:
+            continue
+        # 检查是否已存在
+        with with_db_connection(novel_name) as check_conn:
+            existing = check_conn.execute(
+                "SELECT name FROM characters WHERE name=?", (name,)
+            ).fetchone()
+        if existing:
+            continue  # 已存在，跳过
+        char_data = {
+            "role": role,
+            "appearance": nc.get("appearance", ""),
+            "personality": personality,
+            "secret": "",
+            "weakness": "",
+            "current_location": "",
+            "current_status": f"第{chapter_num}章首次出场",
+            "relationships": {},
+            "updated_chapter": chapter_num,
+        }
+        mm.save_character(name, char_data)
+        role_tag = "⭐ 配角" if role in ("配角", "反派") else "— 龙套"
+        print(f"  [OK] 新角色入库 {role_tag}：{name}（{role}）")
 
     _trigger_compression(novel_name, mm)
     return summary
@@ -687,7 +811,7 @@ def _recover_review_failed(novel_name: str):
             SELECT chapter_num, title, plot_goal, emotion_tag, content,
                    retry_count, LENGTH(content) as chars
             FROM chapters
-            WHERE status='review_failed'
+            WHERE status='审稿失败' OR status='review_failed'
             ORDER BY chapter_num
         """).fetchall()
 
@@ -736,9 +860,6 @@ def _recover_review_failed(novel_name: str):
     print("3. 强制通过并导出")
     print("0. 取消")
     action = input("请选择：").strip()
-
-    from core.reviewer import review_chapter
-
     if action == "1":
         content = target["content"] or ""
         if not content.strip():
@@ -813,7 +934,6 @@ def _recover_review_failed(novel_name: str):
 
 
 def _change_style(novel_name: str):
-    from core.writer import AUTHOR_STYLES
     print("\n" + "=" * 50)
     print("  更换写作风格")
     print("=" * 50)
@@ -1152,7 +1272,6 @@ def chapters_menu(novel_name: str):
             _change_style(novel_name)
 
         elif choice == "7":
-            from core.api_client import print_session_stats
             print_session_stats()
 
         elif choice == "8":
@@ -1165,12 +1284,9 @@ def chapters_menu(novel_name: str):
             _delete_chapters_batch(novel_name)
 
         elif choice == "11":
-            from core.api_client import select_all_models_interactive
             select_all_models_interactive()
 
         elif choice == "12":
-            from core.api_client import get_failure_stats, get_switch_history
-            from core.api_client import get_author_model, get_reviewer_model, get_reader_reviewer_model
             print("\n" + "=" * 60)
             print("  失败统计与模型状态")
             print("=" * 60)
@@ -1193,10 +1309,8 @@ def chapters_menu(novel_name: str):
             print("\n" + "=" * 60)
 
         elif choice == "0":
-            from core.api_client import get_session_stats
             stats = get_session_stats()
             if stats["total_calls"] > 0:
-                from core.api_client import print_session_stats
                 print_session_stats()
             break
 
@@ -1454,7 +1568,6 @@ def _register_sigint_handler():
                 print(f"[OK] 第{_current_chapter_num}章状态已回滚为【待处理】")
             except Exception as e:
                 print(f"[警告] 状态回滚失败（可在章节菜单手动恢复）：{e}")
-        from core.api_client import print_session_stats, get_session_stats
         stats = get_session_stats()
         if stats["total_calls"] > 0:
             print_session_stats()
@@ -1471,8 +1584,6 @@ def main():
 
     _setup_logging()
     _register_sigint_handler()
-
-    from core.api_client import select_model_interactive
     select_model_interactive()
 
     while True:
@@ -1498,8 +1609,6 @@ def main():
 
                 novel_name = import_data["novel_name"]
                 genre = import_data["genre"]
-
-                from core.db import init_database
                 init_database(novel_name)
                 _write_novel_info(novel_name, genre)
 
@@ -1540,8 +1649,6 @@ def main():
                 chapters_menu(novel_name)
             else:
                 novel_name, genre, keywords = setup_novel()
-
-                from core.db import init_database
                 init_database(novel_name)
                 _write_novel_info(novel_name, genre)
 
@@ -1621,11 +1728,9 @@ def main():
                 print("\n[提示] 已取消操作")
 
         elif choice == "4":
-            from core.api_client import select_all_models_interactive
             select_all_models_interactive()
 
         elif choice == "0":
-            from core.api_client import get_session_stats, print_session_stats
             stats = get_session_stats()
             if stats["total_calls"] > 0:
                 print_session_stats()

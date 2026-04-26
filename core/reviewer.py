@@ -420,7 +420,7 @@ def review_chapter(novel_name: str, chapter_num: int,
         raw = call_reviewer_api(
             system_prompt=REVIEWER_SYSTEM,
             user_message=prompt,
-            temperature=0.25,
+            temperature=cfg("temperature", "self_check", 0.25),
             max_tokens=1600,
         )
     except Exception as e:
@@ -588,7 +588,7 @@ def _replan_scene_for_veto(novel_name: str, chapter_num: int,
         new_goal = call_reviewer_api(
             system_prompt=SCENE_REPLAN_SYSTEM,
             user_message=prompt,
-            temperature=0.7,
+            temperature=cfg("temperature", "scene_replan", 0.70),
             max_tokens=400,
         )
         new_goal = new_goal.strip()

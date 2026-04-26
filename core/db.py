@@ -2,6 +2,18 @@ import sqlite3
 import os
 from pathlib import Path
 
+# ==================== 状态常量（Fix Bug3）====================
+CHAPTER_STATUS_DRAFT          = "草稿"
+CHAPTER_STATUS_WRITING        = "writing"
+CHAPTER_STATUS_APPROVED       = "已审核"
+CHAPTER_STATUS_FORCE_APPROVED = "强制通过"
+CHAPTER_STATUS_REVIEW_FAILED  = "审稿失败"
+CHAPTER_STATUS_PENDING_REVIEW = "pending_review"
+TASK_STATUS_PENDING     = "待处理"
+TASK_STATUS_IN_PROGRESS = "进行中"
+TASK_STATUS_COMPLETED   = "已完成"
+TASK_STATUS_FAILED      = "审稿失败"
+
 _initialized_novels = set()
 _wal_configured_paths = set()
 
@@ -77,6 +89,9 @@ def init_database(novel_name: str):
             review_veto_items TEXT,
             review_failure_attribution TEXT,
             review_updated_at TIMESTAMP,
+            reader_review_score INTEGER,
+            reader_review_passed INTEGER DEFAULT 0,
+            reader_review_issues TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -190,6 +205,9 @@ def _migrate(conn, cursor):
         "review_veto_items": "ALTER TABLE chapters ADD COLUMN review_veto_items TEXT",
         "review_failure_attribution": "ALTER TABLE chapters ADD COLUMN review_failure_attribution TEXT",
         "review_updated_at": "ALTER TABLE chapters ADD COLUMN review_updated_at TIMESTAMP",
+        "reader_review_score": "ALTER TABLE chapters ADD COLUMN reader_review_score INTEGER",
+        "reader_review_passed": "ALTER TABLE chapters ADD COLUMN reader_review_passed INTEGER DEFAULT 0",
+        "reader_review_issues": "ALTER TABLE chapters ADD COLUMN reader_review_issues TEXT",
     }
     for col, sql in additions.items():
         if col not in existing:

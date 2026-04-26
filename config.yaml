@@ -18,6 +18,30 @@ model:
     enabled: true
     pass_threshold: 75
 
+# ==================== 写作温度配置 ====================
+# 各任务类型的 temperature 统一在此管理，无需修改代码
+temperature:
+  # 创意写作类（章节正文、前半段、后半段）
+  writing_main: 0.85      # 大模型一次性生成整章
+  writing_first_half: 0.90  # 小模型前半段（略高，给开头更多创意空间）
+  writing_second_half: 0.70  # 小模型后半段（略低，保持与前半段连贯）
+  writing_supplement: 0.75   # 字数补写
+
+  # 修订类（自检修订、续写衔接）
+  revision: 0.70          # 自检修订（有问题时的润色）
+
+  # 质检类（自检判断、JSON 结构化输出）
+  self_check: 0.20        # 自检质检（越低越稳定）
+  beat_planner: 0.65      # 节拍规划
+
+  # 策划类（大纲、世界观、角色生成）
+  outline_gen: 0.90       # 总大纲生成（创意最强）
+  world_gen: 0.85         # 世界观生成
+  character_extract: 0.50 # 角色名提取（结构化，低温）
+  character_gen: 0.70     # 角色档案生成（结构化 JSON，不能太高）
+  task_split: 0.70        # 任务卡拆分（结构化 JSON）
+  scene_replan: 0.70      # veto 触发后场景重规划
+
 novel:
   chapter_word_target: 3500
   chapter_word_min: 3000

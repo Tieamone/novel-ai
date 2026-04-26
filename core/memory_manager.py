@@ -412,7 +412,7 @@ class MemoryManager:
         self._refresh_summaries_md()
 
     def _refresh_summaries_md(self):
-        recent = self.load_recent_summaries(10)
+        recent = self._load_recent_summaries(10)
         lines = ["# 近期章节摘要\n"]
         for s in recent:
             lines.append(f"## 第{s['chapter_num']}章摘要")

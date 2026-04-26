@@ -819,7 +819,7 @@ def _plan_chapter_beats(ctx: dict, chapter_num: int,
     raw = call_author_api(
         system_prompt=BEAT_PLANNER_SYSTEM,
         user_message=prompt,
-        temperature=0.65,
+        temperature=cfg("temperature", "beat_planner", 0.65),
         max_tokens=600,
     )
     return _normalize_beats(clean_content(raw))
@@ -867,7 +867,7 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
         revised = call_author_api(
             system_prompt=system_prompt + "\n\n" + REVISION_SYSTEM,
             user_message=revise_prompt,
-            temperature=0.7,
+            temperature=cfg("temperature", "revision", 0.70),
             max_tokens=max_tokens,
         )
         revised = clean_content(revised)
@@ -894,7 +894,7 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
     raw = call_author_api(
         system_prompt=SELF_CHECK_SYSTEM,
         user_message=check_prompt,
-        temperature=0.2,
+        temperature=cfg("temperature", "self_check", 0.20),
         max_tokens=600,
     )
     result = _extract_json_obj(raw)
@@ -941,7 +941,7 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
     revised = call_author_api(
         system_prompt=system_prompt + "\n\n" + REVISION_SYSTEM,
         user_message=revise_prompt,
-        temperature=0.7,
+        temperature=cfg("temperature", "revision", 0.70),
         max_tokens=max_tokens,
     )
     revised = clean_content(revised)
@@ -1219,7 +1219,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         full_content = call_author_api(
             system_prompt=system_prompt,
             user_message=prompt,
-            temperature=0.85,
+            temperature=cfg("temperature", "writing_main", 0.85),
             max_tokens=min(int(word_max * 1.75), 7000),
         )
         full_content = clean_content(full_content)
@@ -1239,7 +1239,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         first_half = call_author_api(
             system_prompt=system_prompt,
             user_message=prompt,
-            temperature=0.9,
+            temperature=cfg("temperature", "writing_first_half", 0.90),
             max_tokens=min(int(word_max // 2 * 1.5), max_tokens_cfg),
         )
         first_half = clean_content(first_half)
@@ -1254,7 +1254,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         second_half = call_author_api(
             system_prompt=system_prompt + "\n\n" + CONTINUE_SYSTEM_BASE,
             user_message=continue_prompt,
-            temperature=0.7,
+            temperature=cfg("temperature", "writing_second_half", 0.70),
             max_tokens=min(int(word_max // 2 * 1.5), max_tokens_cfg),
         )
         second_half = clean_content(second_half)
@@ -1290,7 +1290,7 @@ def write_chapter(novel_name: str, chapter_num: int,
                 f"本章目标：{plot_goal}\n"
                 f"请在结尾处自然延伸，补充约{shortage}字的正文内容。"
             ),
-            temperature=0.75,
+            temperature=cfg("temperature", "writing_supplement", 0.75),
             max_tokens=1024,
         )
         supplement = clean_content(supplement)

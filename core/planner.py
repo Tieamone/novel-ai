@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import re
 import json
-from core.api_client import call_author_api
+from core.api_client import call_author_api, call_reviewer_api
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg
 
@@ -305,7 +305,7 @@ def get_outline_choice(genre: str, keywords: str, novel_name: str,
     outline = call_author_api(
         system_prompt=_build_outline_prompt(target_chapters),
         user_message=f"小说名：{novel_name}\n类型：{genre}\n关键词/基本设定：{keywords}",
-        temperature=0.9,
+        temperature=cfg("temperature", "outline_gen", 0.90),
     )
     print("  [OK] 总大纲已生成")
     return outline
@@ -340,7 +340,7 @@ def get_characters_choice(outline: str) -> list:
     raw = call_author_api(
         system_prompt=CHARACTER_EXTRACT_PROMPT,
         user_message=f"大纲内容：\n{outline}",
-        temperature=0.5,
+        temperature=cfg("temperature", "character_extract", 0.50),
         max_tokens=300,
     )
 
@@ -394,7 +394,7 @@ def generate_world(novel_name: str, genre: str, outline: str,
             f"主要角色：{names_str}\n\n"
             f"大纲内容：\n{outline}"
         ),
-        temperature=0.85,
+        temperature=cfg("temperature", "world_gen", 0.85),
     )
     if review_mode:
         world = _confirm_text_draft("世界观", world)
@@ -408,21 +408,29 @@ def generate_world(novel_name: str, genre: str, outline: str,
 def generate_characters(character_names: list, outline: str,
                         world: str, mm: MemoryManager,
                         review_mode: bool = False) -> list:
+    """
+    生成角色档案。
+    Fix: 改用 call_reviewer_api（结构化JSON任务用低温更稳定）。
+    Fix: JSON 解析失败时自动重试一次，而非直接返回空档案。
+    """
     print("\n  正在生成人物档案...")
     names_str = "、".join(character_names)
-    raw = call_author_api(
-        system_prompt=CHARACTER_PROMPT,
-        user_message=(
-            f"角色名单：{names_str}\n\n"
-            f"大纲内容：\n{outline}\n\n"
-            f"世界观：\n{world}"
-        ),
-        temperature=0.8,
+    user_msg = (
+        f"角色名单：{names_str}\n\n"
+        f"大纲内容：\n{outline}\n\n"
+        f"世界观：\n{world}"
     )
 
-    match = re.search(r'\[.*\]', raw, re.DOTALL)
-    if not match:
-        print("  [警告] 人物档案解析失败，使用基础档案")
+    def _try_parse(raw: str):
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group())
+        except Exception:
+            return None
+
+    def _fallback_chars():
         for name in character_names:
             mm.save_character(name, {
                 "role": "待确认", "appearance": "", "personality": "",
@@ -432,18 +440,27 @@ def generate_characters(character_names: list, outline: str,
             })
         return [{"name": n} for n in character_names]
 
-    try:
-        characters = json.loads(match.group())
-    except Exception:
-        print("  [警告] JSON解析失败，使用基础档案")
-        for name in character_names:
-            mm.save_character(name, {
-                "role": "待确认", "appearance": "", "personality": "",
-                "secret": "", "weakness": "",
-                "current_location": "", "current_status": "",
-                "relationships": {}
-            })
-        return [{"name": n} for n in character_names]
+    # Fix: 用审稿模型调用（temperature更低，JSON格式更稳定）
+    raw = call_reviewer_api(
+        system_prompt=CHARACTER_PROMPT,
+        user_message=user_msg,
+        temperature=cfg("temperature", "character_gen", 0.70),
+    )
+    characters = _try_parse(raw)
+
+    if characters is None:
+        # 解析失败：用作者模型再试一次（换个模型可能换个格式）
+        print("  [提示] 人物档案首次解析失败，正在用备用模型重试...")
+        raw2 = call_author_api(
+            system_prompt=CHARACTER_PROMPT,
+            user_message=user_msg,
+            temperature=cfg("temperature", "character_gen", 0.70),
+        )
+        characters = _try_parse(raw2)
+
+    if characters is None:
+        print("  [警告] 人物档案两次解析均失败，使用基础档案（建议后续手动补全）")
+        return _fallback_chars()
 
     if review_mode:
         characters = _confirm_json_draft("人物档案JSON", characters, 2)
@@ -572,7 +589,7 @@ def split_outline_to_tasks(outline: str, novel_name: str,
     raw = call_author_api(
         system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
         user_message=_build_task_split_prompt(first_batch, full_target, outline),
-        temperature=0.7,
+        temperature=cfg("temperature", "task_split", 0.70),
         max_tokens=8000 if first_batch > 100 else 4000,
     )
 
@@ -622,7 +639,7 @@ def split_outline_to_tasks(outline: str, novel_name: str,
         supplement_raw = call_author_api(
             system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
             user_message=_build_task_split_prompt(shortage, shortage, outline, start=start_chapter),
-            temperature=0.7,
+            temperature=cfg("temperature", "task_split", 0.70),
             max_tokens=8000,
         )
 
@@ -685,7 +702,7 @@ def extend_tasks(novel_name: str, from_chapter: int):
         user_message=_build_extend_task_prompt(
             from_chapter, end_chapter, full_target or end_chapter, outline
         ),
-        temperature=0.7,
+        temperature=cfg("temperature", "task_split", 0.70),
         max_tokens=4000,
     )
 
@@ -716,6 +733,149 @@ def extend_tasks(novel_name: str, from_chapter: int):
     print(f"  [OK] 任务卡已扩展至第{end_chapter}章")
 
 
+
+# ==================== 大纲自审系统 ====================
+
+OUTLINE_REVIEW_SYSTEM = """你是一位资深网文编辑，专门审查AI生成大纲的结构质量。
+
+请从以下五个维度审查大纲，输出JSON：
+{
+  "pass": true/false,
+  "score": 0-100,
+  "issues": {
+    "three_act_structure": "三幕结构问题描述（无问题则为null）",
+    "rhythm_distribution": "节奏分布问题（铺垫/冲突/高潮比例是否合理，无问题则为null）",
+    "foreshadow_coverage": "伏笔覆盖问题（埋设章节与兑现章节是否都有，无问题则为null）",
+    "character_arc": "人物成长弧线是否清晰（无问题则为null）",
+    "ending_logic": "结局是否有依据、伏笔是否全部兑现（无问题则为null）"
+  },
+  "suggestions": ["具体修改建议1", "具体修改建议2"],
+  "revised_outline": null
+}
+
+评判标准：
+- 三幕结构：铺垫期约30%、发展期约50%、高潮结局约20%，且每幕都有清晰的转折点
+- 节奏分布：不能连续超过10章同一情绪标签，需要有高低起伏
+- 伏笔覆盖：每个埋设的伏笔必须有对应的兑现位置，不能无头无尾
+- 人物弧线：主角至少有一次重大的认知或行为转变，配角有自己的小弧线
+- 结局逻辑：结局不能是突然出现的，必须能在前文找到铺垫
+
+pass=false 的条件（任一满足）：
+- 三幕结构严重失衡（如结局部分不到5%或超过40%）
+- 存在3个以上无兑现位置的伏笔
+- 主角没有清晰的成长/转变
+
+只输出JSON，不要解释。"""
+
+
+TASK_VALIDATION_SYSTEM = """你是一位小说逻辑审查员，专门检查章节任务卡的可行性。
+
+任务：逐一检查每张任务卡的 plot_goal 是否：
+1. 与已知人物设定冲突（要求某角色做出违背其性格的行为）
+2. 过于模糊（不足以指导写作，如"主角继续前进"）
+3. 在当前剧情状态下逻辑上无法实现
+
+只输出JSON：
+{
+  "problematic_tasks": [
+    {
+      "chapter_num": 章号,
+      "issue_type": "ooc冲突/描述模糊/逻辑矛盾",
+      "issue_desc": "具体问题描述",
+      "suggestion": "修改建议"
+    }
+  ],
+  "pass_rate": 0.0-1.0
+}
+
+没有问题则 problematic_tasks 为空列表。只输出JSON。"""
+
+
+
+
+def review_outline_quality(outline: str, target_chapters: int,
+                           characters: list = None) -> dict:
+    """
+    大纲自审：检查三幕结构、节奏分布、伏笔覆盖率。
+    返回 review dict，包含 pass/score/issues/suggestions。
+    """
+    from core.api_client import call_reviewer_api
+    char_names = "、".join([c.get("name","") for c in (characters or [])]) or "未知"
+    prompt = (
+        f"目标章数：{target_chapters}章\n"
+        f"主要角色：{char_names}\n\n"
+        f"大纲内容：\n{outline[:6000]}"
+    )
+    try:
+        raw = call_reviewer_api(
+            system_prompt=OUTLINE_REVIEW_SYSTEM,
+            user_message=prompt,
+            temperature=cfg("temperature", "self_check", 0.20),
+            max_tokens=1200,
+        )
+        import json, re
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except Exception as e:
+        print(f"  [警告] 大纲自审失败（非致命）：{e}")
+    return {"pass": True, "score": 80, "issues": {}, "suggestions": []}
+
+
+def validate_task_cards(tasks: list, characters: list) -> dict:
+    """
+    任务卡可行性验证：检查每张任务卡的 plot_goal 是否与人物设定冲突或过于模糊。
+    返回 {"problematic_tasks": [...], "pass_rate": float}
+    """
+    from core.api_client import call_reviewer_api
+    import json, re
+
+    if not tasks:
+        return {"problematic_tasks": [], "pass_rate": 1.0}
+
+    # 只验证前50张（足够覆盖主要问题，避免 token 过多）
+    sample = tasks[:50]
+    char_summary = "\n".join([
+        f"- {c.get('name')}（{c.get('role','?')}）：{str(c.get('personality',''))[:80]}"
+        for c in characters[:8]
+    ])
+    tasks_text = "\n".join([
+        f"第{t.get('chapter_num')}章：{t.get('plot_goal','')}"
+        for t in sample
+    ])
+    prompt = (
+        f"人物设定：\n{char_summary}\n\n"
+        f"任务卡列表（共{len(tasks)}张，展示前{len(sample)}张）：\n{tasks_text}"
+    )
+    try:
+        raw = call_reviewer_api(
+            system_prompt=TASK_VALIDATION_SYSTEM,
+            user_message=prompt,
+            temperature=cfg("temperature", "self_check", 0.20),
+            max_tokens=1000,
+        )
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except Exception as e:
+        print(f"  [警告] 任务卡验证失败（非致命）：{e}")
+    return {"problematic_tasks": [], "pass_rate": 1.0}
+
+
+def _check_characters_completeness(characters: list) -> list:
+    """
+    人物档案完整性检查：personality 为空时返回问题角色列表。
+    """
+    incomplete = []
+    for c in characters:
+        name = c.get("name", "?")
+        personality = str(c.get("personality", "")).strip()
+        role = c.get("role", "")
+        if not personality and role not in ("龙套", "待确认"):
+            incomplete.append(name)
+    return incomplete
+
+
 # ==================== 主入口 ====================
 
 def run_planner(novel_name: str, genre: str, keywords: str) -> tuple:
@@ -741,6 +901,30 @@ def run_planner(novel_name: str, genre: str, keywords: str) -> tuple:
     )
     print("  [OK] 大纲已保存")
 
+    # ── 大纲自审（AI质检：三幕结构、节奏分布、伏笔覆盖）────────
+    print("\n  正在进行大纲质量自审...")
+    outline_review = review_outline_quality(outline, target_chapters)
+    score = outline_review.get("score", 80)
+    issues = outline_review.get("issues", {})
+    suggestions = outline_review.get("suggestions", [])
+    real_issues = {k: v for k, v in issues.items() if v}
+    print(f"  [大纲自审] 评分：{score}/100，{'通过' if outline_review.get('pass') else '发现问题'}")
+    if real_issues:
+        for k, v in real_issues.items():
+            print(f"  ⚠ {k}：{v}")
+    if suggestions:
+        print("  建议：")
+        for s in suggestions[:3]:
+            print(f"    · {s}")
+    if not outline_review.get("pass", True):
+        print("\n  大纲存在结构性问题。是否继续？（y=继续，n=返回修改大纲，默认y）")
+        choice = input("  ").strip().lower() or "y"
+        if choice == "n":
+            print("  请修改大纲后重新启动策划。")
+            return None, None
+    else:
+        print("  [OK] 大纲结构正常")
+
     # Step 2：角色名单
     character_names = get_characters_choice(outline)
     review_mode = _choose_draft_review_mode()
@@ -752,10 +936,25 @@ def run_planner(novel_name: str, genre: str, keywords: str) -> tuple:
     )
 
     # Step 4：人物档案
-    generate_characters(
+    characters = generate_characters(
         character_names, outline, world, mm,
         review_mode=review_mode
     )
+
+    # ── 人物档案完整性强制检查 ──────────────────────────────────
+    incomplete = _check_characters_completeness(characters or [])
+    if incomplete:
+        print(f"\n  ⚠ [人物档案] 以下角色 personality 为空，建议补全后继续：")
+        for n in incomplete:
+            print(f"    - {n}")
+        print("  空 personality 会导致写作时 OOC 风险大幅升高。")
+        print("  是否继续？（y=继续写作，n=返回补全档案，默认y）")
+        choice = input("  ").strip().lower() or "y"
+        if choice == "n":
+            print("  请在策划完成后手动编辑 data/<小说名>/characters.md 补全档案。")
+            print("  补全后可直接开始写作，无需重新策划。")
+    else:
+        print("  [OK] 人物档案完整性通过")
 
     # Step 5：写作风格
     style_key = get_style_choice()
@@ -777,6 +976,34 @@ def run_planner(novel_name: str, genre: str, keywords: str) -> tuple:
         target_chapters=target_chapters,
         full_batch=full_batch,
     )
+
+    # ── 任务卡可行性验证 ──────────────────────────────────────
+    print("\n  正在验证任务卡可行性...")
+    try:
+        all_tasks_for_check = []
+        import sqlite3
+        from core.db import get_connection
+        conn_check = get_connection(novel_name)
+        rows = conn_check.execute(
+            "SELECT chapter_num, plot_goal FROM chapter_tasks ORDER BY chapter_num"
+        ).fetchall()
+        conn_check.close()
+        all_tasks_for_check = [{"chapter_num": r[0], "plot_goal": r[1]} for r in rows]
+        char_list = mm._load_characters()
+        val_result = validate_task_cards(all_tasks_for_check, char_list)
+        problems = val_result.get("problematic_tasks", [])
+        pass_rate = val_result.get("pass_rate", 1.0)
+        print(f"  [任务卡验证] 通过率：{pass_rate*100:.0f}%，发现 {len(problems)} 个问题")
+        if problems:
+            for p in problems[:5]:
+                print(f"    ⚠ 第{p.get('chapter_num')}章 [{p.get('issue_type')}]：{p.get('issue_desc','')[:60]}")
+                print(f"       建议：{p.get('suggestion','')[:60]}")
+            if len(problems) > 5:
+                print(f"    ... 还有 {len(problems)-5} 个问题，建议在主菜单查看任务卡并手动修正")
+        else:
+            print("  [OK] 任务卡可行性验证通过")
+    except Exception as e:
+        print(f"  [提示] 任务卡验证跳过（非致命）：{e}")
 
     print("\n" + "=" * 50)
     print(f"策划完成！文件已保存到 data/{novel_name}/")

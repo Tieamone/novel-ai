@@ -33,10 +33,11 @@ _session_stats = {
     "model_used": "",
 }
 
+# Fix Bug1: 统一 key 命名，与调用方传入的 "author"/"reviewer"/"reader_reviewer" 一致
 _failure_stats = {
-    "author_failures": 0,
-    "reviewer_failures": 0,
-    "reader_reviewer_failures": 0,
+    "author": 0,
+    "reviewer": 0,
+    "reader_reviewer": 0,
 }
 
 _switch_history = []
