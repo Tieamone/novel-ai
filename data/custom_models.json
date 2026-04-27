@@ -97,5 +97,71 @@
     "output_price": 0.012,
     "has_free_quota": true,
     "recommended_uses": ["author", "reviewer"]
+  },
+  {
+    "model": "deepseek-v4-pro",
+    "name": "DeepSeek V4 Pro",
+    "category": "premium",
+    "description": "阿里云免费体验模型，适合高质量写作与审稿",
+    "context_length": 131072,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "recommended_uses": ["author", "reviewer", "reader_reviewer"]
+  },
+  {
+    "model": "deepseek-v4-flash",
+    "name": "DeepSeek V4 Flash",
+    "category": "balanced",
+    "description": "阿里云免费体验模型，速度更快，适合高频调用",
+    "context_length": 131072,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "recommended_uses": ["author", "reviewer", "reader_reviewer"]
+  },
+  {
+    "model": "qwen3.5-plus-2026-04-20",
+    "name": "千问3.5-Plus 2026-04-20",
+    "category": "balanced",
+    "description": "阿里云免费体验模型，适合稳定写作与审稿",
+    "context_length": 32768,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "recommended_uses": ["author", "reviewer", "reader_reviewer"]
+  },
+  {
+    "model": "qwen3.6-27b",
+    "name": "千问3.6-27B",
+    "category": "premium",
+    "description": "阿里云免费体验模型，中大参数量写作模型",
+    "context_length": 131072,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "recommended_uses": ["author", "reviewer", "reader_reviewer"]
+  },
+  {
+    "model": "kimi-k2.6",
+    "name": "Kimi K2.6",
+    "category": "premium",
+    "description": "阿里云免费体验模型，适合长上下文创作与审稿",
+    "context_length": 131072,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "recommended_uses": ["author", "reviewer", "reader_reviewer"]
+  },
+  {
+    "model": "qwen3.6-max-preview",
+    "name": "千问3.6-Max Preview",
+    "category": "premium",
+    "description": "阿里云免费体验模型，偏高质量预览版",
+    "context_length": 131072,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "recommended_uses": ["author", "reviewer", "reader_reviewer"]
   }
 ]

@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from dotenv import load_dotenv
 
@@ -48,8 +49,12 @@ FREE_TRIAL_MODEL_NAMES = {
     "qwen3.6-flash", "qwen3.6-flash-2026-04-16",
     "qwen3.6-35b-a3b",
     "qwen3.6-plus", "qwen3.6-plus-2026-04-02",
+    "qwen3.5-plus-2026-04-20",
+    "qwen3.6-27b", "qwen3.6-max-preview",
     "qwen3.5-35b-a3b", "qwen3.5-flash-2026-02-23",
     "glm-5.1", "glm-5",
+    "deepseek-v4-pro", "deepseek-v4-flash",
+    "kimi-k2.6",
     "gui-plus-2026-02-26",
     "qwen-flash-character-2026-02-26",
 }
@@ -62,6 +67,17 @@ _DASHSCOPE_ENDPOINTS = {
 }
 # 运行时端点缓存（由验证成功后写入）
 _working_endpoint: str = None
+
+
+def _console_safe(text) -> str:
+    """降级不可被当前终端编码输出的字符，避免 Windows GBK 控制台崩溃。"""
+    s = str(text)
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        s.encode(encoding)
+        return s
+    except Exception:
+        return s.encode(encoding, errors="replace").decode(encoding, errors="replace")
 
 
 def _get_dashscope_base_url() -> str:
@@ -111,7 +127,7 @@ def get_available_models(refresh: bool = False, usage: str = None) -> dict:
     if usage:
         try:
             from core.model_manager import get_models_for_usage, model_list_to_menu_format
-            filtered_models = get_models_for_usage(usage, top_k=8)
+            filtered_models = get_models_for_usage(usage, top_k=30)
             return model_list_to_menu_format(filtered_models)
         except Exception as e:
             print(f"[警告] 模型筛选失败，返回所有模型：{e}")
@@ -163,10 +179,16 @@ MODEL_PRICING = {
     "qwen3.6-35b-a3b":          {"input": 0.0,     "output": 0.0},
     "qwen3.6-plus":             {"input": 0.0,     "output": 0.0},
     "qwen3.6-plus-2026-04-02":  {"input": 0.0,     "output": 0.0},
+    "qwen3.5-plus-2026-04-20":  {"input": 0.0,     "output": 0.0},
+    "qwen3.6-27b":              {"input": 0.0,     "output": 0.0},
+    "qwen3.6-max-preview":      {"input": 0.0,     "output": 0.0},
     "qwen3.5-35b-a3b":          {"input": 0.0,     "output": 0.0},
     "qwen3.5-flash-2026-02-23": {"input": 0.0,     "output": 0.0},
     "glm-5.1":                  {"input": 0.0,     "output": 0.0},
     "glm-5":                    {"input": 0.0,     "output": 0.0},
+    "deepseek-v4-pro":          {"input": 0.0,     "output": 0.0},
+    "deepseek-v4-flash":        {"input": 0.0,     "output": 0.0},
+    "kimi-k2.6":                {"input": 0.0,     "output": 0.0},
     "gui-plus-2026-02-26":      {"input": 0.0,     "output": 0.0},
     "qwen-flash-character-2026-02-26": {"input": 0.0, "output": 0.0},
     "gemini-2.5-flash":         {"input": 0.0,     "output": 0.0},
@@ -355,7 +377,7 @@ def set_author_model(model_name: str, provider: str = None):
         provider = "gemini" if "gemini" in model_name else "dashscope"
     _author_provider = provider
     _switch_history.append({"type": "author", "old_model": old_model, "new_model": model_name, "timestamp": time.time()})
-    print(f"[模型切换] 作者模型已切换：{old_model} → {model_name}")
+    print(f"[模型切换] 作者模型已切换：{old_model} -> {model_name}")
 
 
 def set_reviewer_model(model_name: str, provider: str = None):
@@ -366,7 +388,7 @@ def set_reviewer_model(model_name: str, provider: str = None):
         provider = "gemini" if "gemini" in model_name else "dashscope"
     _reviewer_provider = provider
     _switch_history.append({"type": "reviewer", "old_model": old_model, "new_model": model_name, "timestamp": time.time()})
-    print(f"[模型切换] 审核模型已切换：{old_model} → {model_name}")
+    print(f"[模型切换] 审核模型已切换：{old_model} -> {model_name}")
 
 
 def set_reader_reviewer_model(model_name: str, provider: str = None):
@@ -377,7 +399,7 @@ def set_reader_reviewer_model(model_name: str, provider: str = None):
         provider = "gemini" if "gemini" in model_name else "dashscope"
     _reader_reviewer_provider = provider
     _switch_history.append({"type": "reader_reviewer", "old_model": old_model, "new_model": model_name, "timestamp": time.time()})
-    print(f"[模型切换] 读者视角模型已切换：{old_model} → {model_name}")
+    print(f"[模型切换] 读者视角模型已切换：{old_model} -> {model_name}")
 
 
 def increment_failure_counter(counter_type: str):
@@ -528,7 +550,7 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
                     fallback = _DASHSCOPE_ENDPOINTS["beijing"]
                 else:
                     fallback = _DASHSCOPE_ENDPOINTS["intl"]
-                print(f"  [端点切换] {base_url} 连接失败，自动切换 → {fallback}")
+                print(f"  [端点切换] {base_url} 连接失败，自动切换 -> {fallback}")
                 base_url = fallback
                 client = make_client(base_url)
                 endpoint_switched = True
@@ -545,7 +567,7 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
 
             # 其他错误
             err_info = _format_api_error(e, "DashScope", attempt + 1, retry)
-            print(f"\n❌ [{err_info['category']}] DashScope")
+            print(f"\n[ERROR] [{err_info['category']}] DashScope")
             print(f"   模型：{model_name}  端点：{base_url}")
             print(f"   详情: {err_info['message'][:300]}")
             print(f"   建议: {err_info['suggestion']}")
@@ -610,7 +632,7 @@ def _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, tem
             raise
         except Exception as e:
             err_info = _format_api_error(e, "DashScope(SDK)", attempt + 1, retry)
-            print(f"\n❌ [{err_info['category']}] DashScope(SDK)")
+            print(f"\n[ERROR] [{err_info['category']}] DashScope(SDK)")
             print(f"   详情: {err_info['message'][:200]}")
             print(f"   建议: {err_info['suggestion']}")
             if attempt < retry - 1:
@@ -663,7 +685,7 @@ def _call_gemini(system_prompt, user_message, model_name, max_tokens, temperatur
                 continue
 
             err_info = _format_api_error(e, "Gemini", attempt + 1, retry)
-            print(f"\n❌ [{err_info['category']}] Gemini")
+            print(f"\n[ERROR] [{err_info['category']}] Gemini")
             print(f"   详情: {err_info['message'][:200]}")
             print(f"   建议: {err_info['suggestion']}")
             if attempt < retry - 1:
@@ -713,17 +735,17 @@ def select_model_interactive() -> dict:
     for key, info in models.items():
         api_key_val = os.getenv(info["env_key"], "")
         has_key = api_key_val and len(api_key_val) > 10
-        status = "✓ Key已填写" if has_key else "✗ Key未填写"
+        status = "Key已填写" if has_key else "Key未填写"
         # Bug修复: 显示价格时使用修正后的定价（试用模型强制显示免费）
         pricing = get_model_pricing(info["model"])
         inp = pricing.get("input", 0)
         out = pricing.get("output", 0)
         if inp == 0.0 and out == 0.0:
-            price_str = "★ 免费/试用额度"
+            price_str = "免费/试用额度"
         else:
             price_str = f"输入¥{inp * 1000:.2f}/百万token  输出¥{out * 1000:.2f}/百万token"
-        print(f"  {key}. {info['name']:<38} [{status}]")
-        print(f"      {price_str}")
+        print(_console_safe(f"  {key}. {info['name']:<38} [{status}]"))
+        print(_console_safe(f"      {price_str}"))
 
     default_choice = "1"
     for key, info in models.items():
@@ -763,7 +785,7 @@ def select_model_interactive() -> dict:
         _reader_reviewer_model = _INITIAL_READER
         _reader_reviewer_provider = "dashscope"
 
-    print(f"\n[OK] 作者模型已选择：{selected['name']}")
+    print(_console_safe(f"\n[OK] 作者模型已选择：{selected['name']}"))
     print(f"     模型代码：{selected['model']}")
     if selected["provider"] == "dashscope":
         print(f"     API端点：{_get_dashscope_base_url()}")
@@ -776,9 +798,9 @@ def select_model_interactive() -> dict:
     try:
         call_author_api(system_prompt="你是助手。", user_message="回复ok两个字",
                         max_tokens=10, temperature=0.1, retry=1)
-        print("     [✓ 验证通过] 模型响应正常\n")
+        print("     [OK] 验证通过，模型响应正常\n")
     except Exception as e:
-        print(f"     [✗ 验证失败] {e}")
+        print(f"     [ERROR] 验证失败：{e}")
         print("     该模型当前不可用，请重新选择\n")
         return select_model_interactive()
 
@@ -816,16 +838,16 @@ def _select_single_model(prompt_title: str, default: str, usage: str = None) -> 
     for key, info in models.items():
         api_key_val = os.getenv(info["env_key"], "")
         has_key = api_key_val and len(api_key_val) > 10
-        status = "✓ Key已填写" if has_key else "✗ Key未填写"
+        status = "Key已填写" if has_key else "Key未填写"
         pricing = get_model_pricing(info["model"])
         inp = pricing.get("input", 0)
         out = pricing.get("output", 0)
         if inp == 0.0 and out == 0.0:
-            price_str = "★ 免费/试用额度"
+            price_str = "免费/试用额度"
         else:
             price_str = f"输入¥{inp * 1000:.2f}/百万  输出¥{out * 1000:.2f}/百万"
-        print(f"  {key}. {info['name']:<32} [{status}]")
-        print(f"      {price_str}")
+        print(_console_safe(f"  {key}. {info['name']:<32} [{status}]"))
+        print(_console_safe(f"      {price_str}"))
 
     print()
     choice = input(f"请选择{prompt_title}（直接回车默认选{default}）：").strip() or default
@@ -841,14 +863,14 @@ def _select_single_model(prompt_title: str, default: str, usage: str = None) -> 
         print(f"\n[错误] 未找到 {selected['env_key']}")
         return _select_single_model(prompt_title, default)
 
-    print(f"  正在验证 {selected['name']}...")
+    print(_console_safe(f"  正在验证 {selected['name']}..."))
     try:
         call_api(system_prompt="你是助手。", user_message="回复ok",
                  model_name=selected["model"], provider=selected["provider"],
                  max_tokens=10, temperature=0.1, retry=1)
-        print(f"  [✓] {selected['name']} 验证通过")
+        print(_console_safe(f"  [OK] {selected['name']} 验证通过"))
     except Exception as e:
-        print(f"  [✗] 验证失败：{e}")
+        print(f"  [ERROR] 验证失败：{e}")
         return _select_single_model(prompt_title, default)
 
     return selected

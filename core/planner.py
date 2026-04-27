@@ -989,7 +989,7 @@ def run_planner(novel_name: str, genre: str, keywords: str) -> tuple:
         ).fetchall()
         conn_check.close()
         all_tasks_for_check = [{"chapter_num": r[0], "plot_goal": r[1]} for r in rows]
-        char_list = mm._load_characters()
+        char_list = mm.load_characters()
         val_result = validate_task_cards(all_tasks_for_check, char_list)
         problems = val_result.get("problematic_tasks", [])
         pass_rate = val_result.get("pass_rate", 1.0)

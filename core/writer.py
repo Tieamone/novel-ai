@@ -114,7 +114,7 @@ def _build_outline_block(outline: str, max_chars: int = 1200) -> str:
 
 
 def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
-                              author_style, beat_plan, prev_chapter_ending="",
+                              beat_plan, prev_chapter_ending="",
                               word_min=3000, word_max=4000) -> str:
     """构建一次性生成整章的prompt（用于大模型）"""
     # ── 进度 & 大纲（新增）──────────────────────────────────────
@@ -756,8 +756,8 @@ def _normalize_beats(raw: str) -> str:
 
 
 def _count_matching_words(text1: str, text2: str) -> int:
-    words1 = re.findall(r'[\u4e00-\u9fa5]+', text1.lower())
-    words2 = re.findall(r'[\u4e00-\u9fa5]+', text2.lower())
+    words1 = re.findall(r'[\u4e00-\u9fa5]+', text1)
+    words2 = re.findall(r'[\u4e00-\u9fa5]+', text2)
     match_count = 0
     for w1 in words1:
         for w2 in words2:
@@ -959,7 +959,6 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
 
 def build_writer_prompt(ctx: dict, chapter_num: int,
                         plot_goal: str, emotion_tag: str,
-                        author_style: dict,
                         beat_plan: str = "",
                         prev_chapter_ending: str = "",
                         word_min=3000, word_max=4000) -> str:
@@ -1211,7 +1210,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         print(f"  正在生成第{chapter_num}章（完整章节·{emotion_tag}）...")
         
         prompt = build_full_chapter_prompt(
-            ctx, chapter_num, plot_goal, emotion_tag, author_style, beat_plan,
+            ctx, chapter_num, plot_goal, emotion_tag, beat_plan,
             prev_chapter_ending=prev_chapter_ending,
             word_min=word_min, word_max=word_max
         )
@@ -1232,7 +1231,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         # 前半段
         print(f"  正在生成第{chapter_num}章（前半段·{emotion_tag}）...")
         prompt = build_writer_prompt(
-            ctx, chapter_num, plot_goal, emotion_tag, author_style, beat_plan,
+            ctx, chapter_num, plot_goal, emotion_tag, beat_plan,
             prev_chapter_ending=prev_chapter_ending,
             word_min=word_min, word_max=word_max
         )
@@ -1260,16 +1259,16 @@ def write_chapter(novel_name: str, chapter_num: int,
         second_half = clean_content(second_half)
         print(f"  后半段完成：{len(second_half)}字")
 
-        # 检测结尾复用
-        if prev_chapter_ending and len(prev_chapter_ending) > 50:
-            second_half_start = second_half[:100] if len(second_half) > 100 else second_half
-            if _count_matching_words(prev_chapter_ending[-50:], second_half_start) > 15:
-                print("  [警告] 检测到与上一章结尾的潜在复用，将标记修订")
-                mm.update_chapter_status(chapter_num, "草稿(有问题)")
-
         full_content = f"{first_half}\n\n{second_half}"
         del first_half, second_half
         full_content = re.sub(r'\n{3,}', '\n\n', full_content)
+
+    # 检测与上一章结尾的潜在复用（两种生成模式均需检查）
+    if prev_chapter_ending and len(prev_chapter_ending) > 50:
+        content_start = full_content[:100] if len(full_content) > 100 else full_content
+        if _count_matching_words(prev_chapter_ending[-50:], content_start) > 15:
+            print("  [警告] 检测到与上一章结尾的潜在复用，将标记修订")
+            mm.update_chapter_status(chapter_num, "草稿(有问题)")
 
     # 字数补写
     min_words = word_min

@@ -154,8 +154,8 @@ def _normalize_review_result(raw_result: dict) -> dict:
 
     total_raw = raw_result.get("score_total")
     if total_raw is None:
-        # 新版：四维求和
-        if score_ai > 0:
+        # 新版：四维求和（用字段存在性判断，避免 score_ai=0 时误判为旧版）
+        if "score_ai_authenticity" in raw_result:
             score_total = score_ai + score_logic + score_consistency + score_readability
         else:
             # 旧版兼容
@@ -164,7 +164,7 @@ def _normalize_review_result(raw_result: dict) -> dict:
         score_total = _to_int(total_raw, 0, 0, 100)
 
     # 子项合计校验（偏差超过10分时以子项合计为准）
-    if score_ai > 0:
+    if "score_ai_authenticity" in raw_result:
         expected = score_ai + score_logic + score_consistency + score_readability
     else:
         expected = score_logic + score_consistency + score_style + score_readability
@@ -218,8 +218,10 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
         return {
             "pass": True,
             "score_total": 100,
+            "score_ai_authenticity": 25,
             "score_logic": 25,
             "score_consistency": 25,
+            "score_readability": 25,
             "score_style": 25,
             "score_experience": 25,
             "veto_triggered": False,
@@ -240,21 +242,14 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
 
     print(f"  [读者视角] 正在评估第{chapter_num}章...")
 
-    # Bug修复9: 上一章只传结尾800字，避免两章全文撑爆 token 窗口
+    # 上一章只传结尾部分，避免两章全文撑爆 token 窗口
     if prev_chapter_content and len(prev_chapter_content) > 800:
         prev_snippet = "...（省略前段）...\n" + prev_chapter_content[-800:]
     else:
         prev_snippet = prev_chapter_content or "（首章，无上一章）"
 
-    # 当前章节：超长时保留首800+尾800（审稿最关注开头和结尾）
-    if len(current_content) > 3000:
-        current_snippet = (
-            current_content[:1200]
-            + "\n\n[... 中间部分已省略 ...]\n\n"
-            + current_content[-1200:]
-        )
-    else:
-        current_snippet = current_content
+    # 当前章节：超长时使用智能截断（优先保留开头完整段落，兼顾首尾）
+    current_snippet = _truncate_content(current_content, 3000, "当前章节") or current_content
 
     prompt = READER_REVIEW_PROMPT.format(
         prev_chapter_content=prev_snippet,

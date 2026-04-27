@@ -6,11 +6,29 @@ import signal
 import logging
 from pathlib import Path
 
+from core.api_client import (
+    call_api,
+    call_reviewer_api,
+    get_author_model,
+    get_failure_stats,
+    get_reader_reviewer_model,
+    get_reviewer_model,
+    get_session_stats,
+    get_switch_history,
+    print_session_stats,
+    select_all_models_interactive,
+    select_model_interactive,
+)
 from core.memory_manager import MemoryManager
-from core.planner import run_planner, extend_tasks
-from core.reviewer import write_and_review
+from core.planner import (
+    extend_tasks,
+    get_style_choice,
+    run_planner,
+    split_outline_to_tasks,
+)
+from core.reviewer import review_chapter, write_and_review
 from core.exporter import export_chapter, export_all
-from core.db import get_connection, clean_duplicate_chapters
+from core.db import clean_duplicate_chapters, get_connection, init_database
 from core.utils import with_db_connection, DatabaseTransaction, execute_with_retry
 from core.config_loader import get as cfg
 
@@ -577,7 +595,7 @@ def _robust_json_extract(text: str) -> dict:
 def _build_memory_prompt(chapter_num: int, content: str, mm) -> str:
     """构建章节记忆提取 prompt，包含已知角色列表以防止重复创建"""
     try:
-        known = mm._load_characters()
+        known = mm.load_characters()
         known_names = '、'.join([c.get('name', '') for c in known if c.get('name')]) or '无'
     except Exception:
         known_names = '无'
@@ -637,7 +655,7 @@ def _robust_json_extract(text: str) -> dict:
 def _build_memory_prompt(chapter_num: int, content: str, mm) -> str:
     """构建章节记忆提取 prompt，含已知角色列表防止重复入库"""
     try:
-        known = mm._load_characters()
+        known = mm.load_characters()
         known_names = '、'.join([c.get('name', '') for c in known if c.get('name')]) or '无'
     except Exception:
         known_names = '无'
@@ -669,7 +687,7 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
     print("  正在提取章节记忆...")
 
     # Bug修复6: 改用审核模型（更稳定的JSON输出），max_tokens提升到1200
-    raw = _call_reviewer_api(
+    raw = call_reviewer_api(
         system_prompt="你是小说编辑，提取章节关键信息，只输出JSON，不要Markdown代码块。",
         user_message=_build_memory_prompt(chapter_num, content, mm),
         temperature=0.15,

@@ -10,3 +10,11 @@
 | 2026-04-03 | 用户输入无效数据时程序崩溃或提示不清晰 | 输入验证简单，缺少循环重试和友好提示 | 改进所有输入场景：循环验证、emoji 提示、范围检查、支持 Ctrl+C 中断 | ✅ 已解决 |
 | 2026-04-03 | 删除操作确认不够明确，容易误操作 | 确认方式不够直观，缺少详细信息展示 | 改用 'yes' 确认 + emoji 展示删除对象详情 + 二次确认 ('YES') | ✅ 已解决 |
 | 2026-04-20 | pip升级导致venv损坏（OSError: No such file or directory: pip3.10.exe） | Python 3.10的venv在执行`pip install --upgrade pip`时，卸载旧版pip会尝试删除`pip3.10.exe`，但该文件不存在导致OSError，卸载失败后venv中的python.exe也被破坏 | 使用`--target`参数绕过卸载步骤：`python -m pip install --upgrade pip --target venv/lib/site-packages`，直接将新版pip安装到site-packages而不触发旧版卸载 | ✅ 已解决 |
+| 2026-04-26 | main.py中sys.path.insert路径层级错误 | **误报**：main.py实际不存在sys.path.insert语句，该文件直接从项目根目录运行，无需路径操作 | 无需修复 | ✅ 误报排除 |
+| 2026-04-26 | build_full_chapter_prompt/build_writer_prompt接受但未使用author_style参数 | 两个函数签名含`author_style`参数但函数体内完全未引用 | 从两个函数签名及两处调用点移除`author_style`参数（共4处修改） | ✅ 已修复 |
+| 2026-04-26 | reader_reviewer.py中_truncate_content函数定义后从未调用（死代码） | 该函数实现了完善的智能截断逻辑但被闲置 | 用`_truncate_content(current_content, 3000, label)`替换内联截断的if/else块 | ✅ 已修复 |
+| 2026-04-26 | 大模型一次性生成模式缺少上一章结尾复用检测 | 复用检测仅在小模型分段模式else分支中执行 | 将复用检测提取到if/else合并点之后，改用full_content[:100]统一检查 | ✅ 已修复 |
+| 2026-04-26 | score_ai_authenticity=0时的语义歧义 | `if score_ai > 0`将真实0分误判为字段缺失 | 两处改为`if "score_ai_authenticity" in raw_result`显式判断字段存在性 | ✅ 已修复 |
+| 2026-04-26 | 读者审核禁用时返回dict缺少score_ai_authenticity键 | 禁用返回字典不包含新版字段 | 补全`score_ai_authenticity`和`score_readability`字段（默认值25） | ✅ 已修复 |
+| 2026-04-26 | _count_matching_words对中文文本调用.lower()无意义 | 中文汉字没有大小写概念 | 移除两处`.lower()`调用 | ✅ 已修复 |
+| 2026-04-26 | 多处代码依赖相对路径（CWD敏感性） | Path("sensitive_words.txt")等相对路径假设CWD为项目根目录 | 统一使用基于__file__的绝对路径推导 | 🟡 架构改进（未改动） |
