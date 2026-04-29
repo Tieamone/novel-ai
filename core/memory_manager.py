@@ -10,9 +10,8 @@ from core.utils import with_db_connection, DatabaseTransaction
 class MemoryManager:
     def __init__(self, novel_name: str):
         self.novel_name = novel_name
-        from core.config_loader import get as cfg
-        base = cfg("paths", "data_dir", "data")
-        self.data_dir = Path(base) / novel_name
+        from core.config_loader import get_data_dir
+        self.data_dir = get_data_dir(novel_name)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         ensure_database(novel_name)
 
@@ -333,12 +332,23 @@ class MemoryManager:
         from core.config_loader import get as cfg
 
         with with_db_connection(self.novel_name) as conn:
-            to_compress = conn.execute("""
+            all_uncompressed = conn.execute("""
                 SELECT id, chapter_num, summary FROM summaries
                 WHERE is_compressed=0
                 ORDER BY chapter_num
             """).fetchall()
+            latest_compressed = conn.execute("""
+                SELECT chapter_num, summary FROM summaries
+                WHERE is_compressed=1
+                ORDER BY chapter_num DESC LIMIT 1
+            """).fetchone()
 
+        keep_recent = int(cfg("novel", "recent_summary_count", 5) or 5)
+        keep_recent = max(1, keep_recent)
+        if len(all_uncompressed) <= keep_recent:
+            return
+
+        to_compress = all_uncompressed[:-keep_recent]
         if len(to_compress) < 5:
             return
 
@@ -385,26 +395,67 @@ class MemoryManager:
                 "first_ch": first_ch,
                 "last_ch": last_ch,
                 "ids": [r["id"] for r in batch],
+                "chapter_nums": [r["chapter_num"] for r in batch],
                 "text": compressed_text
             })
 
+        combined_parts = []
+        if latest_compressed and latest_compressed["summary"]:
+            combined_parts.append(
+                f"既有阶段摘要：{latest_compressed['summary']}"
+            )
+        for compressed in all_compressed_texts:
+            combined_parts.append(
+                f"第{compressed['first_ch']}-{compressed['last_ch']}章："
+                f"{compressed['text']}"
+            )
+        combined_basis = "\n".join(combined_parts)
+
+        if len(combined_parts) > 1:
+            overall_text = call_api(
+                system_prompt=(
+                    "你是专业小说编辑，负责维护长期剧情记忆。\n"
+                    "请把历史阶段摘要和新压缩摘要合并为一段350字以内的总阶段摘要。\n"
+                    "必须保留：关键人物状态、主线进展、已揭示信息、未兑现伏笔。"
+                    "直接输出摘要内容，不加前缀。"
+                ),
+                user_message=combined_basis,
+                temperature=0.3,
+                max_tokens=500,
+            )
+        else:
+            overall_text = all_compressed_texts[0]["text"]
+
         with with_db_connection(self.novel_name) as conn:
             with DatabaseTransaction(conn):
+                all_chapter_nums = [
+                    ch for compressed in all_compressed_texts
+                    for ch in compressed["chapter_nums"]
+                ]
+                if all_chapter_nums:
+                    conn.execute(
+                        f"DELETE FROM summaries WHERE is_compressed=1 "
+                        f"AND chapter_num IN ({','.join('?' * len(all_chapter_nums))})",
+                        all_chapter_nums
+                    )
                 for compressed in all_compressed_texts:
                     conn.execute(
                         f"UPDATE summaries SET is_compressed=1 "
                         f"WHERE id IN ({','.join('?' * len(compressed['ids']))})",
                         compressed["ids"]
                     )
-                    conn.execute("""
-                        INSERT INTO summaries (chapter_num, summary, is_compressed)
-                        VALUES (?, ?, 1)
-                    """, (compressed["last_ch"],
-                          f"[阶段摘要 第{compressed['first_ch']}-{compressed['last_ch']}章] {compressed['text']}"))
+                conn.execute(
+                    "UPDATE summaries SET summary=? WHERE id=?",
+                    (
+                        f"[阶段摘要 第{to_compress[0]['chapter_num']}-"
+                        f"{to_compress[-1]['chapter_num']}章] {overall_text}",
+                        to_compress[-1]["id"],
+                    )
+                )
 
         overall_first = to_compress[0]["chapter_num"]
         overall_last = to_compress[-1]["chapter_num"]
-        del to_compress, all_compressed_texts
+        del all_uncompressed, to_compress, all_compressed_texts
         print(f"  [OK] 摘要压缩完成，第{overall_first}-{overall_last}章已合并（共{total_batches}批）")
         self._refresh_summaries_md()
 
@@ -432,13 +483,29 @@ class MemoryManager:
             word_target = int(cfg("novel", "chapter_word_target", 3000))
         with with_db_connection(self.novel_name) as conn:
             with DatabaseTransaction(conn):
-                conn.execute("""
-                    INSERT OR REPLACE INTO chapters
-                    (chapter_num, title, content, status,
-                     plot_goal, emotion_tag, word_target, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (chapter_num, title, content, status,
-                      plot_goal, emotion_tag, word_target, datetime.now()))
+                now = datetime.now()
+                cur = conn.execute("""
+                    UPDATE chapters
+                    SET title=?,
+                        content=?,
+                        status=?,
+                        plot_goal=?,
+                        emotion_tag=?,
+                        word_target=?,
+                        updated_at=?
+                    WHERE chapter_num=?
+                """, (
+                    title, content, status, plot_goal, emotion_tag,
+                    word_target, now, chapter_num
+                ))
+                if cur.rowcount == 0:
+                    conn.execute("""
+                        INSERT INTO chapters
+                        (chapter_num, title, content, status,
+                         plot_goal, emotion_tag, word_target, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (chapter_num, title, content, status,
+                          plot_goal, emotion_tag, word_target, now))
 
     def update_chapter_status(self, chapter_num: int, status: str):
         with with_db_connection(self.novel_name) as conn:

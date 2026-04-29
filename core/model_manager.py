@@ -1,9 +1,9 @@
 import json
-import os
 from dotenv import load_dotenv
 from typing import List, Dict, Optional
+from core.config_loader import get_project_root
 
-load_dotenv()
+load_dotenv(get_project_root() / ".env")
 
 # 模型分类和优先级
 # ==================== 模块级缓存（防止重复发现） ====================
@@ -39,12 +39,13 @@ def _load_custom_models() -> Optional[List[Dict]]:
     """
     从 data/custom_models.json 加载自定义模型列表
     """
-    custom_file = os.path.join("data", "custom_models.json")
-    if not os.path.exists(custom_file):
+    from core.config_loader import get_data_dir
+    custom_file = get_data_dir() / "custom_models.json"
+    if not custom_file.exists():
         return None
     
     try:
-        with open(custom_file, "r", encoding="utf-8") as f:
+        with custom_file.open("r", encoding="utf-8") as f:
             data = json.load(f)
         
         if not isinstance(data, list):

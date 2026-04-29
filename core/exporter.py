@@ -5,9 +5,9 @@ import re
 from pathlib import Path
 from core.memory_manager import MemoryManager
 from core.db import get_connection
-from core.config_loader import get_output_dir
+from core.config_loader import get_output_dir, get_project_root
 
-SENSITIVE_WORDS_PATH = Path("sensitive_words.txt")
+SENSITIVE_WORDS_PATH = get_project_root() / "sensitive_words.txt"
 
 _sensitive_words_cache = None
 _sensitive_words_cache_time = 0

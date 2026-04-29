@@ -7,12 +7,17 @@ import logging
 from pathlib import Path
 
 from core.memory_manager import MemoryManager
-from core.planner import run_planner, extend_tasks
+from core.planner import run_planner, extend_tasks, get_style_choice, split_outline_to_tasks
 from core.reviewer import write_and_review
 from core.exporter import export_chapter, export_all
 from core.db import get_connection, clean_duplicate_chapters
 from core.utils import with_db_connection, DatabaseTransaction, execute_with_retry
-from core.config_loader import get as cfg
+from core.config_loader import (
+    get as cfg,
+    get_data_dir,
+    get_output_dir,
+    get_project_root,
+)
 
 MAX_NOVEL_NAME_LEN = 64
 INVALID_NOVEL_NAME_CHARS = set('<>:"/\\|?*')
@@ -34,11 +39,11 @@ CHAPTER_STATUS_DRAFT_ISSUES = "草稿(有问题)"
 
 
 def _data_dir(novel_name: str) -> Path:
-    return Path(cfg("paths", "data_dir", "data")) / novel_name
+    return get_data_dir(novel_name)
 
 
 def _output_dir(novel_name: str) -> Path:
-    return Path(cfg("paths", "output_dir", "output")) / novel_name
+    return get_output_dir(novel_name)
 
 
 def _get_target_chapters(novel_name: str) -> int:
@@ -776,6 +781,13 @@ def _recover_review_failed(novel_name: str):
         )
         mm = MemoryManager(novel_name)
         if result.get("pass"):
+            from core.reader_reviewer import reader_review_chapter
+            reader_result = reader_review_chapter(novel_name, chapter_num, content)
+            if not reader_result.get("pass"):
+                mm.update_chapter_status(chapter_num, CHAPTER_STATUS_REVIEW_FAILED)
+                _update_task_status(novel_name, chapter_num, TASK_REVIEW_FAILED)
+                print(f"[提示] 第{chapter_num}章读者视角仍未通过，保持审稿失败状态")
+                return
             mm.update_chapter_status(chapter_num, CHAPTER_STATUS_APPROVED)
             _update_task_status(novel_name, chapter_num, TASK_COMPLETED)
             if not _has_chapter_summary(novel_name, chapter_num):
@@ -1218,6 +1230,8 @@ def chapters_menu(novel_name: str):
 
         elif choice == "2":
             try:
+                count = 0
+                cancelled = False
                 while True:
                     count_input = input("批量生成几章？").strip()
                     if not count_input.isdigit():
@@ -1233,8 +1247,11 @@ def chapters_menu(novel_name: str):
                         confirm_batch = input("  确认继续？(y/n): ").strip().lower()
                         if confirm_batch != 'y':
                             print("  ✅ 已取消批量生成")
+                            cancelled = True
                             break
                     break
+                if cancelled:
+                    continue
                 if count >= 1:
                     for i in range(count):
                         print(f"\n===== 进度：{i+1}/{count} =====")
@@ -1354,7 +1371,7 @@ def _import_from_text_file():
     """从 newbook.txt 导入小说信息"""
     from pathlib import Path
 
-    txt_path = Path("newbook.txt")
+    txt_path = get_project_root() / "newbook.txt"
     if not txt_path.exists():
         print("\n[错误] 未找到 newbook.txt")
         print("  请先将文件放在项目根目录（d:\\novel-ai\\）")
@@ -1381,6 +1398,9 @@ def _import_from_text_file():
     except ValueError:
         target_chapters = 100
         print(f"  [提示] 未检测到有效目标章数，默认100章")
+    if not 10 <= target_chapters <= 1000:
+        print("  [提示] 目标章数需在10-1000之间，已默认100章")
+        target_chapters = 100
 
     outline = _extract_section(content, "【大纲】")
     characters_text = _extract_section(content, "【主要角色】")
@@ -1391,6 +1411,10 @@ def _import_from_text_file():
     if not novel_name:
         print("\n[错误] 未检测到书名！请在 newbook.txt 中添加：")
         print("  书名：你的小说名称")
+        return None
+    name_error = _validate_novel_name(novel_name)
+    if name_error:
+        print(f"\n[错误] 书名无效：{name_error}")
         return None
 
     print(f"\n  解析结果预览：")
@@ -1452,23 +1476,43 @@ def _parse_and_save_characters(mm, characters_text: str):
         return
 
     lines = [ln.strip() for ln in characters_text.split('\n') if ln.strip()]
-    character_names = []
+    characters = []
 
     for line in lines:
-        match = re.match(r'^(\d+)[\.、\)\s]+(.+?)(?:[-—–](.+))?$', line)
-        if match:
-            name = match.group(2).strip()
-            character_names.append(name)
+        cleaned = re.sub(r'^\s*(?:[-*]|\d+[\.\、\)\s]+)\s*', '', line)
+        if not cleaned:
+            continue
+        parts = re.split(r'\s*[-—–]\s*', cleaned, maxsplit=1)
+        name_part = parts[0].strip()
+        desc = parts[1].strip() if len(parts) > 1 else ""
+        role = "待确认"
+        role_match = re.search(r'[（(]([^）)]+)[）)]', name_part)
+        if role_match:
+            role = role_match.group(1).strip() or role
+            name = re.sub(r'[（(][^）)]+[）)]', '', name_part).strip()
+        else:
+            name = name_part
+        if not name:
+            continue
+        characters.append({
+            "name": name,
+            "role": role,
+            "appearance": "",
+            "personality": desc,
+            "secret": "",
+            "weakness": "",
+            "current_location": "",
+            "current_status": desc,
+            "relationships": {},
+        })
 
-    if character_names:
-        char_list = "\n".join([f"- {name}" for name in character_names])
+    if characters:
+        mm.save_characters_batch(characters)
+        char_list = "\n".join([f"- {c['name']}" for c in characters])
         (mm.data_dir / "character_names.txt").write_text(
             f"# 角色名单\n\n{char_list}", encoding="utf-8"
         )
-        (mm.data_dir / "characters.md").write_text(
-            f"# 人物档案\n\n{characters_text}", encoding="utf-8"
-        )
-        print(f"  [OK] 已保存 {len(character_names)} 个角色")
+        print(f"  [OK] 已保存 {len(characters)} 个角色")
 
 
 def _create_newbook_template():
@@ -1503,7 +1547,7 @@ def _create_newbook_template():
 """
 
     from pathlib import Path
-    template_path = Path("newbook_template.txt")
+    template_path = get_project_root() / "newbook_template.txt"
     if not template_path.exists():
         template_path.write_text(template, encoding="utf-8")
         print(f"  ✨ 已创建模板文件：{template_path}")
@@ -1513,7 +1557,7 @@ def _create_newbook_template():
 # ==================== 日志配置（Fix Bug10） ====================
 def _setup_logging():
     """初始化日志：控制台输出 INFO，文件记录 DEBUG（含 API 错误）"""
-    log_dir = Path("logs")
+    log_dir = get_project_root() / "logs"
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / "run.log"
 

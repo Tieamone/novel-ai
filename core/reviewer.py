@@ -762,6 +762,15 @@ def write_and_review(novel_name: str, chapter_num: int,
             # ── 责任编辑通过，进入读者视角 ───────────────────────────
             reader_result = reader_review_chapter(novel_name, chapter_num, content)
 
+            if reader_result.get("review_error"):
+                print("\n  [错误] 读者视角评估异常，已标记为审稿失败，避免未经二审放行")
+                try:
+                    _update_status_safe(novel_name, chapter_num, "审稿失败")
+                except Exception as e:
+                    print(f"  [警告] 状态更新失败：{e}")
+                    mm.update_chapter_status(chapter_num, "审稿失败")
+                return ""
+
             if reader_result.get("pass"):
                 print(f"\n  [OK] 第{chapter_num}章双重审核通过！")
                 review_retry_count = 0

@@ -2,8 +2,9 @@ import os
 import sys
 import time
 from dotenv import load_dotenv
+from core.config_loader import get_project_root
 
-load_dotenv()
+load_dotenv(get_project_root() / ".env")
 
 # ==================== 从 config.yaml 读取默认模型 ====================
 def _load_default_model(role: str, fallback: str) -> str:
@@ -417,7 +418,11 @@ def reset_failure_counter(counter_type: str = None):
 
 
 def get_failure_stats() -> dict:
-    return _failure_stats.copy()
+    stats = _failure_stats.copy()
+    stats["author_failures"] = stats.get("author", 0)
+    stats["reviewer_failures"] = stats.get("reviewer", 0)
+    stats["reader_reviewer_failures"] = stats.get("reader_reviewer", 0)
+    return stats
 
 
 def get_switch_history() -> list:

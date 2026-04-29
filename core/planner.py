@@ -654,10 +654,9 @@ def split_outline_to_tasks(outline: str, novel_name: str,
 
 def extend_tasks(novel_name: str, from_chapter: int):
     from core.db import get_connection
-    from core.config_loader import get as cfg
-    from pathlib import Path
+    from core.config_loader import get as cfg, get_data_dir
 
-    data_dir = Path(cfg("paths", "data_dir", "data")) / novel_name
+    data_dir = get_data_dir(novel_name)
     outline_path = data_dir / "master_outline.md"
     if not outline_path.exists():
         return
@@ -765,6 +764,9 @@ def rewrite_task_for_chapter(novel_name: str, chapter_num: int,
 
     veto_text = "\n".join(f"- {r}" for r in veto_reasons) if veto_reasons else "（无）"
 
+    # 提取原始任务卡的情绪标签，作为结局基调约束
+    _end_state_hint = f"情绪基调仍须为「{current_emotion_tag}」" if current_emotion_tag else ""
+
     prompt = f"""当前正在创作第{chapter_num}章，原任务卡连续审稿失败，根本原因如下：
 
 【连续命中的否决原因】
@@ -788,6 +790,10 @@ def rewrite_task_for_chapter(novel_name: str, chapter_num: int,
 3. 不得再触发上述否决原因
 4. 只安排一个核心情节节点，具体到场景和行动
 5. plot_goal 40-80 字
+6. 【关键约束】只修改实现路径和过程细节，章节结尾的核心状态／情节终态必须与原任务卡保持一致。
+   例如：原目标是"众人陷入绝望"，新目标的结尾仍须是"众人陷入绝望"，只改"如何走到这一步"。
+   {_end_state_hint}
+   这是为了确保后续章节的任务卡不需要联动修改。
 
 严格按以下 JSON 格式输出，不要任何其他内容：
 {{"plot_goal": "新的情节目标", "emotion_tag": "铺垫"}}

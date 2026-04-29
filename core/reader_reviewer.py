@@ -238,17 +238,20 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
             print(f"   详情: {str(e)[:200]}")
         increment_failure_counter("reader_reviewer")
         return {
-            "pass": True,  # 评估失败时不阻塞流程
-            "score_total": 75,
-            "score_logic": 20,
-            "score_consistency": 20,
-            "score_style": 20,
-            "score_experience": 15,
+            "pass": False,
+            "score_total": 0,
+            "score_ai_authenticity": 0,
+            "score_logic": 0,
+            "score_consistency": 0,
+            "score_readability": 0,
+            "score_style": 0,
+            "score_experience": 0,
             "veto_triggered": False,
             "veto_reason": "",
             "issues": ["读者视角评估服务不可用"],
             "suggestions": "",
             "error": str(e),
+            "review_error": True,
         }
 
     parsed = extract_json_obj(raw)
@@ -256,16 +259,19 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
         print("  [读者视角] 评估结果格式异常")
         increment_failure_counter("reader_reviewer")
         return {
-            "pass": True,
-            "score_total": 75,
-            "score_logic": 20,
-            "score_consistency": 20,
-            "score_style": 20,
-            "score_experience": 15,
+            "pass": False,
+            "score_total": 0,
+            "score_ai_authenticity": 0,
+            "score_logic": 0,
+            "score_consistency": 0,
+            "score_readability": 0,
+            "score_style": 0,
+            "score_experience": 0,
             "veto_triggered": False,
             "veto_reason": "",
             "issues": ["读者视角评估结果格式异常"],
             "suggestions": "",
+            "review_error": True,
         }
 
     result = _normalize_review_result(parsed)

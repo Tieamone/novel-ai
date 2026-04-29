@@ -2,6 +2,16 @@ import yaml
 from pathlib import Path
 
 _config = None
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def get_project_root() -> Path:
+    return PROJECT_ROOT
+
+
+def resolve_project_path(path_value: str) -> Path:
+    path = Path(path_value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def load_config() -> dict:
@@ -9,7 +19,7 @@ def load_config() -> dict:
     if _config is not None:
         return _config
 
-    config_path = Path("config.yaml")
+    config_path = PROJECT_ROOT / "config.yaml"
     if not config_path.exists():
         _config = _get_defaults()
         return _config
@@ -70,12 +80,12 @@ def get(section: str, key: str, *args, default=None):
 
 
 def get_data_dir(novel_name: str = "") -> Path:
-    base = Path(get("paths", "data_dir", "data"))
+    base = resolve_project_path(get("paths", "data_dir", "data"))
     return base / novel_name if novel_name else base
 
 
 def get_output_dir(novel_name: str = "") -> Path:
-    base = Path(get("paths", "output_dir", "output"))
+    base = resolve_project_path(get("paths", "output_dir", "output"))
     return base / novel_name if novel_name else base
 
 

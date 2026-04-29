@@ -7,9 +7,8 @@ _wal_configured_paths = set()
 
 
 def get_db_path(novel_name: str) -> str:
-    from core.config_loader import get as cfg
-    base = cfg("paths", "data_dir", "data")
-    data_dir = Path(base) / novel_name
+    from core.config_loader import get_data_dir
+    data_dir = get_data_dir(novel_name)
     data_dir.mkdir(parents=True, exist_ok=True)
     return str(data_dir / "novel.db")
 
