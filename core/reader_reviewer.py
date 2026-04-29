@@ -1,13 +1,10 @@
-import sys
-import os
 import json
 import re
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from core.api_client import call_reader_reviewer_api, increment_failure_counter, reset_failure_counter
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg
-from core.utils import with_db_connection, DatabaseTransaction
+from core.utils import with_db_connection, DatabaseTransaction, \
+    extract_json_obj, to_int, is_transient_error
 
 READER_REVIEWER_SYSTEM = """你是一位阅读过数千本网文的资深读者，你最受不了的就是一眼看出是AI写的网文。
 
@@ -78,37 +75,6 @@ READER_REVIEW_PROMPT = """请从读者视角评估以下章节。
 }}"""
 
 
-def _extract_json_obj(raw: str) -> dict:
-    if not raw:
-        return {}
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not match:
-        return {}
-    try:
-        obj = json.loads(match.group())
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
-
-def _to_int(value, default=0, min_value=None, max_value=None) -> int:
-    try:
-        iv = int(float(value))
-    except Exception:
-        iv = default
-    if min_value is not None:
-        iv = max(min_value, iv)
-    if max_value is not None:
-        iv = min(max_value, iv)
-    return iv
-
-
-def _is_transient_error(error):
-    """判断是否为暂时性错误（可重试恢复）"""
-    transient_keywords = ["timeout", "locked", "rate limit", "503", "502", "429"]
-    return any(kw in str(error).lower() for kw in transient_keywords)
-
-
 def _truncate_content(text: str, max_len: int, label: str = "内容") -> str:
     """智能截断文本：优先保留开头完整段落，超长时保留首尾关键部分"""
     if not text or len(text) <= max_len:
@@ -141,16 +107,16 @@ def _truncate_content(text: str, max_len: int, label: str = "内容") -> str:
 
 def _normalize_review_result(raw_result: dict) -> dict:
     # 新版字段（AI真实感）+ 旧版字段兼容（score_style/score_experience）
-    score_ai  = _to_int(raw_result.get("score_ai_authenticity"), 0, 0, 25)
-    score_logic = _to_int(raw_result.get("score_logic"), 0, 0, 25)
-    score_consistency = _to_int(raw_result.get("score_consistency"), 0, 0, 25)
+    score_ai  = to_int(raw_result.get("score_ai_authenticity"), 0, 0, 25)
+    score_logic = to_int(raw_result.get("score_logic"), 0, 0, 25)
+    score_consistency = to_int(raw_result.get("score_consistency"), 0, 0, 25)
     # readability 优先取新字段，兜底取旧字段
-    score_readability = _to_int(
+    score_readability = to_int(
         raw_result.get("score_readability") or raw_result.get("score_experience"),
         0, 0, 25
     )
     # style 字段（旧版兼容，不计入新总分）
-    score_style = _to_int(raw_result.get("score_style"), 0, 0, 25)
+    score_style = to_int(raw_result.get("score_style"), 0, 0, 25)
 
     total_raw = raw_result.get("score_total")
     if total_raw is None:
@@ -161,7 +127,7 @@ def _normalize_review_result(raw_result: dict) -> dict:
             # 旧版兼容
             score_total = score_logic + score_consistency + score_style + score_readability
     else:
-        score_total = _to_int(total_raw, 0, 0, 100)
+        score_total = to_int(total_raw, 0, 0, 100)
 
     # 子项合计校验（偏差超过10分时以子项合计为准）
     if score_ai > 0:
@@ -269,7 +235,7 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
             max_tokens=1200,
         )
     except Exception as e:
-        if _is_transient_error(e):
+        if is_transient_error(e):
             print(f"  [读者视角] ⚠️ 评估遇到暂时性问题: {str(e)[:100]}")
             print(f"  [读者视角] 💡 建议稍后重新评估此章节")
         else:
@@ -290,7 +256,7 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
             "error": str(e),
         }
 
-    parsed = _extract_json_obj(raw)
+    parsed = extract_json_obj(raw)
     if not parsed:
         print("  [读者视角] 评估结果格式异常")
         increment_failure_counter("reader_reviewer")

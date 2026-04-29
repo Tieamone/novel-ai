@@ -27,6 +27,7 @@ novel:
   compress_after_chapters: 20
   pre_split_chapters: 50
   failure_switch_threshold: 3
+  progress_review_window: 10  # 进度面板审稿质量统计窗口（最近N章）
 
 paths:
   data_dir: data

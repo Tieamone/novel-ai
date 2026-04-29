@@ -1,7 +1,3 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import re
 import json
 from core.api_client import call_author_api
@@ -714,6 +710,139 @@ def extend_tasks(novel_name: str, from_chapter: int):
     conn.commit()
     conn.close()
     print(f"  [OK] 任务卡已扩展至第{end_chapter}章")
+
+
+# ==================== 任务卡重写（冲突修复） ====================
+
+def rewrite_task_for_chapter(novel_name: str, chapter_num: int,
+                              veto_reasons: list,
+                              current_goal: str,
+                              current_emotion_tag: str = "铺垫") -> dict:
+    """
+    基于大纲、人物设定、前情，为指定章节重新生成任务卡。
+
+    调用时机：连续 ≥2 次因相同 veto_code 失败，且失败层均为 L1/L2。
+    veto_reasons : 审稿器连续命中的否决原因描述列表（用于约束新目标）
+    返回 {"plot_goal": ..., "emotion_tag": ...}，并同步更新数据库。
+    """
+    from core.utils import extract_json_obj, with_db_connection
+
+    mm = MemoryManager(novel_name)
+
+    # 读取大纲
+    outline = ""
+    outline_path = mm.data_dir / "master_outline.md"
+    if outline_path.exists():
+        try:
+            outline = outline_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+
+    # 人物设定摘要（最多 6 人，每人截取 80 字）
+    char_lines = []
+    try:
+        characters = mm.load_characters()
+        for c in characters[:6]:
+            name = c.get("name", "")
+            personality = (c.get("personality") or "")[:80]
+            if name:
+                char_lines.append(f"- {name}：{personality}")
+    except Exception:
+        pass
+    char_summary = "\n".join(char_lines) if char_lines else "（无人物档案）"
+
+    # 近期摘要（最近 3 章）
+    recent_text = "（无摘要）"
+    try:
+        recent = mm.load_recent_summaries(3)
+        if recent:
+            recent_text = "\n".join(
+                f"第{s['chapter_num']}章：{(s['summary'] or '')[:120]}"
+                for s in recent
+            )
+    except Exception:
+        pass
+
+    veto_text = "\n".join(f"- {r}" for r in veto_reasons) if veto_reasons else "（无）"
+
+    prompt = f"""当前正在创作第{chapter_num}章，原任务卡连续审稿失败，根本原因如下：
+
+【连续命中的否决原因】
+{veto_text}
+
+【原任务卡目标（已失败，请勿照搬）】
+{current_goal}
+
+【故事总大纲（节选，请据此控制推进幅度）】
+{outline[:900] if outline else "（无大纲）"}
+
+【主要人物设定】
+{char_summary}
+
+【近期剧情摘要】
+{recent_text}
+
+请为第{chapter_num}章重新设计一张任务卡，要求：
+1. 严格遵守大纲整体走向，不超前推进
+2. 人物行为必须符合其性格设定，杜绝 OOC
+3. 不得再触发上述否决原因
+4. 只安排一个核心情节节点，具体到场景和行动
+5. plot_goal 40-80 字
+
+严格按以下 JSON 格式输出，不要任何其他内容：
+{{"plot_goal": "新的情节目标", "emotion_tag": "铺垫"}}
+
+emotion_tag 只能从以下 5 个中选 1 个：铺垫 / 冲突 / 爽点 / 低谷 / 反转"""
+
+    raw = call_author_api(
+        system_prompt=(
+            "你是专业的中文网络小说策划师，"
+            "擅长在保持故事连贯性的同时化解情节矛盾，"
+            "为卡壳的章节找到符合人物逻辑的新出路。"
+        ),
+        user_message=prompt,
+        temperature=0.85,
+        max_tokens=300,
+    )
+
+    from core.utils import extract_json_obj
+    parsed = extract_json_obj(raw)
+
+    valid_tags = {"铺垫", "冲突", "爽点", "低谷", "反转"}
+    new_goal = (parsed.get("plot_goal") or "").strip()
+    new_tag  = (parsed.get("emotion_tag") or current_emotion_tag).strip()
+
+    if not new_goal or len(new_goal) < 10:
+        print("  [警告] AI 重写任务卡结果异常，保留原目标")
+        new_goal = current_goal
+        new_tag  = current_emotion_tag
+    if new_tag not in valid_tags:
+        new_tag = current_emotion_tag
+
+    # 写回数据库
+    try:
+        with with_db_connection(novel_name) as conn:
+            row = conn.execute(
+                "SELECT original_plot_goal, rewrite_count "
+                "FROM chapter_tasks WHERE chapter_num=?",
+                (chapter_num,)
+            ).fetchone()
+            original = (
+                (row["original_plot_goal"] or current_goal)
+                if row else current_goal
+            )
+            rewrite_count = ((row["rewrite_count"] or 0) + 1) if row else 1
+            conn.execute("""
+                UPDATE chapter_tasks
+                SET plot_goal=?, emotion_tag=?,
+                    original_plot_goal=?, rewrite_count=?
+                WHERE chapter_num=?
+            """, (new_goal, new_tag, original, rewrite_count, chapter_num))
+            conn.commit()
+    except Exception as e:
+        print(f"  [警告] 任务卡数据库更新失败（非致命）：{e}")
+
+    return {"plot_goal": new_goal, "emotion_tag": new_tag}
 
 
 # ==================== 主入口 ====================

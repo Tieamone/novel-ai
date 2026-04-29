@@ -77,6 +77,9 @@ def init_database(novel_name: str):
             review_veto_items TEXT,
             review_failure_attribution TEXT,
             review_updated_at TIMESTAMP,
+            reader_review_score INTEGER,
+            reader_review_passed INTEGER,
+            reader_review_issues TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -89,6 +92,8 @@ def init_database(novel_name: str):
             plot_goal TEXT,
             emotion_tag TEXT DEFAULT '铺垫',
             status TEXT DEFAULT '待处理',
+            original_plot_goal TEXT,
+            rewrite_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -190,6 +195,9 @@ def _migrate(conn, cursor):
         "review_veto_items": "ALTER TABLE chapters ADD COLUMN review_veto_items TEXT",
         "review_failure_attribution": "ALTER TABLE chapters ADD COLUMN review_failure_attribution TEXT",
         "review_updated_at": "ALTER TABLE chapters ADD COLUMN review_updated_at TIMESTAMP",
+        "reader_review_score":  "ALTER TABLE chapters ADD COLUMN reader_review_score INTEGER",
+        "reader_review_passed": "ALTER TABLE chapters ADD COLUMN reader_review_passed INTEGER",
+        "reader_review_issues": "ALTER TABLE chapters ADD COLUMN reader_review_issues TEXT",
     }
     for col, sql in additions.items():
         if col not in existing:
@@ -222,6 +230,18 @@ def _migrate(conn, cursor):
             )
         except Exception:
             pass
+
+    for col, sql in [
+        ("original_plot_goal",
+         "ALTER TABLE chapter_tasks ADD COLUMN original_plot_goal TEXT"),
+        ("rewrite_count",
+         "ALTER TABLE chapter_tasks ADD COLUMN rewrite_count INTEGER DEFAULT 0"),
+    ]:
+        if col not in task_existing:
+            try:
+                cursor.execute(sql)
+            except Exception:
+                pass
 
     try:
         cursor.execute(

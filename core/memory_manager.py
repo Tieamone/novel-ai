@@ -1,11 +1,8 @@
 import sqlite3
 import json
-import sys
-import os
 from pathlib import Path
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.db import get_connection, ensure_database
 from core.utils import with_db_connection, DatabaseTransaction
 

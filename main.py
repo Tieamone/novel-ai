@@ -218,7 +218,8 @@ def show_progress(novel_name: str):
         ).fetchone()["cnt"]
 
         draft = conn.execute(
-            "SELECT COUNT(*) as cnt FROM chapters WHERE status='draft'"
+            "SELECT COUNT(*) as cnt FROM chapters "
+            "WHERE status IN ('草稿', '草稿(有问题)')"
         ).fetchone()["cnt"]
 
         total_chars = conn.execute(
@@ -460,7 +461,7 @@ def generate_chapter_auto(novel_name: str):
         elif current_status == TASK_COMPLETED:
             print("  [提示] 该章节任务已完成，已跳过")
         elif current_status == TASK_REVIEW_FAILED:
-            print("  [提示] 该章节任务处于 review_failed，请走恢复入口处理")
+            print("  [提示] 该章节任务处于审稿失败状态，请走恢复入口处理")
         else:
             print(f"  [提示] 该章节任务当前状态为 {current_status}，已跳过")
         return
@@ -663,22 +664,48 @@ def _list_chapters(novel_name: str):
 
 
 def _view_tasks(novel_name: str):
+    PAGE = 30
     with with_db_connection(novel_name) as conn:
-        rows = conn.execute(
-            "SELECT chapter_num, emotion_tag, status, plot_goal FROM chapter_tasks "
-            "ORDER BY chapter_num LIMIT 30"
-        ).fetchall()
-    if not rows:
+        total = conn.execute(
+            "SELECT COUNT(*) as cnt FROM chapter_tasks"
+        ).fetchone()["cnt"]
+
+    if not total:
         print("\n暂无任务卡")
         print("提示：旧小说可在继续写作时自动扩展任务卡")
         return
-    print(f"\n章节任务卡（显示前{len(rows)}张）：")
-    print("-" * 60)
-    for row in rows:
-        print(f"  第{row['chapter_num']:>3}章 "
-              f"[{row['emotion_tag']}] "
-              f"[{row['status'] or TASK_PENDING}] "
-              f"{row['plot_goal']}")
+
+    offset = 0
+    while True:
+        with with_db_connection(novel_name) as conn:
+            rows = conn.execute(
+                "SELECT chapter_num, emotion_tag, status, plot_goal FROM chapter_tasks "
+                "ORDER BY chapter_num LIMIT ? OFFSET ?",
+                (PAGE, offset)
+            ).fetchall()
+
+        if not rows:
+            print("  已到末尾")
+            break
+
+        start_ch = rows[0]["chapter_num"]
+        end_ch = rows[-1]["chapter_num"]
+        print(f"\n章节任务卡（第{start_ch}-{end_ch}章，共{total}张）：")
+        print("-" * 60)
+        for row in rows:
+            print(f"  第{row['chapter_num']:>3}章 "
+                  f"[{row['emotion_tag']}] "
+                  f"[{row['status'] or TASK_PENDING}] "
+                  f"{row['plot_goal']}")
+
+        if offset + PAGE >= total:
+            break
+
+        print(f"\n[n] 下一页  [q] 退出")
+        nav = input("请选择：").strip().lower()
+        if nav != "n":
+            break
+        offset += PAGE
 
 
 def _recover_review_failed(novel_name: str):
@@ -687,15 +714,15 @@ def _recover_review_failed(novel_name: str):
             SELECT chapter_num, title, plot_goal, emotion_tag, content,
                    retry_count, LENGTH(content) as chars
             FROM chapters
-            WHERE status='review_failed'
+            WHERE status='审稿失败'
             ORDER BY chapter_num
         """).fetchall()
 
     if not rows:
-        print("\n[提示] 当前没有 review_failed 章节")
+        print("\n[提示] 当前没有审稿失败的章节")
         return
 
-    print("\nreview_failed 章节：")
+    print("\n审稿失败章节：")
     for r in rows:
         print(f"  第{r['chapter_num']}章  "
               f"[{r['emotion_tag'] or '-'}]  "
@@ -727,7 +754,7 @@ def _recover_review_failed(novel_name: str):
             target = r
             break
     if not target:
-        print("[错误] 章节号不在 review_failed 列表中")
+        print("[错误] 章节号不在审稿失败列表中")
         return
 
     print("\n处理方式：")
@@ -760,7 +787,7 @@ def _recover_review_failed(novel_name: str):
         else:
             mm.update_chapter_status(chapter_num, CHAPTER_STATUS_REVIEW_FAILED)
             _update_task_status(novel_name, chapter_num, TASK_REVIEW_FAILED)
-            print(f"[提示] 第{chapter_num}章仍未通过审稿，保持 review_failed")
+            print(f"[提示] 第{chapter_num}章仍未通过审稿，保持审稿失败状态")
         return
 
     if action == "2":
@@ -1024,11 +1051,10 @@ def _delete_chapters_batch(novel_name: str):
             deleted_count += 1
         
         print(f"\n[OK] 已删除第{start_num}章到第{end_num}章，共{deleted_count}章")
-        print(f"  任务卡已重置为 pending")
+        print(f"  任务卡已重置为待处理")
         if deleted_files:
             print(f"  已删除导出文件：{len(deleted_files)}个")
-        print(f"  提示：直接选择「自动生成下一章」时会跳过已删除章节（已有更新章节）。")
-        print(f"  若需重新生成这些章节，请通过「恢复review_failed」入口手动处理。")
+        print(f"  提示：可直接选择「自动生成下一章」或「批量自动生成」重新生成这些章节。")
         
     except ValueError:
         print("[错误] 请输入有效格式（如：2-5 或 3）")
@@ -1087,6 +1113,83 @@ def _delete_novel(novel_name: str) -> bool:
         return False
 
 
+def _edit_task_card(novel_name: str):
+    """手动查看并编辑指定章节的任务卡（情节目标 / 情绪标签）"""
+    VALID_TAGS = ["铺垫", "冲突", "爽点", "低谷", "反转"]
+
+    try:
+        chapter_num_input = input("\n请输入要编辑的章节号（0取消）：").strip()
+        if not chapter_num_input.isdigit():
+            print("  [提示] 无效输入，已取消")
+            return
+        chapter_num = int(chapter_num_input)
+        if chapter_num == 0:
+            return
+    except KeyboardInterrupt:
+        print("\n[提示] 已取消操作")
+        return
+
+    with with_db_connection(novel_name) as conn:
+        row = conn.execute(
+            "SELECT chapter_num, plot_goal, emotion_tag, status, "
+            "original_plot_goal, rewrite_count "
+            "FROM chapter_tasks WHERE chapter_num=?",
+            (chapter_num,)
+        ).fetchone()
+
+    if not row:
+        print(f"  [错误] 第{chapter_num}章任务卡不存在")
+        return
+
+    print(f"\n第{chapter_num}章当前任务卡：")
+    print(f"  情节目标：{row['plot_goal']}")
+    print(f"  情绪标签：{row['emotion_tag']}")
+    print(f"  状    态：{row['status']}")
+    if row["rewrite_count"]:
+        print(f"  已重写过：{row['rewrite_count']} 次")
+        if row["original_plot_goal"]:
+            print(f"  原始目标：{row['original_plot_goal']}")
+
+    print(f"\n请输入新的情节目标（40-80字，直接回车保持不变）：")
+    new_goal = input("  > ").strip()
+
+    print(f"请输入新的情绪标签（{'/'.join(VALID_TAGS)}，直接回车保持不变）：")
+    new_tag = input("  > ").strip()
+
+    if not new_goal and not new_tag:
+        print("  [提示] 未作任何修改")
+        return
+
+    if new_goal and len(new_goal) < 10:
+        print("  [警告] 情节目标过短（建议40-80字），已取消")
+        return
+
+    if new_tag and new_tag not in VALID_TAGS:
+        print(f"  [错误] 情绪标签无效，必须是：{'/'.join(VALID_TAGS)}")
+        return
+
+    final_goal = new_goal or row["plot_goal"]
+    final_tag  = new_tag  or row["emotion_tag"]
+
+    # 首次手动编辑时保存原始目标
+    original = row["original_plot_goal"] or row["plot_goal"]
+    rewrite_count = (row["rewrite_count"] or 0) + 1
+
+    with with_db_connection(novel_name) as conn:
+        conn.execute(
+            "UPDATE chapter_tasks "
+            "SET plot_goal=?, emotion_tag=?, "
+            "original_plot_goal=?, rewrite_count=? "
+            "WHERE chapter_num=?",
+            (final_goal, final_tag, original, rewrite_count, chapter_num)
+        )
+        conn.commit()
+
+    print(f"\n[OK] 第{chapter_num}章任务卡已更新：")
+    print(f"  情节目标：{final_goal}")
+    print(f"  情绪标签：{final_tag}")
+
+
 def chapters_menu(novel_name: str):
     clean_duplicate_chapters(novel_name)
 
@@ -1100,11 +1203,12 @@ def chapters_menu(novel_name: str):
         print("5. 查看章节任务卡")
         print("6. 更换写作风格")
         print("7. 查看详细费用统计")
-        print("8. 恢复review_failed章节")
+        print("8. 恢复审稿失败章节")
         print("9. 删除章节（重新生成）")
         print("10. 批量删除章节（按范围）")
         print("11. 高级模型配置（作者/审核/读者视角模型）")
         print("12. 查看失败统计与模型切换历史")
+        print("13. 手动编辑任务卡（修改情节目标/情绪标签）")
         print("0. 返回主菜单")
 
         choice = input("\n请选择：").strip()
@@ -1131,7 +1235,7 @@ def chapters_menu(novel_name: str):
                             print("  ✅ 已取消批量生成")
                             break
                     break
-                if count >= 1 and count <= 50:
+                if count >= 1:
                     for i in range(count):
                         print(f"\n===== 进度：{i+1}/{count} =====")
                         generate_chapter_auto(novel_name)
@@ -1191,6 +1295,9 @@ def chapters_menu(novel_name: str):
                     ts = datetime.datetime.fromtimestamp(entry["timestamp"]).strftime("%H:%M:%S")
                     print(f"  {i}. [{ts}] {entry['type']}: {entry['old_model']} → {entry['new_model']}")
             print("\n" + "=" * 60)
+
+        elif choice == "13":
+            _edit_task_card(novel_name)
 
         elif choice == "0":
             from core.api_client import get_session_stats
@@ -1466,7 +1573,7 @@ def _register_sigint_handler():
 
 def main():
     print("\n" + "=" * 50)
-    print("       AI 网文写作系统 v1.0")
+    print("       AI 网文写作系统 v2.0")
     print("=" * 50)
 
     _setup_logging()

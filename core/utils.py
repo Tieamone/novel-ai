@@ -1,11 +1,47 @@
 """
 公共工具函数模块
 """
+import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Generator
 from core.db import get_connection
+
+
+def extract_json_obj(raw: str) -> dict:
+    """从字符串中提取第一个 JSON 对象，解析失败返回 {}"""
+    if not raw:
+        return {}
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        obj = json.loads(match.group())
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def to_int(value, default: int = 0,
+           min_value: int = None, max_value: int = None) -> int:
+    """安全地将 value 转为 int，支持范围约束"""
+    try:
+        iv = int(float(value))
+    except Exception:
+        iv = default
+    if min_value is not None:
+        iv = max(min_value, iv)
+    if max_value is not None:
+        iv = min(max_value, iv)
+    return iv
+
+
+def is_transient_error(error) -> bool:
+    """判断是否为暂时性错误（超时/限流/锁定，可重试）"""
+    transient_keywords = ["timeout", "locked", "rate limit", "503", "502", "429"]
+    return any(kw in str(error).lower() for kw in transient_keywords)
 
 
 @contextmanager

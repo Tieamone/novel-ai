@@ -101,6 +101,7 @@ def _get_defaults() -> dict:
             "compress_after_chapters": 20,
             "pre_split_chapters": 50,
             "failure_switch_threshold": 3,
+            "progress_review_window": 10,
         },
         "paths": {
             "data_dir": "data",
