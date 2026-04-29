@@ -1,8 +1,6 @@
-import sys
 import os
 import time
 import re
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pathlib import Path
 from core.memory_manager import MemoryManager

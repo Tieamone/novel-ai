@@ -1,14 +1,11 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import json
 import re
 from core.api_client import call_reviewer_api, increment_failure_counter, reset_failure_counter, check_switch_needed
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg
 from core.reader_reviewer import reader_review_chapter
-from core.utils import with_db_connection, DatabaseTransaction, execute_with_retry
+from core.utils import with_db_connection, DatabaseTransaction, execute_with_retry, \
+    extract_json_obj, to_int, is_transient_error
 
 REVIEW_PASS_TOTAL = 75
 REVIEW_PASS_L1 = 30
@@ -37,13 +34,21 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
 - 章节内部因果是否完整：有起因、有经过、有结果或悬念
 
 【L3 可读性与网文节奏】0-30分
-- 是否存在注水或重复表达（换了个词说同一件事，扣3-5分）
-- 是否具备有效冲突推进或信息推进
-- 结尾是否形成阅读驱动力（读者想继续看）
-- 是否存在比喻/修辞堆砌（平叙段每500字超过2处，或相邻段落出现结构相似比喻句，扣5-8分，code: metaphor_overload）
-- 是否缺少实质性对话（全章少于2轮有来有回的对话，扣3-5分）
-- 是否存在情绪标签化问题：直接用"她感到紧张/他心中涌起暖意"等方式陈述情绪，而非通过行为/生理反应展示（每处扣2-3分，code: emotion_labeling）
-- 结尾是否使用模板化收束句（"才刚刚开始"/"还很长"/"无论前方"类，扣3-5分，code: cliche_ending）
+
+→ AI痕迹检测（最高优先级，每类每处扣2-4分）：
+- 情绪标签直陈（emotion_labeling）：直接写"她感到紧张/他心中涌起/她不禁感动/他意识到"，而非通过行为或生理反应表达
+- 高频烂俗动作（cliche_action）：深吸一口气平复情绪、握紧拳头下定决心、瞳孔收缩察觉危险、喉咙发紧、脑海浮现
+- 模板收束句（cliche_ending）："这才刚开始/路还很长/无论前方有多少困难/故事远未结束"，每出现一次扣3-5分
+- 心理陈述结尾（psych_ending）：以"她决定了/他知道该怎么做了"等直接心理陈述收章，扣3分
+- 对称句式滥用（parallel_abuse）：连续出现"虽然…但依然/一方面…另一方面"超过2次，扣2-3分
+- 句子节奏单调（rhythm_flat）：全章句子长度高度均匀，缺乏长短句交错的节奏变化，扣2-3分
+
+→ 质量检测：
+- 注水或重复表达：换了个词说同一件事（扣3-5分）
+- 有效推进：是否有冲突升级、信息新增或关系变化（无推进扣5分）
+- 结尾驱动力：读者读完想不想翻下一章
+- 比喻堆砌（metaphor_overload）：平叙段每500字超过2处比喻/拟人（扣5-8分）
+- 缺实质性对话：全章少于2轮有来有回的对话（扣3-5分）
 
 一票否决项（任一命中即不通过，不受分数影响）：
 1) 核心设定冲突（setting_conflict）：与已建立的世界规则或关键事实直接矛盾
@@ -73,7 +78,7 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
   ],
   "l1_issues": ["具体问题描述"],
   "l2_issues": ["具体问题描述"],
-  "l3_issues": ["具体问题描述，注明是哪种类型（metaphor_overload/emotion_labeling/cliche_ending/注水/缺对话等）"],
+  "l3_issues": ["具体问题描述，注明类型（emotion_labeling/cliche_action/cliche_ending/psych_ending/parallel_abuse/rhythm_flat/metaphor_overload/注水/缺对话等），并引用原文具体句子"],
   "failure_attribution": {
     "primary_layer": "L1|L2|L3|none",
     "root_cause": "最关键失败原因（一句话），若通过写none",
@@ -81,31 +86,6 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
   },
   "suggestions": "失败时给出具体可执行的修订建议（指出需要改哪段、怎么改）；通过写质量合格"
 }"""
-
-
-def _extract_json_obj(raw: str) -> dict:
-    if not raw:
-        return {}
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not match:
-        return {}
-    try:
-        obj = json.loads(match.group())
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
-
-def _to_int(value, default=0, min_value=None, max_value=None) -> int:
-    try:
-        iv = int(float(value))
-    except Exception:
-        iv = default
-    if min_value is not None:
-        iv = max(min_value, iv)
-    if max_value is not None:
-        iv = min(max_value, iv)
-    return iv
 
 
 def _normalize_issue_list(value) -> list:
@@ -222,12 +202,6 @@ def _normalize_failure_attribution(value, passed: bool,
     }
 
 
-def _is_transient_error(error):
-    """判断是否为暂时性错误（可重试恢复）"""
-    transient_keywords = ["timeout", "locked", "rate limit", "503", "502", "429"]
-    return any(kw in str(error).lower() for kw in transient_keywords)
-
-
 def _rule_pass(score_total: int, score_l1: int, veto_items: list) -> bool:
     return (not veto_items and
             score_total >= REVIEW_PASS_TOTAL and
@@ -240,15 +214,15 @@ def _normalize_review_result(raw_result: dict) -> dict:
     l3_issues = _normalize_issue_list(raw_result.get("l3_issues"))
     veto_items = _normalize_veto_items(raw_result.get("veto_items"))
 
-    score_l1 = _to_int(
+    score_l1 = to_int(
         raw_result.get("score_l1", raw_result.get("l1_score", 0)),
         default=0, min_value=0, max_value=45
     )
-    score_l2 = _to_int(
+    score_l2 = to_int(
         raw_result.get("score_l2", raw_result.get("l2_score", 0)),
         default=0, min_value=0, max_value=25
     )
-    score_l3 = _to_int(
+    score_l3 = to_int(
         raw_result.get("score_l3", raw_result.get("l3_score", 0)),
         default=0, min_value=0, max_value=30
     )
@@ -259,11 +233,11 @@ def _normalize_review_result(raw_result: dict) -> dict:
         if legacy is None:
             score_total = score_l1 + score_l2 + score_l3
         else:
-            score_total = _to_int(legacy, default=0, min_value=0)
+            score_total = to_int(legacy, default=0, min_value=0)
             if score_total <= 10:
                 score_total *= 10
     else:
-        score_total = _to_int(total_raw, default=0, min_value=0, max_value=100)
+        score_total = to_int(total_raw, default=0, min_value=0, max_value=100)
 
     expected_total = score_l1 + score_l2 + score_l3
     if expected_total and abs(score_total - expected_total) > 20:
@@ -311,7 +285,7 @@ def _normalize_review_result(raw_result: dict) -> dict:
         "score_l1": score_l1,
         "score_l2": score_l2,
         "score_l3": score_l3,
-        "score": _to_int(round(score_total / 10), default=0, min_value=0, max_value=10),
+        "score": to_int(round(score_total / 10), default=0, min_value=0, max_value=10),
         "veto_items": veto_items,
         "veto_triggered": veto_triggered,
         "veto_reasons": veto_reasons,
@@ -368,6 +342,7 @@ def _truncate_for_review(text: str, max_len: int = 3000) -> str:
 
 def build_review_prompt(ctx: dict, chapter_num: int,
                         content: str, plot_goal: str) -> str:
+    content = _truncate_for_review(content)
     chars = ctx.get("characters", [])
     chars_str = "\n".join([
         f"【{c.get('name', '未命名角色')}】"
@@ -420,11 +395,11 @@ def review_chapter(novel_name: str, chapter_num: int,
         raw = call_reviewer_api(
             system_prompt=REVIEWER_SYSTEM,
             user_message=prompt,
-            temperature=cfg("temperature", "self_check", 0.25),
+            temperature=0.25,
             max_tokens=1600,
         )
     except Exception as e:
-        if _is_transient_error(e):
+        if is_transient_error(e):
             print(f"  [责任编辑] ⚠️ 审稿遇到暂时性问题: {str(e)[:100]}")
             print(f"  [责任编辑] 💡 建议稍后手动重新审稿此章节")
             mm.update_chapter_status(chapter_num, "pending_review")
@@ -442,7 +417,7 @@ def review_chapter(novel_name: str, chapter_num: int,
                 issue="审稿API调用失败（严重错误）"
             )
 
-    parsed = _extract_json_obj(raw)
+    parsed = extract_json_obj(raw)
     if not parsed:
         print("  [责任编辑] 审稿返回格式异常，本轮判定为不通过")
         error_result = _review_error_result(
@@ -514,114 +489,24 @@ def _increment_retry_safe(novel_name: str, chapter_num: int):
             """, (chapter_num,))
 
 
-
-
-# ============================================================
-# 场景重规划：当 veto 反复触发时，放弃原场景方案，生成新方案
-# ============================================================
-
-SCENE_REPLAN_SYSTEM = """你是一位资深网文策划编辑，专门解决剧情逻辑卡关问题。
-
-当AI写手连续在同一章卡住时，你的任务是：
-1. 找到让当前场景无法实现的根本矛盾
-2. 提出一个不同的场景实现方案，绕开矛盾，同时完成相同的情节目标
-3. 新方案必须与人物设定和已建立的世界观兼容
-
-你输出的是一个修订后的情节目标描述（plot_goal），不是章节内容。
-直接输出新的 plot_goal 文本，不要解释，不要JSON。"""
-
-
-def _replan_scene_for_veto(novel_name: str, chapter_num: int,
-                           plot_goal: str, veto_reasons: list,
-                           suggestions: str) -> str:
-    """
-    当 veto 反复触发（core_ooc / timeline_break）时，
-    调用 AI 重新规划场景方案，返回修订后的 plot_goal。
-    这是"剧情层面的修复"，不是"写作层面的修复"。
-    """
-    from core.api_client import call_reviewer_api
-    from core.memory_manager import MemoryManager
-
-    mm = MemoryManager(novel_name)
-    ctx = mm.load_context(chapter_num)
-
-    chars = ctx.get("characters", [])
-    chars_summary = "\n".join([
-        f"{c.get('name')}（{c.get('role')}）：{c.get('personality', '')[:100]}"
-        for c in chars[:6]
-    ])
-
-    summaries = ctx.get("recent_summaries", [])
-    recent = "\n".join([
-        f"第{s['chapter_num']}章：{s['summary']}" for s in summaries[-3:]
-    ]) if summaries else "无近期摘要"
-
-    veto_text = "\n".join([f"- {r}" for r in veto_reasons])
-    print(f"  [场景重规划] 检测到反复 veto，正在重新规划第{chapter_num}章场景方案...")
-
-    prompt = f"""以下章节的情节目标在三次写作尝试后仍因逻辑问题无法通过审核：
-
-【原情节目标】
-{plot_goal}
-
-【反复触发的 Veto 原因】
-{veto_text}
-
-【审稿建议】
-{suggestions}
-
-【已确立的人物设定】
-{chars_summary}
-
-【近期剧情摘要】
-{recent}
-
-请提供一个修订后的情节目标，要求：
-1. 完成相同的剧情推进方向（比如：主角到达目标地点、获得关键信息、与反派发生冲突）
-2. 不要求任何角色做出与其设定相悖的行为
-3. 给出一个具体的、不同于原方案的场景实现路径
-4. 如果原方案中某角色的状态转变太突兀，提供一个更合理的触发机制
-
-只输出修订后的情节目标文本（100-200字），不要任何解释。"""
-
-    try:
-        new_goal = call_reviewer_api(
-            system_prompt=SCENE_REPLAN_SYSTEM,
-            user_message=prompt,
-            temperature=cfg("temperature", "scene_replan", 0.70),
-            max_tokens=400,
-        )
-        new_goal = new_goal.strip()
-        if new_goal and len(new_goal) > 30:
-            print(f"  [场景重规划] 新方案已生成（{len(new_goal)}字）")
-            return new_goal
-        else:
-            print(f"  [场景重规划] 生成结果过短，保留原方案")
-            return plot_goal
-    except Exception as e:
-        print(f"  [场景重规划] 失败：{e}，保留原方案")
-        return plot_goal
-
 def write_and_review(novel_name: str, chapter_num: int,
                      plot_goal: str, emotion_tag: str = "铺垫",
                      max_retry: int = None) -> str:
     """
-    写作 → 审稿（责任编辑 + 读者视角）→ 保存 的完整流程。
+    写作→审稿（责任编辑+读者视角）→保存 的完整流程。
 
-    重试策略（修复版）：
-    ─────────────────────────────────────────────────────────
-    • L1 一票否决（core_ooc / timeline_break 等逻辑崩塌）：
-        第1次失败 → 附带审稿建议重写（写法层面修复）
-        第2次起   → 调用 _replan_scene_for_veto 重规划场景方案
-                    （改变"怎么到达目标"，不改变目标本身）
-    • L3 不通过（文笔/AI痕迹问题）：
-        附带具体问题清单重写，每次重置为干净的反馈，不累积
-    • 读者视角不通过：
-        只用读者视角问题作为反馈，不混入责任编辑结果
-    ─────────────────────────────────────────────────────────
+    并发安全保障：
+    - 入口标记状态为 'writing'，标识正在处理中
+    - 所有数据库状态变更使用 execute_with_retry 防锁定失败
+    - 异常路径保证状态回退到确定性的终态（approved/force_approved/review_failed）
+    - 绝不会停留在中间不一致状态
+
+    冲突检测：
+    - 连续 ≥2 次因相同 veto_code 失败且层均为 L1/L2 时，触发任务卡冲突菜单
+    - 每章最多允许一次任务卡重写，防止无限循环
     """
     from core.writer import write_chapter
-    from core.api_client import get_failure_stats, check_switch_needed
+    from core.api_client import get_failure_stats, check_switch_needed, get_switch_history
 
     if max_retry is None:
         max_retry = cfg("novel", "max_retry", 3)
@@ -632,219 +517,320 @@ def write_and_review(novel_name: str, chapter_num: int,
     MAX_REVIEW_RETRIES = 3
     review_retry_count = 0
 
-    # 原始 plot_goal 保存，重规划时基于原始目标
-    original_plot_goal = plot_goal
-    current_plot_goal = plot_goal
-
-    # veto 连续触发计数（用于决定何时切换到场景重规划模式）
-    consecutive_veto_count = 0
-
     try:
         _update_status_safe(novel_name, chapter_num, "writing")
     except Exception as e:
         print(f"  [警告] 状态标记 writing 失败（非致命）：{e}")
 
-    for attempt in range(max_retry):
-        print(f"\n  第{attempt+1}次写作尝试...")
+    # ── 冲突检测变量 ──────────────────────────────────────────────
+    _original_plot_goal = plot_goal   # 保留原始干净目标（不含累积反馈）
+    _original_emotion_tag = emotion_tag
+    _veto_code_counter: dict = {}     # {veto_code: 命中次数}
+    _failure_layers: list = []        # 每次失败的 primary_layer
+    _task_rewrite_done = False        # 每章最多重写一次任务卡
+    _rewrite_requested = False        # 内层 for 循环通知外层需要重试
+    # ─────────────────────────────────────────────────────────────
 
-        # ── 写作 ──────────────────────────────────────────────
-        try:
-            content = write_chapter(novel_name, chapter_num,
-                                    current_plot_goal, emotion_tag)
-            reset_failure_counter("author")
-        except Exception as e:
-            print(f"  [错误] 写作调用失败：{e}")
-            increment_failure_counter("author")
-            if check_switch_needed("author"):
-                print(f"\n{'='*60}")
-                print(f"  [提示] 作者模型连续失败，建议切换模型")
-                print(f"{'='*60}")
-                from core.api_client import _select_single_model
-                print("\n是否切换作者模型？(y/n，默认y)")
-                choice = input().strip().lower() or "y"
-                if choice == "y":
-                    author_choice = _select_single_model("作者模型", default="1")
-                    from core.api_client import set_author_model
-                    set_author_model(author_choice["model"], author_choice["provider"])
-                    reset_failure_counter("author")
-            continue
+    # 外层 while：正常流程只走一次；任务卡重写后最多再走一次
+    while True:
+        _rewrite_requested = False
 
-        # ── 责任编辑审稿 ──────────────────────────────────────
-        result = review_chapter(novel_name, chapter_num,
-                                content, current_plot_goal)
+        for attempt in range(max_retry):
+            print(f"\n  第{attempt+1}次写作尝试...")
 
-        # 审稿模型异常（JSON 解析失败等）
-        if result.get("review_error"):
-            review_retry_count += 1
-            issue_msg = result.get("issue") or result.get("retry_hint", "未知错误")
-            if review_retry_count <= MAX_REVIEW_RETRIES:
-                print(f"\n  [重试审稿] 责任编辑返回异常（{issue_msg}），"
-                      f"第{review_retry_count}/{MAX_REVIEW_RETRIES}次重试...")
-                increment_failure_counter("reviewer")
-                if check_switch_needed("reviewer"):
+            try:
+                content = write_chapter(novel_name, chapter_num,
+                                        plot_goal, emotion_tag)
+                reset_failure_counter("author")
+            except Exception as e:
+                print(f"  [错误] 写作调用失败：{e}")
+                increment_failure_counter("author")
+                if check_switch_needed("author"):
                     print(f"\n{'='*60}")
-                    print(f"  [提示] 审稿模型连续异常，建议切换模型")
+                    print(f"  [提示] 作者模型连续失败，建议切换模型")
                     print(f"{'='*60}")
-                    from core.api_client import _select_single_model
-                    print("\n是否切换审稿模型？(y/n，默认y)")
+                    from core.api_client import select_all_models_interactive, _select_single_model
+                    print("\n是否切换作者模型？(y/n，默认y)")
                     choice = input().strip().lower() or "y"
                     if choice == "y":
-                        reviewer_choice = _select_single_model("审稿模型", default="1")
-                        from core.api_client import set_reviewer_model
-                        set_reviewer_model(reviewer_choice["model"], reviewer_choice["provider"])
-                        reset_failure_counter("reviewer")
+                        print("\n【选择新的作者模型】")
+                        author_choice = _select_single_model("作者模型", default="1")
+                        from core.api_client import set_author_model
+                        set_author_model(author_choice["model"], author_choice["provider"])
+                        reset_failure_counter("author")
                 continue
-            else:
-                print(f"\n  [错误] 审稿连续{MAX_REVIEW_RETRIES}次异常，降级处理")
 
-        # ── 责任编辑不通过 ───────────────────────────────────
-        if not result.get("pass"):
-            score = result.get("score_total", 0)
-            veto_triggered = result.get("veto_triggered", False)
-            veto_items = result.get("veto_items", [])
-            veto_codes = [v.get("code", "") for v in veto_items]
-            suggestions = result.get("suggestions", "")
+            result = review_chapter(novel_name, chapter_num,
+                                    content, plot_goal)
 
-            print(f"\n  [重写] 责任编辑不通过（{score}/100），跳过读者视角")
-
-            try:
-                _increment_retry_safe(novel_name, chapter_num)
-            except Exception as e:
-                print(f"  [警告] 重试计数更新失败（非致命）：{e}")
-                mm.increment_retry_count(chapter_num)
-
-            if attempt < max_retry - 1:
-                is_logic_veto = veto_triggered and any(
-                    c in veto_codes for c in
-                    ("core_ooc", "timeline_break", "setting_conflict",
-                     "plot_collapse", "worldview_break")
-                )
-
-                if is_logic_veto:
-                    consecutive_veto_count += 1
-                    veto_reasons = [
-                        f"{v.get('code', '?')}：{v.get('reason', '')}"
-                        for v in veto_items
-                    ]
-                    print(f"  [失败类型] L1逻辑崩塌（veto×{consecutive_veto_count}）：{', '.join(veto_codes)}")
-
-                    if consecutive_veto_count >= 2:
-                        # 第2次及以后的 L1 veto → 重规划场景方案
-                        new_goal = _replan_scene_for_veto(
-                            novel_name, chapter_num,
-                            original_plot_goal, veto_reasons, suggestions
-                        )
-                        current_plot_goal = new_goal
-                        print(f"  [重写] 已切换至新场景方案，准备第{attempt+2}次写作...")
-                    else:
-                        # 第1次 L1 veto → 附带详细审稿建议重写（写法层面）
-                        veto_text = "\n".join([f"- {r}" for r in veto_reasons])
-                        current_plot_goal = (
-                            f"{original_plot_goal}\n\n"
-                            f"【上次审稿一票否决原因，本次必须从根本上修复】\n"
-                            f"{veto_text}\n\n"
-                            f"【审稿建议（必须执行）】\n{suggestions}"
-                        )
-                        print(f"  [重写] 已附详细修复要求，准备第{attempt+2}次写作...")
+            if result.get("review_error"):
+                review_retry_count += 1
+                issue_msg = result.get('issue') or result.get('retry_hint', '未知错误')
+                if review_retry_count <= MAX_REVIEW_RETRIES:
+                    print(f"\n  [重试审稿] 责任编辑返回异常（{issue_msg}），第{review_retry_count}/{MAX_REVIEW_RETRIES}次重试...")
+                    increment_failure_counter("reviewer")
+                    if check_switch_needed("reviewer"):
+                        print(f"\n{'='*60}")
+                        print(f"  [提示] 审稿模型连续异常，建议切换模型")
+                        print(f"{'='*60}")
+                        from core.api_client import select_all_models_interactive, _select_single_model
+                        print("\n是否切换审稿模型？(y/n，默认y)")
+                        choice = input().strip().lower() or "y"
+                        if choice == "y":
+                            print("\n【选择新的审稿模型】")
+                            reviewer_choice = _select_single_model("审稿模型", default="1")
+                            from core.api_client import set_reviewer_model
+                            set_reviewer_model(reviewer_choice["model"], reviewer_choice["provider"])
+                            reset_failure_counter("reviewer")
+                    continue
                 else:
-                    # L3 文笔/AI痕迹问题 → 附具体问题清单，每次重置（不累积）
-                    consecutive_veto_count = 0
+                    print(f"\n  [错误] 审稿连续{MAX_REVIEW_RETRIES}次异常，降级为不通过处理")
+                    pass
+
+            if not result.get("pass"):
+                print(f"\n  [重写] 责任编辑不通过（{result.get('score_total', 0)}/100），跳过读者视角评估")
+                try:
+                    _increment_retry_safe(novel_name, chapter_num)
+                except Exception as e:
+                    print(f"  [警告] 重试计数更新失败（非致命）：{e}")
+                    mm.increment_retry_count(chapter_num)
+
+                # ── 冲突检测：收集本次失败数据 ────────────────────────
+                for veto_item in result.get("veto_items", []):
+                    code = veto_item.get("code", "unknown")
+                    _veto_code_counter[code] = _veto_code_counter.get(code, 0) + 1
+                _attr = result.get("failure_attribution", {})
+                if isinstance(_attr, dict):
+                    _layer = _attr.get("primary_layer", "")
+                    if _layer:
+                        _failure_layers.append(_layer)
+
+                repeated_vetos = [
+                    code for code, cnt in _veto_code_counter.items() if cnt >= 2
+                ]
+                _all_structural = bool(_failure_layers) and all(
+                    l in ("L1", "L2") for l in _failure_layers
+                )
+                _conflict_detected = (
+                    len(repeated_vetos) > 0
+                    and _all_structural
+                    and attempt >= 1
+                    and not _task_rewrite_done
+                )
+                # ─────────────────────────────────────────────────────
+
+                # ── 冲突菜单 ──────────────────────────────────────────
+                if _conflict_detected:
+                    _veto_desc = "、".join(repeated_vetos)
+                    print(f"\n{'='*60}")
+                    print(f"  [冲突检测] 连续{attempt+1}次因相同原因失败：{_veto_desc}")
+                    print(f"  系统判断：当前任务卡目标可能与故事设定存在冲突")
+                    print(f"{'='*60}")
+                    print("\n  处理方式：")
+                    print("  1. 基于大纲自动重写本章任务卡，然后重新写作（推荐）")
+                    print("  2. 手动输入新的情节目标")
+                    print("  3. 继续原任务卡重试（切换模型）")
+                    print("  4. 强制通过当前版本")
+                    conflict_choice = input("\n  请选择（默认1）：").strip() or "1"
+
+                    if conflict_choice == "1":
+                        print("\n  [任务卡重写] 正在基于大纲生成新目标...")
+                        from core.planner import rewrite_task_for_chapter
+                        veto_descs = [
+                            f"{item.get('code','')}: {item.get('description','')}"
+                            for item in result.get("veto_items", [])
+                            if item.get("code") in repeated_vetos
+                        ]
+                        new_task = rewrite_task_for_chapter(
+                            novel_name, chapter_num,
+                            veto_reasons=veto_descs,
+                            current_goal=_original_plot_goal,
+                            current_emotion_tag=_original_emotion_tag,
+                        )
+                        plot_goal    = new_task["plot_goal"]
+                        emotion_tag  = new_task["emotion_tag"]
+                        _original_plot_goal   = plot_goal
+                        _original_emotion_tag = emotion_tag
+                        _veto_code_counter.clear()
+                        _failure_layers.clear()
+                        _task_rewrite_done = True
+                        _rewrite_requested = True
+                        print(f"  [OK] 新任务卡：{plot_goal}")
+                        print(f"       情绪标签：{emotion_tag}")
+                        break  # 跳出 for 循环，外层 while 重新开始
+
+                    elif conflict_choice == "2":
+                        print("\n  请输入新的情节目标（40-80字，直接回车取消）：")
+                        manual_goal = input("  > ").strip()
+                        if manual_goal and len(manual_goal) >= 10:
+                            plot_goal   = manual_goal
+                            _original_plot_goal   = plot_goal
+                            _veto_code_counter.clear()
+                            _failure_layers.clear()
+                            _task_rewrite_done = True
+                            _rewrite_requested = True
+                            # 同步写库
+                            try:
+                                from core.utils import with_db_connection as _wdb
+                                with _wdb(novel_name) as _conn:
+                                    _row = _conn.execute(
+                                        "SELECT original_plot_goal, rewrite_count "
+                                        "FROM chapter_tasks WHERE chapter_num=?",
+                                        (chapter_num,)
+                                    ).fetchone()
+                                    _orig = (_row["original_plot_goal"] or _original_plot_goal) if _row else _original_plot_goal
+                                    _rc   = ((_row["rewrite_count"] or 0) + 1) if _row else 1
+                                    _conn.execute(
+                                        "UPDATE chapter_tasks SET plot_goal=?, "
+                                        "original_plot_goal=?, rewrite_count=? "
+                                        "WHERE chapter_num=?",
+                                        (plot_goal, _orig, _rc, chapter_num)
+                                    )
+                                    _conn.commit()
+                            except Exception as _e:
+                                print(f"  [警告] 任务卡更新失败（非致命）：{_e}")
+                            print(f"  [OK] 已更新任务卡目标")
+                            break  # 跳出 for 循环，外层 while 重新开始
+                        else:
+                            print("  [提示] 输入无效，继续原任务卡重试")
+                            # 不 break，继续 for 循环的正常重试逻辑
+
+                    elif conflict_choice == "4":
+                        print(f"  [强制通过] 保留当前版本")
+                        try:
+                            _update_status_safe(novel_name, chapter_num, "强制通过")
+                        except Exception as e:
+                            print(f"  [警告] 状态更新失败：{e}")
+                            mm.update_chapter_status(chapter_num, "强制通过")
+                        return content or ""
+
+                    # choice == "3"：跳过冲突菜单，走正常重试逻辑（下方）
+                # ─────────────────────────────────────────────────────
+
+                # 若刚才选了 1 或 2 并 break，这里不会执行
+                if _rewrite_requested:
+                    break
+
+                if attempt < max_retry - 1:
                     retry_feedback = _build_retry_feedback(result)
                     if retry_feedback:
-                        current_plot_goal = (
-                            f"{original_plot_goal}\n\n"
-                            f"【上次写作文笔问题，本次必须修复（以下问题逐一解决）】\n"
-                            f"{retry_feedback}"
+                        plot_goal = (
+                            f"{_original_plot_goal}\n\n"
+                            f"【上次写作问题（责任编辑），本次必须修复】\n{retry_feedback}"
                         )
-                    else:
-                        current_plot_goal = original_plot_goal
-                    print(f"  [重写] 已附文笔修复要求，准备第{attempt+2}次写作...")
+                    print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
+                    continue
+                else:
+                    if result.get("review_error"):
+                        print(f"  [错误] 审稿连续{max_retry}次异常，停止")
+                        try:
+                            _update_status_safe(novel_name, chapter_num, "审稿失败")
+                        except Exception as e:
+                            print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+                            mm.update_chapter_status(chapter_num, "审稿失败")
+                        return ""
 
+                    print(f"\n{'='*60}")
+                    print(f"  [提示] 连续{max_retry}次未通过！")
+                    print(f"  建议切换到更强的模型后重新生成此章节")
+                    print(f"{'='*60}")
+
+                    from core.api_client import select_all_models_interactive, _select_single_model
+                    print("\n是否切换模型？(y/n，默认y)")
+                    choice = input().strip().lower() or "y"
+                    if choice == "y":
+                        print("\n【选择新的写作/审稿模型】")
+                        model_choice = _select_single_model("综合模型", default="1")
+                        from core.api_client import set_author_model, set_reviewer_model
+                        set_author_model(model_choice["model"], model_choice["provider"])
+                        set_reviewer_model(model_choice["model"], model_choice["provider"])
+                        reset_failure_counter("author")
+                        reset_failure_counter("reviewer")
+                        print(f"\n  [OK] 已切换至 {model_choice['name']}")
+                        print(f"  请在章节菜单选择「恢复审稿失败章节」重新生成第{chapter_num}章")
+
+                    print(f"  [警告] 保留最后版本（强制通过）")
+                    try:
+                        _update_status_safe(novel_name, chapter_num, "强制通过")
+                    except Exception as e:
+                        print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+                        mm.update_chapter_status(chapter_num, "强制通过")
+                    return content or ""
+
+                continue  # for 循环正常推进
+
+            # ── 责任编辑通过，进入读者视角 ───────────────────────────
+            reader_result = reader_review_chapter(novel_name, chapter_num, content)
+
+            if reader_result.get("pass"):
+                print(f"\n  [OK] 第{chapter_num}章双重审核通过！")
+                review_retry_count = 0
+                try:
+                    _update_status_safe(novel_name, chapter_num, "已审核")
+                except Exception as e:
+                    print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+                    mm.update_chapter_status(chapter_num, "已审核")
+                return content
             else:
-                # 所有重试耗尽
-                _handle_all_retries_failed(novel_name, chapter_num, content, mm, max_retry)
-                return content or ""
+                print(f"\n  [重写] 读者视角不通过（{reader_result.get('score_total', 0)}/100）")
+                try:
+                    _increment_retry_safe(novel_name, chapter_num)
+                except Exception as e:
+                    print(f"  [警告] 重试计数更新失败（非致命）：{e}")
+                    mm.increment_retry_count(chapter_num)
 
-            continue
+                if attempt < max_retry - 1:
+                    reader_issues = reader_result.get("issues", [])
+                    reader_suggestions = reader_result.get("suggestions", "")
+                    reader_feedback_parts = [f"- {i}" for i in reader_issues if i]
+                    if reader_suggestions and reader_suggestions not in ("", "质量合格"):
+                        reader_feedback_parts.append(f"- 建议：{reader_suggestions}")
+                    if reader_feedback_parts:
+                        plot_goal = (
+                            f"{_original_plot_goal}\n\n"
+                            f"【上次写作问题（读者视角），本次必须修复）】\n"
+                            + "\n".join(reader_feedback_parts)
+                        )
+                    print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
+                else:
+                    print(f"\n{'='*60}")
+                    print(f"  [提示] 连续{max_retry}次未通过！")
+                    print(f"  建议切换到更强的模型后重新生成此章节")
+                    print(f"{'='*60}")
 
-        # ── 责任编辑通过 → 读者视角审稿 ─────────────────────
-        consecutive_veto_count = 0
-        reader_result = reader_review_chapter(novel_name, chapter_num, content)
+                    from core.api_client import select_all_models_interactive, _select_single_model
+                    print("\n是否切换模型？(y/n，默认y)")
+                    choice = input().strip().lower() or "y"
+                    if choice == "y":
+                        print("\n【选择新的写作/审稿模型】")
+                        model_choice = _select_single_model("综合模型", default="1")
+                        from core.api_client import set_author_model, set_reviewer_model
+                        set_author_model(model_choice["model"], model_choice["provider"])
+                        set_reviewer_model(model_choice["model"], model_choice["provider"])
+                        reset_failure_counter("author")
+                        reset_failure_counter("reviewer")
+                        print(f"\n  [OK] 已切换至 {model_choice['name']}")
+                        print(f"  请在章节菜单选择「恢复审稿失败章节」重新生成第{chapter_num}章")
 
-        if reader_result.get("pass"):
-            print(f"\n  [OK] 第{chapter_num}章双重审核通过！")
-            review_retry_count = 0
-            try:
-                _update_status_safe(novel_name, chapter_num, "已审核")
-            except Exception as e:
-                print(f"  [警告] 状态更新失败：{e}")
-                mm.update_chapter_status(chapter_num, "已审核")
-            return content
+                    print(f"  [警告] 保留最后版本（强制通过）")
+                    try:
+                        _update_status_safe(novel_name, chapter_num, "强制通过")
+                    except Exception as e:
+                        print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+                        mm.update_chapter_status(chapter_num, "强制通过")
+                    return content or ""
 
-        # 读者视角不通过
-        score_r = reader_result.get("score_total", 0)
-        print(f"\n  [重写] 读者视角不通过（{score_r}/100）")
-
-        try:
-            _increment_retry_safe(novel_name, chapter_num)
-        except Exception as e:
-            print(f"  [警告] 重试计数更新失败（非致命）：{e}")
-            mm.increment_retry_count(chapter_num)
-
-        if attempt < max_retry - 1:
-            # Bug修复7: 只用读者视角的问题，不混入已通过的责任编辑结果
-            reader_issues = reader_result.get("issues", [])
-            reader_suggestions = str(reader_result.get("suggestions", "")).strip()
-            parts = [f"- {i}" for i in reader_issues if i]
-            if reader_suggestions and reader_suggestions not in ("", "质量合格"):
-                parts.append(f"- 建议：{reader_suggestions}")
-            if parts:
-                current_plot_goal = (
-                    f"{original_plot_goal}\n\n"
-                    f"【读者视角反馈（本次必须修复）】\n"
-                    + "\n".join(parts)
-                )
-            else:
-                current_plot_goal = original_plot_goal
-            print(f"  [重写] 已附读者视角修复要求，准备第{attempt+2}次写作...")
+        # for 循环结束后：若收到重写请求且未超次，继续 while
+        if _rewrite_requested:
+            continue  # 回到 while True，重新 for attempt in range(max_retry)
         else:
-            _handle_all_retries_failed(novel_name, chapter_num, content, mm, max_retry)
-            return content or ""
+            break  # 正常退出 while
 
-    # 循环正常结束（理论上不应到达此处）
-    if content:
-        try:
-            _update_status_safe(novel_name, chapter_num, "强制通过")
-        except Exception:
-            pass
+    if check_switch_needed("author") or check_switch_needed("reviewer"):
+        print(f"\n{'='*60}")
+        print(f"  [提示] 检测到多次失败，建议检查模型配置")
+        fail_stats = get_failure_stats()
+        print(f"  失败统计：作者={fail_stats['author_failures']} 审核={fail_stats['reviewer_failures']} 读者视角={fail_stats['reader_reviewer_failures']}")
+        print(f"{'='*60}")
+
     return content or ""
-
-
-def _handle_all_retries_failed(novel_name: str, chapter_num: int,
-                                content: str, mm, max_retry: int):
-    """所有重试耗尽时的统一处理：询问切换模型，强制通过当前内容"""
-    print(f"\n{'='*60}")
-    print(f"  [提示] 连续{max_retry}次未通过！建议切换更强的模型后重新生成")
-    print(f"{'='*60}")
-
-    from core.api_client import _select_single_model
-    print("\n是否现在切换模型？(y/n，默认n)")
-    choice = input().strip().lower() or "n"
-    if choice == "y":
-        model_choice = _select_single_model("写作模型", default="1")
-        from core.api_client import set_author_model, set_reviewer_model
-        from core.api_client import reset_failure_counter as rfc
-        set_author_model(model_choice["model"], model_choice["provider"])
-        set_reviewer_model(model_choice["model"], model_choice["provider"])
-        rfc("author")
-        rfc("reviewer")
-        print(f"\n  [OK] 已切换至 {model_choice['name']}")
-        print(f"  请在主菜单中选择「恢复review_failed」重新生成第{chapter_num}章")
-
-    if content:
-        print(f"  [警告] 保留最后版本（强制通过）")
-        try:
-            _update_status_safe(novel_name, chapter_num, "强制通过")
-        except Exception as e:
-            print(f"  [警告] 状态更新失败：{e}")
-            mm.update_chapter_status(chapter_num, "强制通过")

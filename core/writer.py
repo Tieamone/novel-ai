@@ -1,12 +1,9 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import json
 import re
 from core.api_client import call_author_api, increment_failure_counter, reset_failure_counter, get_current_author_model
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg, get_data_dir
+from core.utils import extract_json_obj, is_transient_error
 
 
 def is_high_capacity_model() -> bool:
@@ -548,19 +545,6 @@ Q6. 结尾无张力：结尾是否是一个总结性/说明性的句子，而不
 
 # ==================== 修订与续写系统 ====================
 
-REVISION_SYSTEM = """你是专业的网文修订师，专门消除AI写作痕迹，让文字听起来像真人写的。
-
-修订原则：
-- 只动有问题的地方，保留原文的语气和节奏
-- 改情绪标签时，想想这个角色在这一刻会做什么具体的小动作
-- 改模板收束时，找到这段里最后一个具体的画面停在那里
-- 改对称句式时，把其中一半打破——让它更像人在说话，不像人在背稿子
-- 改等长句子时，把其中几句劈短，或者把两句合成一句长的
-
-{NEGATIVE_EXAMPLES}
-
-只输出修订后的完整正文，不要任何说明。"""
-
 NEGATIVE_EXAMPLES = """
 【反面教材——这些句子让读者一眼看出是AI写的】
 
@@ -606,6 +590,19 @@ NEGATIVE_EXAMPLES = """
 ✓ 改：他拿起了包，又放下了。又拿起来，这次没放下。
 ✓ 改：她走出去了。脚步是快的，但手没有放开门把。
 """
+
+REVISION_SYSTEM = f"""你是专业的网文修订师，专门消除AI写作痕迹，让文字听起来像真人写的。
+
+修订原则：
+- 只动有问题的地方，保留原文的语气和节奏
+- 改情绪标签时，想想这个角色在这一刻会做什么具体的小动作
+- 改模板收束时，找到这段里最后一个具体的画面停在那里
+- 改对称句式时，把其中一半打破——让它更像人在说话，不像人在背稿子
+- 改等长句子时，把其中几句劈短，或者把两句合成一句长的
+
+{NEGATIVE_EXAMPLES}
+
+只输出修订后的完整正文，不要任何说明。"""
 
 CONTINUE_SYSTEM_BASE = """你正在续写一章小说的后半部分。
 
@@ -722,19 +719,6 @@ def _format_rule_block(title: str, rules: list) -> str:
     lines = [f"【{title}】"]
     lines.extend([f"- {r}" for r in rules])
     return "\n".join(lines)
-
-
-def _extract_json_obj(raw: str) -> dict:
-    if not raw:
-        return {}
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not match:
-        return {}
-    try:
-        obj = json.loads(match.group())
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
 
 
 def _normalize_beats(raw: str) -> str:
@@ -897,7 +881,7 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
         temperature=cfg("temperature", "self_check", 0.20),
         max_tokens=600,
     )
-    result = _extract_json_obj(raw)
+    result = extract_json_obj(raw)
     if not result:
         print("  [自检] 结果解析失败，跳过自动修订")
         return full_content
