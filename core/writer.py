@@ -27,6 +27,9 @@ def is_high_capacity_model() -> bool:
 
         model_id = current_model.get("model", "").lower()
 
+        if "flash-character" in model_id:
+            return True
+
         # 第一步：明确排除的小模型关键词（比大模型关键词优先级更高）
         small_model_patterns = [
             "flash",    # qwen3.6-flash, gemini-flash, qwen3.5-flash 等
@@ -1146,6 +1149,7 @@ def write_chapter(novel_name: str, chapter_num: int,
     word_min = cfg("novel", "chapter_word_min", 3000)
     word_max = cfg("novel", "chapter_word_max", 4000)
     max_tokens_cfg = cfg("model", "max_tokens", 4096)
+    draft_status = "草稿"
 
     # 读取风格
     author_style = AUTHOR_STYLES["1"]
@@ -1252,7 +1256,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         content_start = full_content[:100] if len(full_content) > 100 else full_content
         if _count_matching_words(prev_chapter_ending[-50:], content_start) > 15:
             print("  [警告] 检测到与上一章结尾的潜在复用，将标记修订")
-            mm.update_chapter_status(chapter_num, "草稿(有问题)")
+            draft_status = "草稿(有问题)"
 
     # 字数补写
     min_words = word_min
@@ -1335,7 +1339,7 @@ def write_chapter(novel_name: str, chapter_num: int,
 
     mm.save_chapter(
         chapter_num, f"第{chapter_num}章",
-        full_content, "草稿",
+        full_content, draft_status,
         word_target=word_target,
         plot_goal=plot_goal,
         emotion_tag=emotion_tag,

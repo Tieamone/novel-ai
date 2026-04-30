@@ -49,7 +49,7 @@ _available_models = None
 FREE_TRIAL_MODEL_NAMES = {
     "qwen3.6-flash", "qwen3.6-flash-2026-04-16",
     "qwen3.6-35b-a3b",
-    "qwen3.6-plus", "qwen3.6-plus-2026-04-02",
+    "qwen3.6-plus-2026-04-02",
     "qwen3.5-plus-2026-04-20",
     "qwen3.6-27b", "qwen3.6-max-preview",
     "qwen3.5-35b-a3b", "qwen3.5-flash-2026-02-23",
@@ -178,7 +178,7 @@ MODEL_PRICING = {
     "qwen3.6-flash":            {"input": 0.0,     "output": 0.0},
     "qwen3.6-flash-2026-04-16": {"input": 0.0,     "output": 0.0},
     "qwen3.6-35b-a3b":          {"input": 0.0,     "output": 0.0},
-    "qwen3.6-plus":             {"input": 0.0,     "output": 0.0},
+    "qwen3.6-plus":             {"input": 0.004,   "output": 0.012},
     "qwen3.6-plus-2026-04-02":  {"input": 0.0,     "output": 0.0},
     "qwen3.5-plus-2026-04-20":  {"input": 0.0,     "output": 0.0},
     "qwen3.6-27b":              {"input": 0.0,     "output": 0.0},

@@ -566,7 +566,7 @@ def write_and_review(novel_name: str, chapter_num: int,
             if result.get("review_error"):
                 review_retry_count += 1
                 issue_msg = result.get('issue') or result.get('retry_hint', '未知错误')
-                if review_retry_count <= MAX_REVIEW_RETRIES:
+                if review_retry_count < MAX_REVIEW_RETRIES:
                     print(f"\n  [重试审稿] 责任编辑返回异常（{issue_msg}），第{review_retry_count}/{MAX_REVIEW_RETRIES}次重试...")
                     increment_failure_counter("reviewer")
                     if check_switch_needed("reviewer"):
@@ -584,8 +584,13 @@ def write_and_review(novel_name: str, chapter_num: int,
                             reset_failure_counter("reviewer")
                     continue
                 else:
-                    print(f"\n  [错误] 审稿连续{MAX_REVIEW_RETRIES}次异常，降级为不通过处理")
-                    pass
+                    print(f"\n  [错误] 审稿连续{MAX_REVIEW_RETRIES}次异常，已标记为审稿失败")
+                    try:
+                        _update_status_safe(novel_name, chapter_num, "审稿失败")
+                    except Exception as e:
+                        print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+                        mm.update_chapter_status(chapter_num, "审稿失败")
+                    return ""
 
             if not result.get("pass"):
                 print(f"\n  [重写] 责任编辑不通过（{result.get('score_total', 0)}/100），跳过读者视角评估")
@@ -637,7 +642,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                         print("\n  [任务卡重写] 正在基于大纲生成新目标...")
                         from core.planner import rewrite_task_for_chapter
                         veto_descs = [
-                            f"{item.get('code','')}: {item.get('description','')}"
+                            f"{item.get('code','')}: {item.get('reason','')}"
                             for item in result.get("veto_items", [])
                             if item.get("code") in repeated_vetos
                         ]

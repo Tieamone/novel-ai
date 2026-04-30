@@ -96,6 +96,10 @@ def _sanitize_path_name(name: str) -> str:
     return sanitized.strip("._") or "未命名"
 
 
+def get_safe_output_dir(novel_name: str) -> Path:
+    return get_output_dir(_sanitize_path_name(novel_name))
+
+
 def export_chapter(novel_name: str, chapter_num: int) -> str:
     mm = MemoryManager(novel_name)
     chapter = mm.load_chapter(chapter_num)
@@ -107,8 +111,7 @@ def export_chapter(novel_name: str, chapter_num: int) -> str:
     content = clean_for_export(chapter["content"])
 
     # Bug修复11: 小说名含特殊字符时安全创建目录（Windows 尤其重要）
-    safe_novel_name = _sanitize_path_name(novel_name)
-    out_dir = get_output_dir(safe_novel_name)
+    out_dir = get_safe_output_dir(novel_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     filename = f"第{str(chapter_num).zfill(3)}章.txt"

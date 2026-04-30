@@ -9,13 +9,12 @@ from pathlib import Path
 from core.memory_manager import MemoryManager
 from core.planner import run_planner, extend_tasks, get_style_choice, split_outline_to_tasks
 from core.reviewer import write_and_review
-from core.exporter import export_chapter, export_all
+from core.exporter import export_chapter, export_all, get_safe_output_dir
 from core.db import get_connection, clean_duplicate_chapters
 from core.utils import with_db_connection, DatabaseTransaction, execute_with_retry
 from core.config_loader import (
     get as cfg,
     get_data_dir,
-    get_output_dir,
     get_project_root,
 )
 
@@ -43,7 +42,7 @@ def _data_dir(novel_name: str) -> Path:
 
 
 def _output_dir(novel_name: str) -> Path:
-    return get_output_dir(novel_name)
+    return get_safe_output_dir(novel_name)
 
 
 def _get_target_chapters(novel_name: str) -> int:
@@ -509,20 +508,23 @@ def generate_chapter_auto(novel_name: str):
     _current_chapter_num = None
 
     if content:
-        _save_chapter_memory(novel_name, next_num, content, plot_goal)
-        export_chapter(novel_name, next_num)
         chapter_status = _get_chapter_status(novel_name, next_num)
         if chapter_status in (CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED):
+            _save_chapter_memory(novel_name, next_num, content, plot_goal)
+            export_path = export_chapter(novel_name, next_num)
             _update_task_status(novel_name, next_num, TASK_COMPLETED)
+            from core.api_client import get_session_stats
+            stats = get_session_stats()
+            print(f"\n[完成] 第{next_num}章已生成并导出")
+            print(f"文件：{export_path}")
+            print(f"本次会话累计费用：¥{stats['total_cost_yuan']:.4f} 元")
         elif chapter_status == CHAPTER_STATUS_REVIEW_FAILED:
             _update_task_status(novel_name, next_num, TASK_REVIEW_FAILED)
+            print("\n[中断] 本章因审稿异常标记为 审稿失败。")
+            print('可在章节菜单使用"恢复审稿失败章节"继续处理。')
         else:
             _update_task_status(novel_name, next_num, TASK_PENDING)
-        from core.api_client import get_session_stats
-        stats = get_session_stats()
-        print(f"\n[完成] 第{next_num}章已生成并导出")
-        print(f"文件：{_output_dir(novel_name)}/第{str(next_num).zfill(3)}章.txt")
-        print(f"本次会话累计费用：¥{stats['total_cost_yuan']:.4f} 元")
+            print("\n[中断] 本章未通过审核，任务状态已回退为 待处理。")
     else:
         chapter_status = _get_chapter_status(novel_name, next_num)
         if chapter_status == CHAPTER_STATUS_REVIEW_FAILED:
@@ -812,17 +814,19 @@ def _recover_review_failed(novel_name: str):
             emotion_tag=emotion_tag,
         )
         if content:
-            if not _has_chapter_summary(novel_name, chapter_num):
-                _save_chapter_memory(novel_name, chapter_num, content, plot_goal)
-            export_chapter(novel_name, chapter_num)
             chapter_status = _get_chapter_status(novel_name, chapter_num)
             if chapter_status in (CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED):
+                if not _has_chapter_summary(novel_name, chapter_num):
+                    _save_chapter_memory(novel_name, chapter_num, content, plot_goal)
+                export_chapter(novel_name, chapter_num)
                 _update_task_status(novel_name, chapter_num, TASK_COMPLETED)
+                print(f"[OK] 第{chapter_num}章重试完成")
             elif chapter_status == CHAPTER_STATUS_REVIEW_FAILED:
                 _update_task_status(novel_name, chapter_num, TASK_REVIEW_FAILED)
+                print(f"[提示] 第{chapter_num}章仍未恢复")
             else:
                 _update_task_status(novel_name, chapter_num, TASK_PENDING)
-            print(f"[OK] 第{chapter_num}章重试完成")
+                print(f"[提示] 第{chapter_num}章未通过审核，未导出")
         else:
             chapter_status = _get_chapter_status(novel_name, chapter_num)
             if chapter_status == CHAPTER_STATUS_REVIEW_FAILED:
