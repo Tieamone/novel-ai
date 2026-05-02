@@ -48,7 +48,6 @@ def is_high_capacity_model() -> bool:
             "35b", "72b", "110b",  # 大参数开源模型
             "glm",              # GLM-5.1 等（非 flash 已被上面过滤）
             "minimax",
-            "flash-character",  # 角色扮演专用，有足够上下文
             "gemini",           # Gemini 系列（non-lite 已被过滤）
             "deepseek",
             "kimi",

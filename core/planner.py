@@ -546,7 +546,7 @@ def split_outline_to_tasks(outline: str, novel_name: str,
                      第一批次任务卡数量 = min(target_chapters, pre_split_chapters)。
     full_batch: 是否一次性生成全书任务卡（默认False保持分批行为）。
     """
-    from core.db import get_connection
+    from core.utils import with_db_connection
     pre_split = cfg("novel", "pre_split_chapters", 50)
 
     if target_chapters > 0:
@@ -590,24 +590,22 @@ def split_outline_to_tasks(outline: str, novel_name: str,
         return 0
 
     valid_tags = ["铺垫", "冲突", "爽点", "低谷", "反转"]
-    conn = get_connection(novel_name)
-    saved = 0
-    for task in tasks:
-        chapter_num = task.get("chapter_num")
-        plot_goal = task.get("plot_goal", "").strip()
-        emotion_tag = task.get("emotion_tag", "铺垫").strip()
-        if emotion_tag not in valid_tags:
-            emotion_tag = "铺垫"
-        if chapter_num and plot_goal:
-            conn.execute("""
-                INSERT OR REPLACE INTO chapter_tasks
-                (chapter_num, plot_goal, emotion_tag, status)
-                VALUES (?, ?, ?, '待处理')
-            """, (chapter_num, plot_goal, emotion_tag))
-            saved += 1
-
-    conn.commit()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        saved = 0
+        for task in tasks:
+            chapter_num = task.get("chapter_num")
+            plot_goal = task.get("plot_goal", "").strip()
+            emotion_tag = task.get("emotion_tag", "铺垫").strip()
+            if emotion_tag not in valid_tags:
+                emotion_tag = "铺垫"
+            if chapter_num and plot_goal:
+                conn.execute("""
+                    INSERT OR REPLACE INTO chapter_tasks
+                    (chapter_num, plot_goal, emotion_tag, status)
+                    VALUES (?, ?, ?, '待处理')
+                """, (chapter_num, plot_goal, emotion_tag))
+                saved += 1
+        conn.commit()
     print(f"  [OK] 已生成 {saved} 个章节任务卡")
 
     if full_batch and saved < first_batch:
@@ -627,22 +625,21 @@ def split_outline_to_tasks(outline: str, novel_name: str,
             try:
                 sup_tasks = json.loads(sup_match.group())
                 if isinstance(sup_tasks, list):
-                    conn = get_connection(novel_name)
-                    for task in sup_tasks:
-                        chapter_num = task.get("chapter_num")
-                        plot_goal = task.get("plot_goal", "").strip()
-                        emotion_tag = task.get("emotion_tag", "铺垫").strip()
-                        if emotion_tag not in valid_tags:
-                            emotion_tag = "铺垫"
-                        if chapter_num and plot_goal:
-                            conn.execute("""
-                                INSERT OR REPLACE INTO chapter_tasks
-                                (chapter_num, plot_goal, emotion_tag, status)
-                                VALUES (?, ?, ?, '待处理')
-                            """, (chapter_num, plot_goal, emotion_tag))
-                            saved += 1
-                    conn.commit()
-                    conn.close()
+                    with with_db_connection(novel_name) as conn:
+                        for task in sup_tasks:
+                            chapter_num = task.get("chapter_num")
+                            plot_goal = task.get("plot_goal", "").strip()
+                            emotion_tag = task.get("emotion_tag", "铺垫").strip()
+                            if emotion_tag not in valid_tags:
+                                emotion_tag = "铺垫"
+                            if chapter_num and plot_goal:
+                                conn.execute("""
+                                    INSERT OR REPLACE INTO chapter_tasks
+                                    (chapter_num, plot_goal, emotion_tag, status)
+                                    VALUES (?, ?, ?, '待处理')
+                                """, (chapter_num, plot_goal, emotion_tag))
+                                saved += 1
+                        conn.commit()
                     print(f"  [OK] 补充完成！总计 {saved} 个章节任务卡")
             except Exception as e:
                 print(f"  [警告] 补充任务卡解析失败：{e}")
@@ -653,7 +650,7 @@ def split_outline_to_tasks(outline: str, novel_name: str,
 
 
 def extend_tasks(novel_name: str, from_chapter: int):
-    from core.db import get_connection
+    from core.utils import with_db_connection
     from core.config_loader import get as cfg, get_data_dir
 
     data_dir = get_data_dir(novel_name)
@@ -693,21 +690,20 @@ def extend_tasks(novel_name: str, from_chapter: int):
         return
 
     valid_tags = ["铺垫", "冲突", "爽点", "低谷", "反转"]
-    conn = get_connection(novel_name)
-    for task in tasks:
-        chapter_num = task.get("chapter_num")
-        plot_goal = task.get("plot_goal", "").strip()
-        emotion_tag = task.get("emotion_tag", "铺垫").strip()
-        if emotion_tag not in valid_tags:
-            emotion_tag = "铺垫"
-        if chapter_num and plot_goal:
-            conn.execute("""
-                INSERT OR IGNORE INTO chapter_tasks
-                (chapter_num, plot_goal, emotion_tag, status)
-                VALUES (?, ?, ?, '待处理')
-            """, (chapter_num, plot_goal, emotion_tag))
-    conn.commit()
-    conn.close()
+    with with_db_connection(novel_name) as conn:
+        for task in tasks:
+            chapter_num = task.get("chapter_num")
+            plot_goal = task.get("plot_goal", "").strip()
+            emotion_tag = task.get("emotion_tag", "铺垫").strip()
+            if emotion_tag not in valid_tags:
+                emotion_tag = "铺垫"
+            if chapter_num and plot_goal:
+                conn.execute("""
+                    INSERT OR IGNORE INTO chapter_tasks
+                    (chapter_num, plot_goal, emotion_tag, status)
+                    VALUES (?, ?, ?, '待处理')
+                """, (chapter_num, plot_goal, emotion_tag))
+        conn.commit()
     print(f"  [OK] 任务卡已扩展至第{end_chapter}章")
 
 

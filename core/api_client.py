@@ -195,9 +195,18 @@ MODEL_PRICING = {
     "gemini-2.5-flash":         {"input": 0.0,     "output": 0.0},
     "gemini-2.5-flash-lite":    {"input": 0.0,     "output": 0.0},
     "gemini-2.5-pro":           {"input": 0.0,     "output": 0.0},
+    # Mimo 模型（小米）
+    "mimo-v2.5-pro":            {"input": 0.0,     "output": 0.0},
+    "mimo-v2.5":                {"input": 0.0,     "output": 0.0},
+    "mimo-v2-pro":              {"input": 0.0,     "output": 0.0},
+    "mimo-v2-omni":             {"input": 0.0,     "output": 0.0},
+    "mimo-v2-flash":            {"input": 0.0,     "output": 0.0},
 }
 
 FREE_TIER_MODELS = {"gemini-2.5-flash", "gemini-2.5-flash-lite"}
+
+# Mimo 端点
+_MIMO_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
 
 AVAILABLE_MODELS = {
     "1": {
@@ -254,6 +263,41 @@ AVAILABLE_MODELS = {
         "model": "gemini-2.5-flash",
         "provider": "gemini",
         "env_key": "GEMINI_API_KEY",
+        "free_tier": True,
+    },
+    "9": {
+        "name": "Mimo v2.5 Pro ⭐（小米旗舰）",
+        "model": "mimo-v2.5-pro",
+        "provider": "mimo",
+        "env_key": "MIMO_API_KEY",
+        "free_tier": True,
+    },
+    "10": {
+        "name": "Mimo v2.5（小米标准）",
+        "model": "mimo-v2.5",
+        "provider": "mimo",
+        "env_key": "MIMO_API_KEY",
+        "free_tier": True,
+    },
+    "11": {
+        "name": "Mimo v2 Pro（小米v2旗舰）",
+        "model": "mimo-v2-pro",
+        "provider": "mimo",
+        "env_key": "MIMO_API_KEY",
+        "free_tier": True,
+    },
+    "12": {
+        "name": "Mimo v2 Omni（小米v2全能）",
+        "model": "mimo-v2-omni",
+        "provider": "mimo",
+        "env_key": "MIMO_API_KEY",
+        "free_tier": True,
+    },
+    "13": {
+        "name": "Mimo v2 Flash（小米v2快速）",
+        "model": "mimo-v2-flash",
+        "provider": "mimo",
+        "env_key": "MIMO_API_KEY",
         "free_tier": True,
     },
 }
@@ -375,7 +419,12 @@ def set_author_model(model_name: str, provider: str = None):
     old_model = _author_model
     _author_model = model_name
     if provider is None:
-        provider = "gemini" if "gemini" in model_name else "dashscope"
+        if "gemini" in model_name:
+            provider = "gemini"
+        elif model_name.startswith("mimo-"):
+            provider = "mimo"
+        else:
+            provider = "dashscope"
     _author_provider = provider
     _switch_history.append({"type": "author", "old_model": old_model, "new_model": model_name, "timestamp": time.time()})
     print(f"[模型切换] 作者模型已切换：{old_model} -> {model_name}")
@@ -386,7 +435,12 @@ def set_reviewer_model(model_name: str, provider: str = None):
     old_model = _reviewer_model
     _reviewer_model = model_name
     if provider is None:
-        provider = "gemini" if "gemini" in model_name else "dashscope"
+        if "gemini" in model_name:
+            provider = "gemini"
+        elif model_name.startswith("mimo-"):
+            provider = "mimo"
+        else:
+            provider = "dashscope"
     _reviewer_provider = provider
     _switch_history.append({"type": "reviewer", "old_model": old_model, "new_model": model_name, "timestamp": time.time()})
     print(f"[模型切换] 审核模型已切换：{old_model} -> {model_name}")
@@ -397,7 +451,12 @@ def set_reader_reviewer_model(model_name: str, provider: str = None):
     old_model = _reader_reviewer_model
     _reader_reviewer_model = model_name
     if provider is None:
-        provider = "gemini" if "gemini" in model_name else "dashscope"
+        if "gemini" in model_name:
+            provider = "gemini"
+        elif model_name.startswith("mimo-"):
+            provider = "mimo"
+        else:
+            provider = "dashscope"
     _reader_reviewer_provider = provider
     _switch_history.append({"type": "reader_reviewer", "old_model": old_model, "new_model": model_name, "timestamp": time.time()})
     print(f"[模型切换] 读者视角模型已切换：{old_model} -> {model_name}")
@@ -453,12 +512,19 @@ def call_api(system_prompt: str, user_message: str,
         model_name = _author_model
         provider = _author_provider
     elif provider is None:
-        provider = "gemini" if "gemini" in model_name else "dashscope"
+        if "gemini" in model_name:
+            provider = "gemini"
+        elif model_name.startswith("mimo-"):
+            provider = "mimo"
+        else:
+            provider = "dashscope"
 
     if provider == "dashscope":
         return _call_dashscope(system_prompt, user_message, model_name, max_tokens, temperature, retry)
     elif provider == "gemini":
         return _call_gemini(system_prompt, user_message, model_name, max_tokens, temperature, retry)
+    elif provider == "mimo":
+        return _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature, retry)
     else:
         raise ValueError(f"未知的provider: {provider}")
 
@@ -701,6 +767,85 @@ def _call_gemini(system_prompt, user_message, model_name, max_tokens, temperatur
 
     raise RuntimeError(f"Gemini API连续失败{retry}次")
 
+def _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature, retry):
+    """
+    调用小米 Mimo 模型（OpenAI 兼容接口）。
+    端点: https://token-plan-cn.xiaomimimo.com/v1
+    认证: Authorization: Bearer $MIMO_API_KEY
+    """
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise RuntimeError("请先安装 openai 库：pip install openai")
+
+    api_key = _get_api_key("MIMO_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "未找到 MIMO_API_KEY，请在 .env 文件中设置：\n"
+            "  MIMO_API_KEY=你的Key"
+        )
+
+    # Mimo v2.5-pro / v2-pro 支持思考链，其余禁用
+    thinking_models = {"mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni"}
+    enable_thinking = model_name in thinking_models
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+    client = OpenAI(api_key=api_key, base_url=_MIMO_BASE_URL)
+
+    for attempt in range(retry):
+        try:
+            kwargs = dict(
+                model=model_name,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            if enable_thinking:
+                kwargs["extra_body"] = {
+                    "thinking": {"type": "disabled"}  # 小说写作关闭思考链，节省token
+                }
+
+            response = client.chat.completions.create(**kwargs)
+            resp_content = response.choices[0].message.content or ""
+
+            try:
+                usage = response.usage
+                input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                output_tokens = getattr(usage, "completion_tokens", 0) or 0
+                cost = _calc_cost(model_name, input_tokens, output_tokens)
+                _update_stats(model_name, input_tokens, output_tokens, cost)
+            except Exception:
+                pass
+
+            return resp_content
+
+        except Exception as e:
+            err_str = str(e).lower()
+
+            if any(kw in err_str for kw in ("429", "rate", "limit", "quota")):
+                wait = 30 * (attempt + 1)
+                print(f"  [限速] Mimo API限速，等待{wait}秒后重试...")
+                time.sleep(wait)
+                attempt += 1
+                continue
+
+            err_info = _format_api_error(e, "Mimo", attempt + 1, retry)
+            print(f"\n[ERROR] [{err_info['category']}] Mimo")
+            print(f"   模型：{model_name}")
+            print(f"   详情: {err_info['message'][:300]}")
+            print(f"   建议: {err_info['suggestion']}")
+            if attempt < retry - 1:
+                print(f"   第 {attempt+1}/{retry} 次重试...")
+                time.sleep(2 ** attempt)
+            else:
+                raise RuntimeError(f"Mimo API连续失败{retry}次: {e}")
+
+    raise RuntimeError(f"Mimo API连续失败{retry}次")
+
+
 
 # ==================== 三种独立调用入口 ====================
 
@@ -732,84 +877,85 @@ def select_model_interactive() -> dict:
     global _reviewer_model, _reviewer_provider
     global _reader_reviewer_model, _reader_reviewer_provider
 
-    print("\n" + "=" * 50)
-    print("  请选择写作模型（作者模型）")
-    print("=" * 50)
+    while True:
+        print("\n" + "=" * 50)
+        print("  请选择写作模型（作者模型）")
+        print("=" * 50)
 
-    models = get_available_models(usage="author")
-    for key, info in models.items():
-        api_key_val = os.getenv(info["env_key"], "")
-        has_key = api_key_val and len(api_key_val) > 10
-        status = "Key已填写" if has_key else "Key未填写"
-        # Bug修复: 显示价格时使用修正后的定价（试用模型强制显示免费）
-        pricing = get_model_pricing(info["model"])
-        inp = pricing.get("input", 0)
-        out = pricing.get("output", 0)
-        if inp == 0.0 and out == 0.0:
-            price_str = "免费/试用额度"
-        else:
-            price_str = f"输入¥{inp * 1000:.2f}/百万token  输出¥{out * 1000:.2f}/百万token"
-        print(_console_safe(f"  {key}. {info['name']:<38} [{status}]"))
-        print(_console_safe(f"      {price_str}"))
+        models = get_available_models(usage="author")
+        for key, info in models.items():
+            api_key_val = os.getenv(info["env_key"], "")
+            has_key = api_key_val and len(api_key_val) > 10
+            status = "Key已填写" if has_key else "Key未填写"
+            # Bug修复: 显示价格时使用修正后的定价（试用模型强制显示免费）
+            pricing = get_model_pricing(info["model"])
+            inp = pricing.get("input", 0)
+            out = pricing.get("output", 0)
+            if inp == 0.0 and out == 0.0:
+                price_str = "免费/试用额度"
+            else:
+                price_str = f"输入¥{inp * 1000:.2f}/百万token  输出¥{out * 1000:.2f}/百万token"
+            print(_console_safe(f"  {key}. {info['name']:<38} [{status}]"))
+            print(_console_safe(f"      {price_str}"))
 
-    default_choice = "1"
-    for key, info in models.items():
-        if info.get("model") == _author_model:
-            default_choice = key
-            break
+        default_choice = "1"
+        for key, info in models.items():
+            if info.get("model") == _author_model:
+                default_choice = key
+                break
 
-    print()
-    choice = input(f"请选择作者模型（直接回车默认选{default_choice}，当前：{_author_model}）：").strip() or default_choice
+        print()
+        choice = input(f"请选择作者模型（直接回车默认选{default_choice}，当前：{_author_model}）：").strip() or default_choice
 
-    if choice not in models:
-        print("[提示] 无效选择，使用默认模型")
-        choice = default_choice
+        if choice not in models:
+            print("[提示] 无效选择，使用默认模型")
+            choice = default_choice
 
-    selected = models[choice]
+        selected = models[choice]
 
-    api_key_val = os.getenv(selected["env_key"], "")
-    if not api_key_val or len(api_key_val) < 10:
-        print(f"\n[错误] 未找到 {selected['env_key']}，请在 .env 文件中填写：")
-        print(f"  {selected['env_key']}=sk-xxxxxxxx")
-        print("请重新选择\n")
-        return select_model_interactive()
+        api_key_val = os.getenv(selected["env_key"], "")
+        if not api_key_val or len(api_key_val) < 10:
+            print(f"\n[错误] 未找到 {selected['env_key']}，请在 .env 文件中填写：")
+            print(f"  {selected['env_key']}=sk-xxxxxxxx")
+            print("请重新选择\n")
+            continue
 
-    _author_model = selected["model"]
-    _author_provider = selected["provider"]
-    _session_stats["model_used"] = selected["model"]
+        _author_model = selected["model"]
+        _author_provider = selected["provider"]
+        _session_stats["model_used"] = selected["model"]
 
-    _INITIAL_REVIEWER = _load_default_model("reviewer", "qwen3.6-flash")
-    _INITIAL_READER = _load_default_model("reader_reviewer", "qwen3.6-flash")
-    reviewer_is_default = (_reviewer_model == _INITIAL_REVIEWER)
-    reader_is_default = (_reader_reviewer_model == _INITIAL_READER)
+        _INITIAL_REVIEWER = _load_default_model("reviewer", "qwen3.6-flash")
+        _INITIAL_READER = _load_default_model("reader_reviewer", "qwen3.6-flash")
+        reviewer_is_default = (_reviewer_model == _INITIAL_REVIEWER)
+        reader_is_default = (_reader_reviewer_model == _INITIAL_READER)
 
-    if reviewer_is_default:
-        _reviewer_model = _INITIAL_REVIEWER
-        _reviewer_provider = "dashscope"
-    if reader_is_default:
-        _reader_reviewer_model = _INITIAL_READER
-        _reader_reviewer_provider = "dashscope"
+        if reviewer_is_default:
+            _reviewer_model = _INITIAL_REVIEWER
+            _reviewer_provider = "dashscope"
+        if reader_is_default:
+            _reader_reviewer_model = _INITIAL_READER
+            _reader_reviewer_provider = "dashscope"
 
-    print(_console_safe(f"\n[OK] 作者模型已选择：{selected['name']}"))
-    print(f"     模型代码：{selected['model']}")
-    if selected["provider"] == "dashscope":
-        print(f"     API端点：{_get_dashscope_base_url()}")
-    print(f"     审核模型：{_reviewer_model}{'（默认）' if reviewer_is_default else '（已保留自定义）'}")
-    print(f"     读者视角模型：{_reader_reviewer_model}{'（默认）' if reader_is_default else '（已保留自定义）'}")
-    if selected.get("free_tier"):
-        print("     [试用额度] 使用免费试用 Token，请注意余量")
-    print("     正在验证模型可用性...")
+        print(_console_safe(f"\n[OK] 作者模型已选择：{selected['name']}"))
+        print(f"     模型代码：{selected['model']}")
+        if selected["provider"] == "dashscope":
+            print(f"     API端点：{_get_dashscope_base_url()}")
+        print(f"     审核模型：{_reviewer_model}{'（默认）' if reviewer_is_default else '（已保留自定义）'}")
+        print(f"     读者视角模型：{_reader_reviewer_model}{'（默认）' if reader_is_default else '（已保留自定义）'}")
+        if selected.get("free_tier"):
+            print("     [试用额度] 使用免费试用 Token，请注意余量")
+        print("     正在验证模型可用性...")
 
-    try:
-        call_author_api(system_prompt="你是助手。", user_message="回复ok两个字",
-                        max_tokens=10, temperature=0.1, retry=1)
-        print("     [OK] 验证通过，模型响应正常\n")
-    except Exception as e:
-        print(f"     [ERROR] 验证失败：{e}")
-        print("     该模型当前不可用，请重新选择\n")
-        return select_model_interactive()
+        try:
+            call_author_api(system_prompt="你是助手。", user_message="回复ok两个字",
+                            max_tokens=10, temperature=0.1, retry=1)
+            print("     [OK] 验证通过，模型响应正常\n")
+        except Exception as e:
+            print(f"     [ERROR] 验证失败：{e}")
+            print("     该模型当前不可用，请重新选择\n")
+            continue
 
-    return selected
+        return selected
 
 
 def select_all_models_interactive():
@@ -838,44 +984,45 @@ def select_all_models_interactive():
 
 
 def _select_single_model(prompt_title: str, default: str, usage: str = None) -> dict:
-    print("-" * 60)
-    models = get_available_models(usage=usage)
-    for key, info in models.items():
-        api_key_val = os.getenv(info["env_key"], "")
-        has_key = api_key_val and len(api_key_val) > 10
-        status = "Key已填写" if has_key else "Key未填写"
-        pricing = get_model_pricing(info["model"])
-        inp = pricing.get("input", 0)
-        out = pricing.get("output", 0)
-        if inp == 0.0 and out == 0.0:
-            price_str = "免费/试用额度"
-        else:
-            price_str = f"输入¥{inp * 1000:.2f}/百万  输出¥{out * 1000:.2f}/百万"
-        print(_console_safe(f"  {key}. {info['name']:<32} [{status}]"))
-        print(_console_safe(f"      {price_str}"))
+    while True:
+        print("-" * 60)
+        models = get_available_models(usage=usage)
+        for key, info in models.items():
+            api_key_val = os.getenv(info["env_key"], "")
+            has_key = api_key_val and len(api_key_val) > 10
+            status = "Key已填写" if has_key else "Key未填写"
+            pricing = get_model_pricing(info["model"])
+            inp = pricing.get("input", 0)
+            out = pricing.get("output", 0)
+            if inp == 0.0 and out == 0.0:
+                price_str = "免费/试用额度"
+            else:
+                price_str = f"输入¥{inp * 1000:.2f}/百万  输出¥{out * 1000:.2f}/百万"
+            print(_console_safe(f"  {key}. {info['name']:<32} [{status}]"))
+            print(_console_safe(f"      {price_str}"))
 
-    print()
-    choice = input(f"请选择{prompt_title}（直接回车默认选{default}）：").strip() or default
+        print()
+        choice = input(f"请选择{prompt_title}（直接回车默认选{default}）：").strip() or default
 
-    if choice not in models:
-        print("[提示] 无效选择，使用默认")
-        choice = default
+        if choice not in models:
+            print("[提示] 无效选择，使用默认")
+            choice = default
 
-    selected = models[choice]
+        selected = models[choice]
 
-    api_key_val = os.getenv(selected["env_key"], "")
-    if not api_key_val or len(api_key_val) < 10:
-        print(f"\n[错误] 未找到 {selected['env_key']}")
-        return _select_single_model(prompt_title, default)
+        api_key_val = os.getenv(selected["env_key"], "")
+        if not api_key_val or len(api_key_val) < 10:
+            print(f"\n[错误] 未找到 {selected['env_key']}")
+            continue
 
-    print(_console_safe(f"  正在验证 {selected['name']}..."))
-    try:
-        call_api(system_prompt="你是助手。", user_message="回复ok",
-                 model_name=selected["model"], provider=selected["provider"],
-                 max_tokens=10, temperature=0.1, retry=1)
-        print(_console_safe(f"  [OK] {selected['name']} 验证通过"))
-    except Exception as e:
-        print(f"  [ERROR] 验证失败：{e}")
-        return _select_single_model(prompt_title, default)
+        print(_console_safe(f"  正在验证 {selected['name']}..."))
+        try:
+            call_api(system_prompt="你是助手。", user_message="回复ok",
+                     model_name=selected["model"], provider=selected["provider"],
+                     max_tokens=10, temperature=0.1, retry=1)
+            print(_console_safe(f"  [OK] {selected['name']} 验证通过"))
+        except Exception as e:
+            print(f"  [ERROR] 验证失败：{e}")
+            continue
 
-    return selected
+        return selected

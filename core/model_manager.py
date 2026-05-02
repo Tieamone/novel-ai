@@ -96,15 +96,9 @@ def _parse_model_info_from_api(model_data: Dict) -> Optional[Dict]:
         # 未在预设列表中的 qwen 模型（如试用模型）
         display_name = model_id + "（试用）"
 
-    # 获取定价信息（使用默认定价或从已知分类）
-    if category_info:
-        # 已知模型使用已知分类的定价
-        input_price = DEFAULT_PRICING["input"]
-        output_price = DEFAULT_PRICING["output"]
-    else:
-        # 未知模型使用通用定价
-        input_price = DEFAULT_PRICING["input"]
-        output_price = DEFAULT_PRICING["output"]
+    # 获取定价信息（使用默认定价）
+    input_price = DEFAULT_PRICING["input"]
+    output_price = DEFAULT_PRICING["output"]
 
     # 假设所有从 API 获取的模型都可能有免费额度
     has_free_quota = True

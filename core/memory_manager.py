@@ -60,11 +60,30 @@ class MemoryManager:
             self._refresh_characters_md()
 
     def save_characters_batch(self, characters: list):
-        """批量保存人物档案，最后只刷新一次 MD（比循环调 save_character 更高效）"""
-        for char_data in characters:
-            name = char_data.get("name", "")
-            if name:
-                self.save_character(name, char_data, _batch=True)
+        """批量保存人物档案，使用单一连接和单一事务，最后只刷新一次 MD"""
+        with with_db_connection(self.novel_name) as conn:
+            with DatabaseTransaction(conn):
+                for char_data in characters:
+                    name = char_data.get("name", "")
+                    if not name:
+                        continue
+                    conn.execute("""
+                        INSERT OR REPLACE INTO characters
+                        (name, role, appearance, personality, secret, weakness,
+                         current_location, current_status, relationships, updated_chapter)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        name,
+                        char_data.get("role", ""),
+                        char_data.get("appearance", ""),
+                        char_data.get("personality", ""),
+                        char_data.get("secret", ""),
+                        char_data.get("weakness", ""),
+                        char_data.get("current_location", ""),
+                        char_data.get("current_status", ""),
+                        json.dumps(char_data.get("relationships", {}), ensure_ascii=False),
+                        char_data.get("updated_chapter", 0),
+                    ))
         self._refresh_characters_md()
 
     def load_characters(self) -> list:

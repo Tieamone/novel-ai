@@ -163,5 +163,65 @@
     "output_price": 0.0,
     "has_free_quota": true,
     "recommended_uses": ["author", "reviewer", "reader_reviewer"]
+  },
+  {
+    "model": "mimo-v2.5-pro",
+    "name": "Mimo v2.5 Pro ⭐旗舰",
+    "category": "premium",
+    "description": "小米Mimo v2.5旗舰模型，131K上下文，最高质量写作与审稿",
+    "context_length": 131072,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "provider": "mimo",
+    "recommended_uses": ["author", "reviewer", "reader_reviewer"]
+  },
+  {
+    "model": "mimo-v2.5",
+    "name": "Mimo v2.5",
+    "category": "balanced",
+    "description": "小米Mimo v2.5标准模型，32K上下文，平衡速度与质量",
+    "context_length": 32768,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "provider": "mimo",
+    "recommended_uses": ["author", "reviewer", "reader_reviewer"]
+  },
+  {
+    "model": "mimo-v2-pro",
+    "name": "Mimo v2 Pro",
+    "category": "premium",
+    "description": "小米Mimo v2旗舰，131K上下文，高质量创作",
+    "context_length": 131072,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "provider": "mimo",
+    "recommended_uses": ["author", "reviewer", "reader_reviewer"]
+  },
+  {
+    "model": "mimo-v2-omni",
+    "name": "Mimo v2 Omni",
+    "category": "balanced",
+    "description": "小米Mimo v2全能模型，32K上下文，综合能力强",
+    "context_length": 32768,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "provider": "mimo",
+    "recommended_uses": ["author", "reviewer"]
+  },
+  {
+    "model": "mimo-v2-flash",
+    "name": "Mimo v2 Flash 快速版",
+    "category": "cost_effective",
+    "description": "小米Mimo v2快速模型，65K上下文，速度最快，适合高频调用",
+    "context_length": 65536,
+    "input_price": 0.0,
+    "output_price": 0.0,
+    "has_free_quota": true,
+    "provider": "mimo",
+    "recommended_uses": ["author"]
   }
 ]

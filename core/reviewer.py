@@ -802,7 +802,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                     if reader_feedback_parts:
                         plot_goal = (
                             f"{_original_plot_goal}\n\n"
-                            f"【上次写作问题（读者视角），本次必须修复）】\n"
+                            f"【上次写作问题（读者视角），本次必须修复】\n"
                             + "\n".join(reader_feedback_parts)
                         )
                     print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
