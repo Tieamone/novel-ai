@@ -95,11 +95,22 @@ def _build_outline_prompt(target_chapters: int) -> str:
 
 
 def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
-                             start: int = 1) -> str:
+                             start: int = 1,
+                             prev_chapter_ending: str = "") -> str:
     if start == 1:
         chapter_range = f"前{first_batch}章"
     else:
         chapter_range = f"第{start}章到第{start + first_batch - 1}章"
+
+    ending_block = ""
+    ending_rule = ""
+    if prev_chapter_ending:
+        ending_block = f"""
+【上章结尾悬念】
+{prev_chapter_ending}
+
+"""
+        ending_rule = "\n6. 如果提供了【上章结尾悬念】，第一章任务卡必须与该悬念逻辑衔接，确保情节不断裂"
 
     return f"""根据以下小说大纲，生成{chapter_range}的章节任务卡。
 
@@ -110,9 +121,8 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 2. plot_goal要具体到场景级别：不是"主角继续调查"，而是"主角在废弃图书馆找到一本残缺日记，发现其中有自己名字"
 3. 情绪标签的分布要有节奏：不要连续超过3章都是同一个标签，要有起伏
 4. 前5章的任务卡要重点建立世界感和人物关系，不要急着上大冲突
-5. 每隔5-8章要安排一个"高潮/转折"节点（冲突/爽点/反转），保持读者追读动力
-
-大纲：
+5. 每隔5-8章要安排一个"高潮/转折"节点（冲突/爽点/反转），保持读者追读动力{ending_rule}
+{ending_block}大纲：
 {outline}
 
 严格按JSON格式输出，不要任何其他内容：
@@ -128,7 +138,18 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 
 
 def _build_extend_task_prompt(from_chapter: int, end_chapter: int,
-                              full_target: int, outline: str) -> str:
+                              full_target: int, outline: str,
+                              prev_chapter_ending: str = "") -> str:
+    ending_block = ""
+    ending_rule = ""
+    if prev_chapter_ending:
+        ending_block = f"""
+【上章结尾悬念】
+{prev_chapter_ending}
+
+"""
+        ending_rule = "\n5. 如果提供了【上章结尾悬念】，第一章任务卡必须与该悬念逻辑衔接，确保情节不断裂"
+
     return f"""根据以下大纲，生成第{from_chapter}章到第{end_chapter}章的任务卡。
 全书目标总章数为{full_target}章，当前进行到中段，请据此控制推进节奏。
 
@@ -136,9 +157,8 @@ def _build_extend_task_prompt(from_chapter: int, end_chapter: int,
 1. 每章只安排一个核心情节节点，具体到场景级别
 2. 这一批任务卡处于故事中段，要有新的冲突升级，要有伏笔回收，要推进人物关系变化
 3. 每隔5-8章安排一个高潮节点，保持追读驱动力
-4. 情绪标签要有起伏，不要连续同一标签超过3章
-
-大纲：
+4. 情绪标签要有起伏，不要连续同一标签超过3章{ending_rule}
+{ending_block}大纲：
 {outline}
 
 JSON格式：
@@ -539,7 +559,8 @@ def get_style_choice() -> str:
 def split_outline_to_tasks(outline: str, novel_name: str,
                            review_mode: bool = False,
                            target_chapters: int = 0,
-                           full_batch: bool = False):
+                           full_batch: bool = False,
+                           start: int = 1):
     """
     将大纲拆分为章节任务卡。
     target_chapters: 小说总目标章数（0表示使用config默认值）。
@@ -565,9 +586,17 @@ def split_outline_to_tasks(outline: str, novel_name: str,
         print(f"\n  正在将大纲拆分为前{first_batch}章任务卡"
               f"（全书目标：{full_target}章）...")
 
+    prev_ending = ""
+    if start > 1:
+        mm_tmp = MemoryManager(novel_name)
+        prev_ending = mm_tmp.get_last_chapter_ending(start, chars=400)
+
     raw = call_author_api(
         system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
-        user_message=_build_task_split_prompt(first_batch, full_target, outline),
+        user_message=_build_task_split_prompt(
+            first_batch, full_target, outline, start=start,
+            prev_chapter_ending=prev_ending,
+        ),
         temperature=0.7,
         max_tokens=8000 if first_batch > 100 else 4000,
     )
@@ -613,9 +642,17 @@ def split_outline_to_tasks(outline: str, novel_name: str,
         print(f"\n  [提示] 任务卡数量不足（{saved}/{first_batch}），正在补充{shortage}章...")
         start_chapter = saved + 1
 
+        prev_ending = ""
+        if start_chapter > 1:
+            mm_tmp = MemoryManager(novel_name)
+            prev_ending = mm_tmp.get_last_chapter_ending(start_chapter, chars=400)
+
         supplement_raw = call_author_api(
             system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
-            user_message=_build_task_split_prompt(shortage, shortage, outline, start=start_chapter),
+            user_message=_build_task_split_prompt(
+                shortage, shortage, outline, start=start_chapter,
+                prev_chapter_ending=prev_ending,
+            ),
             temperature=0.7,
             max_tokens=8000,
         )
@@ -672,10 +709,14 @@ def extend_tasks(novel_name: str, from_chapter: int):
 
     print(f"  [扩展] 正在生成第{from_chapter}-{end_chapter}章任务卡...")
 
+    mm_tmp = MemoryManager(novel_name)
+    prev_ending = mm_tmp.get_last_chapter_ending(from_chapter, chars=400)
+
     raw = call_author_api(
         system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
         user_message=_build_extend_task_prompt(
-            from_chapter, end_chapter, full_target or end_chapter, outline
+            from_chapter, end_chapter, full_target or end_chapter, outline,
+            prev_chapter_ending=prev_ending,
         ),
         temperature=0.7,
         max_tokens=4000,
