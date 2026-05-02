@@ -315,7 +315,7 @@ def _persist_review_result(mm: MemoryManager, chapter_num: int, result: dict):
         print(f"  [警告] 审稿结果写入数据库失败：{e}")
 
 
-def _truncate_for_review(text: str, max_len: int = 3000) -> str:
+def _truncate_for_review(text: str, max_len: int = 6000) -> str:
     """智能截断审稿内容：优先保留开头完整段落"""
     if len(text) <= max_len:
         return text
@@ -346,10 +346,12 @@ def build_review_prompt(ctx: dict, chapter_num: int,
     chars = ctx.get("characters", [])
     chars_str = "\n".join([
         f"【{c.get('name', '未命名角色')}】"
-        f"性格：{c.get('personality', '未记录')[:80]}｜"
-        f"状态：{c.get('current_status', '未记录')[:60]}｜"
+        f"性格：{c.get('personality', '未记录')[:200]}｜"
+        f"状态：{c.get('current_status', '未记录')[:150]}｜"
         f"位置：{c.get('current_location', '未记录')}｜"
-        f"关系：{json.dumps(c.get('relationships', {}), ensure_ascii=False)[:100]}"
+        f"关系：{json.dumps(c.get('relationships', {}), ensure_ascii=False)[:200]}｜"
+        f"秘密：{c.get('secret', '无')[:100]}｜"
+        f"弱点：{c.get('weakness', '无')[:100]}"
         for c in chars
     ]) if chars else "（暂无人物设定）"
 
@@ -529,6 +531,7 @@ def write_and_review(novel_name: str, chapter_num: int,
     _failure_layers: list = []        # 每次失败的 primary_layer
     _task_rewrite_done = False        # 每章最多重写一次任务卡
     _rewrite_requested = False        # 内层 for 循环通知外层需要重试
+    _retry_feedback = ""              # 重试反馈，独立于 plot_goal
     # ─────────────────────────────────────────────────────────────
 
     # 外层 while：正常流程只走一次；任务卡重写后最多再走一次
@@ -540,7 +543,8 @@ def write_and_review(novel_name: str, chapter_num: int,
 
             try:
                 content = write_chapter(novel_name, chapter_num,
-                                        plot_goal, emotion_tag)
+                                        plot_goal, emotion_tag,
+                                        retry_feedback=_retry_feedback)
                 reset_failure_counter("author")
             except Exception as e:
                 print(f"  [错误] 写作调用失败：{e}")
@@ -658,6 +662,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                         _original_emotion_tag = emotion_tag
                         _veto_code_counter.clear()
                         _failure_layers.clear()
+                        _retry_feedback = ""
                         _task_rewrite_done = True
                         _rewrite_requested = True
                         print(f"  [OK] 新任务卡：{plot_goal}")
@@ -672,6 +677,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                             _original_plot_goal   = plot_goal
                             _veto_code_counter.clear()
                             _failure_layers.clear()
+                            _retry_feedback = ""
                             _task_rewrite_done = True
                             _rewrite_requested = True
                             # 同步写库
@@ -719,10 +725,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                 if attempt < max_retry - 1:
                     retry_feedback = _build_retry_feedback(result)
                     if retry_feedback:
-                        plot_goal = (
-                            f"{_original_plot_goal}\n\n"
-                            f"【上次写作问题（责任编辑），本次必须修复】\n{retry_feedback}"
-                        )
+                        _retry_feedback = retry_feedback
                     print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
                     continue
                 else:
@@ -800,11 +803,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                     if reader_suggestions and reader_suggestions not in ("", "质量合格"):
                         reader_feedback_parts.append(f"- 建议：{reader_suggestions}")
                     if reader_feedback_parts:
-                        plot_goal = (
-                            f"{_original_plot_goal}\n\n"
-                            f"【上次写作问题（读者视角），本次必须修复】\n"
-                            + "\n".join(reader_feedback_parts)
-                        )
+                        _retry_feedback = "\n".join(reader_feedback_parts)
                     print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
                 else:
                     print(f"\n{'='*60}")

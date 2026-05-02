@@ -114,7 +114,8 @@ def _build_outline_block(outline: str, max_chars: int = 1200) -> str:
 
 def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
                               beat_plan, prev_chapter_ending="",
-                              word_min=3000, word_max=4000) -> str:
+                              word_min=3000, word_max=4000,
+                              retry_feedback: str = "") -> str:
     """构建一次性生成整章的prompt（用于大模型）"""
     # ── 进度 & 大纲（新增）──────────────────────────────────────
     progress_block = _build_progress_block(chapter_num, ctx.get("target_chapters", 0))
@@ -210,6 +211,10 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
     if outline_block:
         header += outline_block + "\n\n"
 
+    retry_block = ""
+    if retry_feedback:
+        retry_block = f"\n【本次必须修复的问题】\n{retry_feedback}\n"
+
     return f"""{header}现在要写第{chapter_num}章的完整内容，{word_min}-{word_max}字。
 
 【本章要做什么】
@@ -240,6 +245,7 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
 
 {NEGATIVE_EXAMPLES}
 
+{retry_block}
 开始写。第一行是章节标题（第{chapter_num}章 + 你拟的标题），然后直接进入正文。
 请严格控制在{word_min}-{word_max}字范围内。如果某个场景还没写透，宁愿少推进一步也不要压缩细节。"""
 
@@ -947,7 +953,8 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
                         plot_goal: str, emotion_tag: str,
                         beat_plan: str = "",
                         prev_chapter_ending: str = "",
-                        word_min=3000, word_max=4000) -> str:
+                        word_min=3000, word_max=4000,
+                        retry_feedback: str = "") -> str:
     # ── 进度 & 大纲（小模型上下文有限，大纲截短到600字）────────
     progress_block = _build_progress_block(chapter_num, ctx.get("target_chapters", 0))
     outline_block  = _build_outline_block(ctx.get("outline", ""), max_chars=600)
@@ -1034,6 +1041,10 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
     if outline_block:
         header += outline_block + "\n\n"
 
+    retry_block = ""
+    if retry_feedback:
+        retry_block = f"\n【本次必须修复的问题】\n{retry_feedback}\n"
+
     return f"""{header}现在要写第{chapter_num}章，{half_min}-{half_max}字，是完整章节的前半部分。
 
 【本章要做什么】
@@ -1064,6 +1075,7 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 
 {NEGATIVE_EXAMPLES}
 
+{retry_block}
 开始写。第一行是章节标题（第{chapter_num}章 + 你拟的标题），然后直接进入正文。
 写到一个自然的停顿点停下，后半段另外续写。
 请严格控制在{half_min}-{half_max}字范围内。"""
@@ -1072,7 +1084,8 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 def build_continue_prompt(chapter_num: int, plot_goal: str,
                           emotion_tag: str, first_half: str,
                           beat_plan: str = "",
-                          word_min=3000, word_max=4000) -> str:
+                          word_min=3000, word_max=4000,
+                          retry_feedback: str = "") -> str:
     last_part = first_half[-600:] if len(first_half) > 600 else first_half
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
     word_target = cfg("novel", "chapter_word_target", 3500)
@@ -1080,6 +1093,10 @@ def build_continue_prompt(chapter_num: int, plot_goal: str,
     half_max = word_max // 2
     hard_rules = _format_rule_block("硬约束（必须满足）", WRITER_HARD_CONSTRAINTS)
     forbidden_rules = _format_rule_block("禁止项（必须避免）", WRITER_FORBIDDEN_RULES)
+
+    retry_block = ""
+    if retry_feedback:
+        retry_block = f"\n【本次必须修复的问题】\n{retry_feedback}\n"
 
     return f"""这章的任务：{plot_goal}
 这章的感觉：{emotion_tag}——{emotion_guide}
@@ -1103,7 +1120,9 @@ def build_continue_prompt(chapter_num: int, plot_goal: str,
 4. 结尾应通过具体行动、新信息揭示或设置一个未答的问题形成阅读驱动力
 5. 最后一句话要有画面感或声音感——读者看完这句，眼前要有一个具体的画面
 
-{NEGATIVE_EXAMPLES}"""
+{NEGATIVE_EXAMPLES}
+
+{retry_block}"""
 
 def clean_content(text: str) -> str:
     text = re.sub(r'^\s*【[^】]*】.*$', '', text, flags=re.MULTILINE)
@@ -1140,7 +1159,8 @@ def clean_content(text: str) -> str:
 # ==================== 主写作函数 ====================
 
 def write_chapter(novel_name: str, chapter_num: int,
-                  plot_goal: str, emotion_tag: str = "铺垫") -> str:
+                  plot_goal: str, emotion_tag: str = "铺垫",
+                  retry_feedback: str = "") -> str:
     mm = MemoryManager(novel_name)
     ctx = mm.load_context(chapter_num)
 
@@ -1199,7 +1219,8 @@ def write_chapter(novel_name: str, chapter_num: int,
         prompt = build_full_chapter_prompt(
             ctx, chapter_num, plot_goal, emotion_tag, beat_plan,
             prev_chapter_ending=prev_chapter_ending,
-            word_min=word_min, word_max=word_max
+            word_min=word_min, word_max=word_max,
+            retry_feedback=retry_feedback
         )
 
         full_content = call_author_api(
@@ -1220,7 +1241,8 @@ def write_chapter(novel_name: str, chapter_num: int,
         prompt = build_writer_prompt(
             ctx, chapter_num, plot_goal, emotion_tag, beat_plan,
             prev_chapter_ending=prev_chapter_ending,
-            word_min=word_min, word_max=word_max
+            word_min=word_min, word_max=word_max,
+            retry_feedback=retry_feedback
         )
         first_half = call_author_api(
             system_prompt=system_prompt,
@@ -1235,7 +1257,8 @@ def write_chapter(novel_name: str, chapter_num: int,
         print(f"  正在生成第{chapter_num}章（后半段）...")
         continue_prompt = build_continue_prompt(
             chapter_num, plot_goal, emotion_tag, first_half, beat_plan,
-            word_min=word_min, word_max=word_max
+            word_min=word_min, word_max=word_max,
+            retry_feedback=retry_feedback
         )
         second_half = call_author_api(
             system_prompt=system_prompt + "\n\n" + CONTINUE_SYSTEM_BASE,
