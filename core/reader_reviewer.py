@@ -100,7 +100,7 @@ def _truncate_content(text: str, max_len: int, label: str = "内容") -> str:
 
     # 策略2: 如果段落太少但总长度很长，使用首尾保留策略
     half = max_len // 2
-    truncated = text[:half] + "\n\n[... 中间部分已省略 ...]\n\n" + text[-half:]
+    truncated = text[:half] + "\n\n[...节选中段已省略，以下为章节结尾...]\n\n" + text[-half:]
     print(f"  [提示] {label}过长（{len(text)}字），已智能截断至约{len(truncated)}字（保留开头和结尾）")
     return truncated
 
@@ -215,7 +215,7 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
         prev_snippet = prev_chapter_content or "（首章，无上一章）"
 
     # 当前章节：超长时使用智能截断（优先保留开头完整段落，兼顾首尾）
-    current_snippet = _truncate_content(current_content, 3000, "当前章节") or current_content
+    current_snippet = _truncate_content(current_content, 5000, "当前章节") or current_content
 
     prompt = READER_REVIEW_PROMPT.format(
         prev_chapter_content=prev_snippet,
