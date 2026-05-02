@@ -1,6 +1,6 @@
 import json
 import re
-from core.api_client import call_author_api, increment_failure_counter, reset_failure_counter, get_current_author_model
+from core.api_client import call_author_api, call_reviewer_api, increment_failure_counter, reset_failure_counter, get_current_author_model
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg, get_data_dir
 from core.utils import extract_json_obj, is_transient_error
@@ -883,7 +883,7 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
 正文：
 {full_content}
 """
-    raw = call_author_api(
+    raw = call_reviewer_api(
         system_prompt=SELF_CHECK_SYSTEM,
         user_message=check_prompt,
         temperature=cfg("temperature", "self_check", 0.20),

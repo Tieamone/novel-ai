@@ -21,7 +21,7 @@ def _load_default_model(role: str, fallback: str) -> str:
 _author_model = _load_default_model("author", "qwen3.6-flash")
 _author_provider = "dashscope"
 
-_reviewer_model = _load_default_model("reviewer", "qwen3.6-flash")
+_reviewer_model = _load_default_model("reviewer", "qwen3.6-max-preview")
 _reviewer_provider = "dashscope"
 
 _reader_reviewer_model = _load_default_model("reader_reviewer", "qwen3.6-flash")
@@ -924,7 +924,7 @@ def select_model_interactive() -> dict:
         _author_provider = selected["provider"]
         _session_stats["model_used"] = selected["model"]
 
-        _INITIAL_REVIEWER = _load_default_model("reviewer", "qwen3.6-flash")
+        _INITIAL_REVIEWER = _load_default_model("reviewer", "qwen3.6-max-preview")
         _INITIAL_READER = _load_default_model("reader_reviewer", "qwen3.6-flash")
         reviewer_is_default = (_reviewer_model == _INITIAL_REVIEWER)
         reader_is_default = (_reader_reviewer_model == _INITIAL_READER)
