@@ -826,6 +826,33 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
     hard_rules = _format_rule_block("硬约束", WRITER_HARD_CONSTRAINTS)
     forbidden_rules = _format_rule_block("禁止项", WRITER_FORBIDDEN_RULES)
 
+    # ── 专项去AI化处理 ──────────────────────────────────────────
+    _deai_system = (
+        "你是网文文字打磨师，专门处理三类问题：\n"
+        "1. 比喻过密：每500字最多保留1个比喻，其余改为直接感官描写"
+        "2. 情绪直陈：删除所有'他感到/他觉得/心中涌起'等直接定义情绪的句子，"
+        "改为肢体/生理反应"
+        "3. 心理总结：删除结尾处'他知道/他明白/原来这一切'类的总结性独白，"
+        "改为具体动作收尾\n"
+        "只输出修改后的正文，不要任何说明。"
+    )
+    try:
+        polished = call_author_api(
+            system_prompt=_deai_system,
+            user_message=full_content,
+            temperature=cfg("temperature", "revision", 0.70),
+            max_tokens=max_tokens,
+        )
+        polished = clean_content(polished)
+        if polished and len(polished) >= int(len(full_content) * 0.65):
+            print(f"  [去AI化] 完成：{len(polished)}字")
+            full_content = polished
+        else:
+            print("  [去AI化] 结果过短，保留原稿")
+    except Exception as e:
+        print(f"  [去AI化] 跳过（{type(e).__name__}）")
+    # ─────────────────────────────────────────────────────────────
+
     detected_issues = _rule_based_ai_check(full_content)
 
     if detected_issues:
