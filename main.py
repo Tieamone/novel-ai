@@ -550,6 +550,9 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
         system_prompt="你是小说编辑，提取章节关键信息，只输出JSON，不要Markdown代码块。",
         user_message=f"""分析以下章节，严格按JSON格式输出：
 
+提取规则：
+- expected_redeem：必须填写具体章节范围，格式为'第X-Y章'，X至少比当前章节大5，禁止填'待定'或空字符串
+
 {{
   "summary": "100字以内情节摘要",
   "character_updates": [
@@ -570,7 +573,7 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
     {{
       "fid": "F{chapter_num:03d}_1",
       "description": "伏笔描述",
-      "expected_redeem": "预计兑现章节"
+      "expected_redeem": "第{chapter_num+10}-{chapter_num+20}章（示例）"
     }}
   ],
   "redeemed_foreshadowing": ["已兑现伏笔ID，没有则为空列表"]
@@ -624,6 +627,8 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
         fid = f.get("fid", "")
         desc = f.get("description", "")
         redeem = f.get("expected_redeem", "待定")
+        if not redeem or redeem.strip() in ("待定", "", "未定", "暂定"):
+            redeem = f"第{chapter_num+10}-{chapter_num+20}章"
         if fid and desc:
             mm.add_foreshadowing(fid, chapter_num, desc, redeem)
             print(f"  [OK] 新伏笔：{desc[:30]}...")
