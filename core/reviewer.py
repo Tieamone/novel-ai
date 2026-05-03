@@ -681,10 +681,13 @@ def write_and_review(novel_name: str, chapter_num: int,
                     l in ("L1", "L2") for l in _failure_layers
                 )
                 _conflict_detected = (
-                    len(repeated_vetos) > 0
-                    and _all_structural
-                    and attempt >= 1
-                    and not _task_rewrite_done
+                    attempt >= 1                    # 至少第2次失败
+                    and not _task_rewrite_done      # 还没重写过
+                    and _all_structural             # 全是L1/L2结构问题
+                    and (
+                        len(repeated_vetos) > 0     # 原条件：veto code重复
+                        or len(_failure_layers) >= 2  # 新增：连续2次都是L1/L2
+                    )
                 )
                 # ─────────────────────────────────────────────────────
 

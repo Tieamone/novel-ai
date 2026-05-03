@@ -847,11 +847,11 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
             max_tokens=max_tokens,
         )
         polished = clean_content(polished)
-        if polished and len(polished) >= int(len(full_content) * 0.65):
+        if polished and len(polished) >= len(full_content) * 0.85:
             print(f"  [去AI化] 完成：{len(polished)}字")
             full_content = polished
         else:
-            print("  [去AI化] 结果过短，保留原稿")
+            print("  [去AI化] 缩减过度，保留原稿")
     except Exception as e:
         print(f"  [去AI化] 跳过（{type(e).__name__}）")
     # ─────────────────────────────────────────────────────────────
