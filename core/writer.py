@@ -5,6 +5,9 @@ from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg, get_data_dir
 from core.utils import extract_json_obj, is_transient_error
 
+# 节拍规划缓存（跨重试复用，任务卡不变则节拍不变）
+_cached_beat_plan = ""
+
 
 def is_high_capacity_model() -> bool:
     """
@@ -1226,14 +1229,21 @@ def write_chapter(novel_name: str, chapter_num: int,
         if prev_chapter_ending:
             print(f"  [衔接] 已获取第{chapter_num - 1}章结尾（{len(prev_chapter_ending)}字）")
 
-    # 节拍规划
-    print(f"  正在规划第{chapter_num}章节拍...")
-    beat_plan = _plan_chapter_beats(ctx, chapter_num, plot_goal, emotion_tag)
-    if beat_plan:
+    # 节拍规划（重试时复用缓存，任务卡不变则节拍不变）
+    global _cached_beat_plan
+    if _cached_beat_plan and retry_feedback:
+        beat_plan = _cached_beat_plan
         beat_count = len([ln for ln in beat_plan.splitlines() if ln.strip()])
-        print(f"  节拍规划完成：{beat_count}条")
+        print(f"  [复用] 沿用上次节拍规划（共{beat_count}条）")
     else:
-        print("  [提示] 节拍规划未返回有效结果，按目标直接推进")
+        print(f"  正在规划第{chapter_num}章节拍...")
+        beat_plan = _plan_chapter_beats(ctx, chapter_num, plot_goal, emotion_tag)
+        if beat_plan:
+            _cached_beat_plan = beat_plan
+            beat_count = len([ln for ln in beat_plan.splitlines() if ln.strip()])
+            print(f"  节拍规划完成：{beat_count}条")
+        else:
+            print("  [提示] 节拍规划未返回有效结果，按目标直接推进")
 
     # 智能检测：判断是否使用大模型一次性生成
     use_single_pass = is_high_capacity_model()
