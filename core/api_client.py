@@ -192,9 +192,6 @@ MODEL_PRICING = {
     "kimi-k2.6":                {"input": 0.0,     "output": 0.0},
     "gui-plus-2026-02-26":      {"input": 0.0,     "output": 0.0},
     "qwen-flash-character-2026-02-26": {"input": 0.0, "output": 0.0},
-    "gemini-2.5-flash":         {"input": 0.0,     "output": 0.0},
-    "gemini-2.5-flash-lite":    {"input": 0.0,     "output": 0.0},
-    "gemini-2.5-pro":           {"input": 0.0,     "output": 0.0},
     # Mimo 模型（小米）
     "mimo-v2.5-pro":            {"input": 0.0,     "output": 0.0},
     "mimo-v2.5":                {"input": 0.0,     "output": 0.0},
@@ -202,8 +199,6 @@ MODEL_PRICING = {
     "mimo-v2-omni":             {"input": 0.0,     "output": 0.0},
     "mimo-v2-flash":            {"input": 0.0,     "output": 0.0},
 }
-
-FREE_TIER_MODELS = {"gemini-2.5-flash", "gemini-2.5-flash-lite"}
 
 # Mimo 端点
 _MIMO_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
@@ -259,41 +254,34 @@ AVAILABLE_MODELS = {
         "free_tier": False,
     },
     "8": {
-        "name": "Gemini 2.5 Flash（Google免费模型）",
-        "model": "gemini-2.5-flash",
-        "provider": "gemini",
-        "env_key": "GEMINI_API_KEY",
-        "free_tier": True,
-    },
-    "9": {
         "name": "Mimo v2.5 Pro ⭐（小米旗舰）",
         "model": "mimo-v2.5-pro",
         "provider": "mimo",
         "env_key": "MIMO_API_KEY",
         "free_tier": True,
     },
-    "10": {
+    "9": {
         "name": "Mimo v2.5（小米标准）",
         "model": "mimo-v2.5",
         "provider": "mimo",
         "env_key": "MIMO_API_KEY",
         "free_tier": True,
     },
-    "11": {
+    "10": {
         "name": "Mimo v2 Pro（小米v2旗舰）",
         "model": "mimo-v2-pro",
         "provider": "mimo",
         "env_key": "MIMO_API_KEY",
         "free_tier": True,
     },
-    "12": {
+    "11": {
         "name": "Mimo v2 Omni（小米v2全能）",
         "model": "mimo-v2-omni",
         "provider": "mimo",
         "env_key": "MIMO_API_KEY",
         "free_tier": True,
     },
-    "13": {
+    "12": {
         "name": "Mimo v2 Flash（小米v2快速）",
         "model": "mimo-v2-flash",
         "provider": "mimo",
@@ -419,9 +407,7 @@ def set_author_model(model_name: str, provider: str = None):
     old_model = _author_model
     _author_model = model_name
     if provider is None:
-        if "gemini" in model_name:
-            provider = "gemini"
-        elif model_name.startswith("mimo-"):
+        if model_name.startswith("mimo-"):
             provider = "mimo"
         else:
             provider = "dashscope"
@@ -435,9 +421,7 @@ def set_reviewer_model(model_name: str, provider: str = None):
     old_model = _reviewer_model
     _reviewer_model = model_name
     if provider is None:
-        if "gemini" in model_name:
-            provider = "gemini"
-        elif model_name.startswith("mimo-"):
+        if model_name.startswith("mimo-"):
             provider = "mimo"
         else:
             provider = "dashscope"
@@ -451,9 +435,7 @@ def set_reader_reviewer_model(model_name: str, provider: str = None):
     old_model = _reader_reviewer_model
     _reader_reviewer_model = model_name
     if provider is None:
-        if "gemini" in model_name:
-            provider = "gemini"
-        elif model_name.startswith("mimo-"):
+        if model_name.startswith("mimo-"):
             provider = "mimo"
         else:
             provider = "dashscope"
@@ -512,17 +494,13 @@ def call_api(system_prompt: str, user_message: str,
         model_name = _author_model
         provider = _author_provider
     elif provider is None:
-        if "gemini" in model_name:
-            provider = "gemini"
-        elif model_name.startswith("mimo-"):
+        if model_name.startswith("mimo-"):
             provider = "mimo"
         else:
             provider = "dashscope"
 
     if provider == "dashscope":
         return _call_dashscope(system_prompt, user_message, model_name, max_tokens, temperature, retry)
-    elif provider == "gemini":
-        return _call_gemini(system_prompt, user_message, model_name, max_tokens, temperature, retry)
     elif provider == "mimo":
         return _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature, retry)
     else:
@@ -714,58 +692,6 @@ def _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, tem
 
     raise RuntimeError(f"API连续失败{retry}次")
 
-
-def _call_gemini(system_prompt, user_message, model_name, max_tokens, temperature, retry):
-    from google import genai
-
-    api_key = _get_api_key("GEMINI_API_KEY", "GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("未找到 GEMINI_API_KEY 或 GOOGLE_API_KEY，请检查 .env 文件")
-
-    is_free = model_name in FREE_TIER_MODELS
-    client = genai.Client(api_key=api_key)
-    full_prompt = f"{system_prompt}\n\n---\n\n{user_message}"
-
-    for attempt in range(retry):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=full_prompt,
-                config=genai.types.GenerateContentConfig(
-                    max_output_tokens=max_tokens,
-                    temperature=temperature,
-                ),
-            )
-            try:
-                input_tokens = response.usage_metadata.prompt_token_count or 0
-                output_tokens = response.usage_metadata.candidates_token_count or 0
-                cost = _calc_cost(model_name, input_tokens, output_tokens)
-                _update_stats(model_name, input_tokens, output_tokens, cost)
-            except Exception:
-                pass
-            if is_free:
-                time.sleep(4)
-            return response.text
-
-        except Exception as e:
-            err_str = str(e).lower()
-            if any(kw in err_str for kw in ("429", "quota", "resource_exhausted", "rate")):
-                wait = 65 if is_free else 30 * (attempt + 1)
-                print(f"  [限速] Gemini API限速，等待{wait}秒后重试...")
-                time.sleep(wait)
-                continue
-
-            err_info = _format_api_error(e, "Gemini", attempt + 1, retry)
-            print(f"\n[ERROR] [{err_info['category']}] Gemini")
-            print(f"   详情: {err_info['message'][:200]}")
-            print(f"   建议: {err_info['suggestion']}")
-            if attempt < retry - 1:
-                print(f"   {err_info['attempt_info']}...")
-                time.sleep(2 ** attempt)
-            else:
-                raise RuntimeError(f"Gemini API连续失败{retry}次: {e}")
-
-    raise RuntimeError(f"Gemini API连续失败{retry}次")
 
 def _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature, retry):
     """

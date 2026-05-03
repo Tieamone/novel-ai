@@ -168,7 +168,7 @@ def _get_default_qwen_models() -> List[Dict]:
 
 def discover_all_models(refresh: bool = False) -> list:
     """
-    发现所有可用模型（通义千问 + Gemini），结果模块级缓存，避免重复打印日志。
+    发现所有可用模型（通义千问），结果模块级缓存，避免重复打印日志。
     优先读取 data/custom_models.json，其次用内置默认列表。
     """
     global _discover_cache
@@ -183,47 +183,7 @@ def discover_all_models(refresh: bool = False) -> list:
     else:
         qwen_models = _get_default_qwen_models()
 
-    # Gemini 静态列表
-    gemini_models = [
-        {
-            "model": "gemini-2.5-flash",
-            "name": "gemini-2.5-flash（推荐）",
-            "category": "free",
-            "description": "Google Gemini 当前稳定主力模型",
-            "context_length": 1000000,
-            "input_price": 0.0,
-            "output_price": 0.0,
-            "has_free_quota": True,
-            "provider": "gemini",
-            "free_tier": True,
-        },
-        {
-            "model": "gemini-2.5-flash-lite",
-            "name": "gemini-2.5-flash-lite（快速）",
-            "category": "free",
-            "description": "Google Gemini 2.5 轻量版，速度更快",
-            "context_length": 1000000,
-            "input_price": 0.0,
-            "output_price": 0.0,
-            "has_free_quota": True,
-            "provider": "gemini",
-            "free_tier": True,
-        },
-        {
-            "model": "gemini-2.5-pro",
-            "name": "gemini-2.5-pro（高质量）",
-            "category": "premium",
-            "description": "Google Gemini 2.5 高质量推理模型",
-            "context_length": 1000000,
-            "input_price": 0.0,
-            "output_price": 0.0,
-            "has_free_quota": False,
-            "provider": "gemini",
-            "free_tier": False,
-        },
-    ]
-
-    _discover_cache = qwen_models + gemini_models
+    _discover_cache = qwen_models
     return _discover_cache
 
 
@@ -264,7 +224,7 @@ def model_list_to_menu_format(models: List[Dict]) -> Dict[str, Dict]:
             "output_price": model.get("output_price", DEFAULT_PRICING["output"]),
             "free_tier": model.get("free_tier", False),
             "has_free_quota": model.get("has_free_quota", False),
-            "env_key": "DASHSCOPE_API_KEY" if model["provider"] == "dashscope" else "GEMINI_API_KEY",
+            "env_key": "DASHSCOPE_API_KEY",
             "context_length": model.get("context_length", 0),  # 保留，供 is_high_capacity_model 使用
         }
     return menu
