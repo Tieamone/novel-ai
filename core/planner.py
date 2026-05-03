@@ -96,7 +96,8 @@ def _build_outline_prompt(target_chapters: int) -> str:
 
 def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
                              start: int = 1,
-                             prev_chapter_ending: str = "") -> str:
+                             prev_chapter_ending: str = "",
+                             urgent_foreshadowing: list = None) -> str:
     if start == 1:
         chapter_range = f"前{first_batch}章"
     else:
@@ -136,10 +137,28 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 
 情绪标签只能从以下5个中选1个：铺垫 / 冲突 / 爽点 / 低谷 / 反转"""
 
+    # 追加强制兑现伏笔块
+    if urgent_foreshadowing:
+        fs_lines = []
+        for f in urgent_foreshadowing:
+            fid = f.get("fid", "?")
+            desc = f.get("description", "")
+            plant = f.get("plant_chapter", "?")
+            fs_lines.append(f" - {fid}: {desc}（埋于第{plant}章）")
+        fs_block = "\n".join(fs_lines)
+        prompt += f"""
+
+【本批必须兑现的伏笔】
+以下伏笔沉睡过久，请在本批任务卡中安排至少1-2个章节明确兑现：
+{fs_block}"""
+
+    return prompt
+
 
 def _build_extend_task_prompt(from_chapter: int, end_chapter: int,
                               full_target: int, outline: str,
-                              prev_chapter_ending: str = "") -> str:
+                              prev_chapter_ending: str = "",
+                              urgent_foreshadowing: list = None) -> str:
     ending_block = ""
     ending_rule = ""
     if prev_chapter_ending:
@@ -170,6 +189,23 @@ JSON格式：
   }}
 ]
 情绪标签只能从：铺垫 / 冲突 / 爽点 / 低谷 / 反转 中选1个"""
+
+    # 追加强制兑现伏笔块
+    if urgent_foreshadowing:
+        fs_lines = []
+        for f in urgent_foreshadowing:
+            fid = f.get("fid", "?")
+            desc = f.get("description", "")
+            plant = f.get("plant_chapter", "?")
+            fs_lines.append(f" - {fid}: {desc}（埋于第{plant}章）")
+        fs_block = "\n".join(fs_lines)
+        prompt += f"""
+
+【本批必须兑现的伏笔】
+以下伏笔沉睡过久，请在本批任务卡中安排至少1-2个章节明确兑现：
+{fs_block}"""
+
+    return prompt
 
 
 # ==================== 交互工具 ====================
@@ -554,6 +590,22 @@ def get_style_choice() -> str:
     return choice
 
 
+# ==================== 伏笔紧急度查询 ====================
+
+def _get_urgent_foreshadowing(mm: MemoryManager, current_chapter: int,
+                              sleep_threshold: int = 20, limit: int = 5) -> list:
+    """获取沉睡超过 sleep_threshold 章且 status='active' 的伏笔，取前 limit 个。"""
+    all_active = mm.load_active_foreshadowing()
+    urgent = []
+    for f in all_active:
+        plant = max(f.get("plant_chapter", 1) or 1, 1)
+        age = current_chapter - plant
+        if age >= sleep_threshold:
+            urgent.append(f)
+    urgent.sort(key=lambda x: -((current_chapter - max(x.get("plant_chapter", 1) or 1, 1))))
+    return urgent[:limit]
+
+
 # ==================== Step 6：任务卡 ====================
 
 def split_outline_to_tasks(outline: str, novel_name: str,
@@ -587,15 +639,20 @@ def split_outline_to_tasks(outline: str, novel_name: str,
               f"（全书目标：{full_target}章）...")
 
     prev_ending = ""
+    urgent_fs = []
     if start > 1:
         mm_tmp = MemoryManager(novel_name)
         prev_ending = mm_tmp.get_last_chapter_ending(start, chars=400)
+        urgent_fs = _get_urgent_foreshadowing(mm_tmp, start)
+        if urgent_fs:
+            print(f"  [伏笔] 检测到 {len(urgent_fs)} 个沉睡伏笔，将在任务卡中强制安排兑现")
 
     raw = call_author_api(
         system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
         user_message=_build_task_split_prompt(
             first_batch, full_target, outline, start=start,
             prev_chapter_ending=prev_ending,
+            urgent_foreshadowing=urgent_fs,
         ),
         temperature=0.7,
         max_tokens=8000 if first_batch > 100 else 4000,
@@ -643,15 +700,18 @@ def split_outline_to_tasks(outline: str, novel_name: str,
         start_chapter = saved + 1
 
         prev_ending = ""
+        urgent_fs = []
         if start_chapter > 1:
             mm_tmp = MemoryManager(novel_name)
             prev_ending = mm_tmp.get_last_chapter_ending(start_chapter, chars=400)
+            urgent_fs = _get_urgent_foreshadowing(mm_tmp, start_chapter)
 
         supplement_raw = call_author_api(
             system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
             user_message=_build_task_split_prompt(
                 shortage, shortage, outline, start=start_chapter,
                 prev_chapter_ending=prev_ending,
+                urgent_foreshadowing=urgent_fs,
             ),
             temperature=0.7,
             max_tokens=8000,
@@ -711,12 +771,16 @@ def extend_tasks(novel_name: str, from_chapter: int):
 
     mm_tmp = MemoryManager(novel_name)
     prev_ending = mm_tmp.get_last_chapter_ending(from_chapter, chars=400)
+    urgent_fs = _get_urgent_foreshadowing(mm_tmp, from_chapter)
+    if urgent_fs:
+        print(f"  [伏笔] 检测到 {len(urgent_fs)} 个沉睡伏笔，将在任务卡中强制安排兑现")
 
     raw = call_author_api(
         system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
         user_message=_build_extend_task_prompt(
             from_chapter, end_chapter, full_target or end_chapter, outline,
             prev_chapter_ending=prev_ending,
+            urgent_foreshadowing=urgent_fs,
         ),
         temperature=0.7,
         max_tokens=4000,

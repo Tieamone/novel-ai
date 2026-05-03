@@ -491,6 +491,59 @@ def _increment_retry_safe(novel_name: str, chapter_num: int):
             """, (chapter_num,))
 
 
+def _auto_redeem_foreshadowing(mm: MemoryManager, chapter_num: int, content: str):
+    """章节审核通过后，检查逾期伏笔（priority=0），若正文包含相关关键词则自动兑现。"""
+    if not content:
+        return
+    try:
+        hints = mm.get_foreshadow_hints(chapter_num)
+    except Exception:
+        return
+    if not hints:
+        return
+
+    # 从 hints 中提取 priority=0 的伏笔描述，与 active foreshadowing 做匹配
+    active = mm.load_active_foreshadowing()
+    content_lower = content.lower()
+    redeemed_any = False
+
+    for f in active:
+        desc = (f.get("description") or "").strip()
+        fid = f.get("fid", "")
+        if not desc or not fid:
+            continue
+
+        # 检查该伏笔是否在 priority=0 的 hints 中（逾期/应兑现）
+        is_overdue = False
+        for hint_str in hints:
+            if desc[:20] in hint_str and ("逾期" in hint_str or "应兑现" in hint_str):
+                is_overdue = True
+                break
+        if not is_overdue:
+            continue
+
+        # 从伏笔描述中提取关键词（取长度>=2的词，至少匹配2个）
+        keywords = [w for w in re.split(r'[，。、；：！？\s,.;:!?\-—/\\()\[\]【】""'']+',
+                                        desc) if len(w) >= 2]
+        if not keywords:
+            continue
+
+        matched = sum(1 for kw in keywords if kw in content_lower)
+        if matched >= min(2, len(keywords)):
+            try:
+                mm.redeem_foreshadowing(fid, chapter_num)
+                print(f"  [伏笔兑现] {fid}: {desc[:30]}... → 第{chapter_num}章自动兑现")
+                redeemed_any = True
+            except Exception as e:
+                print(f"  [警告] 伏笔 {fid} 自动兑现失败：{e}")
+
+    if not redeemed_any:
+        # 检查是否有逾期伏笔但未匹配到关键词的情况
+        overdue_count = sum(1 for h in hints if "逾期" in h or "应兑现" in h)
+        if overdue_count > 0:
+            print(f"  [伏笔提示] 有 {overdue_count} 个逾期伏笔未在本章兑现，请关注后续章节")
+
+
 def write_and_review(novel_name: str, chapter_num: int,
                      plot_goal: str, emotion_tag: str = "铺垫",
                      max_retry: int = None) -> str:
@@ -787,6 +840,10 @@ def write_and_review(novel_name: str, chapter_num: int,
                 except Exception as e:
                     print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
                     mm.update_chapter_status(chapter_num, "已审核")
+
+                # ── 自动兑现逾期伏笔 ────────────────────────────────
+                _auto_redeem_foreshadowing(mm, chapter_num, content)
+
                 return content
             else:
                 print(f"\n  [重写] 读者视角不通过（{reader_result.get('score_total', 0)}/100）")
