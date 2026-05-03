@@ -209,8 +209,8 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
     print(f"  [读者视角] 正在评估第{chapter_num}章...")
 
     # 上一章只传结尾部分，避免两章全文撑爆 token 窗口
-    if prev_chapter_content and len(prev_chapter_content) > 800:
-        prev_snippet = "...（省略前段）...\n" + prev_chapter_content[-800:]
+    if prev_chapter_content and len(prev_chapter_content) > 1500:
+        prev_snippet = "...（上章前段已省略，以下为上章后半部分）...\n" + prev_chapter_content[-1500:]
     else:
         prev_snippet = prev_chapter_content or "（首章，无上一章）"
 
