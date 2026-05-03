@@ -522,14 +522,21 @@ def _auto_redeem_foreshadowing(mm: MemoryManager, chapter_num: int, content: str
         if not is_overdue:
             continue
 
-        # 从伏笔描述中提取关键词（取长度>=2的词，至少匹配2个）
-        keywords = [w for w in re.split(r'[，。、；：！？\s,.;:!?\-—/\\()\[\]【】""'']+',
-                                        desc) if len(w) >= 2]
+        # 从伏笔描述中提取关键词
+        # 排除常见人名/地名词（长度<=3的纯名词高频词）
+        _name_like = re.compile(r'^[一-鿿]{2,3}$')
+        _split_re = re.compile(r'[，。、；：！？\s,.;:!?\\/\-—()\[\]【】“”‘’]+')
+        raw_words = [w for w in _split_re.split(desc) if len(w) >= 2]
+        keywords = [w for w in raw_words if not _name_like.match(w)]
+        if not keywords:
+            keywords = raw_words  # 全被过滤时回退，避免漏判
         if not keywords:
             continue
 
         matched = sum(1 for kw in keywords if kw in content_lower)
-        if matched >= min(2, len(keywords)):
+        match_ratio = matched / len(keywords) if keywords else 0
+        # 需同时满足：至少匹配3个关键词 且 匹配比例>=50%
+        if matched >= min(3, len(keywords)) and match_ratio >= 0.5:
             try:
                 mm.redeem_foreshadowing(fid, chapter_num)
                 print(f"  [伏笔兑现] {fid}: {desc[:30]}... → 第{chapter_num}章自动兑现")
