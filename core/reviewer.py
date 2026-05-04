@@ -567,7 +567,7 @@ def write_and_review(novel_name: str, chapter_num: int,
     - 连续 ≥2 次因相同 veto_code 失败且层均为 L1/L2 时，触发任务卡冲突菜单
     - 每章最多允许一次任务卡重写，防止无限循环
     """
-    from core.writer import write_chapter
+    from core.writer import write_chapter, revise_chapter
     from core.api_client import get_failure_stats, check_switch_needed, get_switch_history
 
     if max_retry is None:
@@ -592,6 +592,9 @@ def write_and_review(novel_name: str, chapter_num: int,
     _task_rewrite_done = False        # 每章最多重写一次任务卡
     _rewrite_requested = False        # 内层 for 循环通知外层需要重试
     _retry_feedback = ""              # 重试反馈，独立于 plot_goal
+    _original_content = None          # 首次写入的原文（供局部修改使用）
+    _revise_mode = False              # 是否进入局部修改模式
+    _rewrite_count = 0                # 已执行完全重写的次数
     # ─────────────────────────────────────────────────────────────
 
     # 外层 while：正常流程只走一次；任务卡重写后最多再走一次
@@ -602,9 +605,18 @@ def write_and_review(novel_name: str, chapter_num: int,
             print(f"\n  第{attempt+1}次写作尝试...")
 
             try:
-                content = write_chapter(novel_name, chapter_num,
-                                        plot_goal, emotion_tag,
-                                        retry_feedback=_retry_feedback)
+                if _revise_mode and _original_content:
+                    content = revise_chapter(
+                        novel_name, chapter_num,
+                        _original_content, _retry_feedback,
+                        plot_goal, emotion_tag,
+                    )
+                else:
+                    content = write_chapter(novel_name, chapter_num,
+                                            plot_goal, emotion_tag,
+                                            retry_feedback=_retry_feedback)
+                    if _original_content is None:
+                        _original_content = content
                 reset_failure_counter("author")
             except Exception as e:
                 print(f"  [错误] 写作调用失败：{e}")
@@ -789,7 +801,40 @@ def write_and_review(novel_name: str, chapter_num: int,
                     retry_feedback = _build_retry_feedback(result)
                     if retry_feedback:
                         _retry_feedback = retry_feedback
-                    print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
+
+                    if not _revise_mode:
+                        # 第1次失败：自动进入局部修改模式
+                        _revise_mode = True
+                        print(f"  [修改] 基于原文进行局部修改...")
+                    else:
+                        # 已在修改模式，给用户选择
+                        print(f"\n{'='*60}")
+                        print(f"  局部修改仍未通过（{result.get('score_total', 0)}/100）")
+                        print(f"{'='*60}")
+                        print("  1. 继续局部修改（默认）")
+                        print("  2. 完全重写（原任务卡，不带修改意见）")
+                        print("  3. 切换模型重新生成")
+                        retry_choice = input("\n  请选择：").strip() or "1"
+
+                        if retry_choice == "2":
+                            _revise_mode = False
+                            _retry_feedback = ""
+                            plot_goal = _original_plot_goal
+                            emotion_tag = _original_emotion_tag
+                            _rewrite_count += 1
+                            print(f"  [重写] 使用原始任务卡完全重写...")
+                        elif retry_choice == "3":
+                            from core.api_client import select_all_models_interactive, _select_single_model
+                            print("\n【选择新的作者模型】")
+                            model_choice = _select_single_model("综合模型", default="1")
+                            from core.api_client import set_author_model, set_reviewer_model
+                            set_author_model(model_choice["model"], model_choice["provider"])
+                            set_reviewer_model(model_choice["model"], model_choice["provider"])
+                            reset_failure_counter("author")
+                            reset_failure_counter("reviewer")
+                            print(f"\n  [OK] 已切换至 {model_choice['name']}")
+                        # choice == "1"：继续局部修改，保持现有状态
+
                     continue
                 else:
                     if result.get("review_error"):
@@ -827,8 +872,6 @@ def write_and_review(novel_name: str, chapter_num: int,
                         print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
                         mm.update_chapter_status(chapter_num, "强制通过")
                     return content or ""
-
-                continue  # for 循环正常推进
 
             # ── 责任编辑通过，进入读者视角 ───────────────────────────
             reader_result = reader_review_chapter(novel_name, chapter_num, content)
@@ -871,7 +914,36 @@ def write_and_review(novel_name: str, chapter_num: int,
                         reader_feedback_parts.append(f"- 建议：{reader_suggestions}")
                     if reader_feedback_parts:
                         _retry_feedback = "\n".join(reader_feedback_parts)
-                    print(f"  [重写] 准备第{attempt+2}次写作，已附上修复要求...")
+
+                    if not _revise_mode:
+                        _revise_mode = True
+                        print(f"  [修改] 基于原文进行局部修改...")
+                    else:
+                        print(f"\n{'='*60}")
+                        print(f"  局部修改仍未通过（读者视角）")
+                        print(f"{'='*60}")
+                        print("  1. 继续局部修改（默认）")
+                        print("  2. 完全重写（原任务卡，不带修改意见）")
+                        print("  3. 切换模型重新生成")
+                        retry_choice = input("\n  请选择：").strip() or "1"
+
+                        if retry_choice == "2":
+                            _revise_mode = False
+                            _retry_feedback = ""
+                            plot_goal = _original_plot_goal
+                            emotion_tag = _original_emotion_tag
+                            _rewrite_count += 1
+                            print(f"  [重写] 使用原始任务卡完全重写...")
+                        elif retry_choice == "3":
+                            from core.api_client import select_all_models_interactive, _select_single_model
+                            print("\n【选择新的作者模型】")
+                            model_choice = _select_single_model("综合模型", default="1")
+                            from core.api_client import set_author_model, set_reviewer_model
+                            set_author_model(model_choice["model"], model_choice["provider"])
+                            set_reviewer_model(model_choice["model"], model_choice["provider"])
+                            reset_failure_counter("author")
+                            reset_failure_counter("reviewer")
+                            print(f"\n  [OK] 已切换至 {model_choice['name']}")
                 else:
                     print(f"\n{'='*60}")
                     print(f"  [提示] 连续{max_retry}次未通过！")

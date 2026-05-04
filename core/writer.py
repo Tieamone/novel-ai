@@ -1186,6 +1186,144 @@ def clean_content(text: str) -> str:
     return text.strip()
 
 
+# ==================== 局部修改函数 ====================
+
+REVISE_SYSTEM = (
+    "你是专业网文修改师。在保留原文优秀内容的基础上，"
+    "针对指出的问题进行局部修改。"
+    "不要大幅改动没有问题的段落。"
+    "只输出修改后的完整正文，不要任何说明。"
+)
+
+
+def revise_chapter(novel_name: str, chapter_num: int,
+                   original_content: str, feedback: str,
+                   plot_goal: str, emotion_tag: str = "铺垫",
+                   beat_plan: str = "") -> str:
+    """基于审核反馈对原文进行局部修改，保留未被指出问题的段落。"""
+    mm = MemoryManager(novel_name)
+    ctx = mm.load_context(chapter_num)
+
+    word_target = cfg("novel", "chapter_word_target", 3500)
+    word_min = cfg("novel", "chapter_word_min", 3000)
+    word_max = cfg("novel", "chapter_word_max", 4000)
+    max_tokens_cfg = cfg("model", "max_tokens", 4096)
+
+    author_style = AUTHOR_STYLES["1"]
+    style_path = get_data_dir(novel_name) / "style.txt"
+    if style_path.exists():
+        style_key = style_path.read_text(encoding="utf-8").strip()
+        if style_key.startswith("custom:"):
+            custom_desc = style_key[7:].strip()
+            system_prompt = f"""你是一位专业的中文网络小说作家。
+你的写作风格特点：{custom_desc}
+
+你修改时只动有问题的地方，保留原文的语气、节奏和好的段落。"""
+        else:
+            author_style = AUTHOR_STYLES.get(style_key, AUTHOR_STYLES["1"])
+            system_prompt = author_style["system"]
+    else:
+        system_prompt = AUTHOR_STYLES["1"]["system"]
+
+    hard_rules = _format_rule_block("硬约束（必须满足）", WRITER_HARD_CONSTRAINTS)
+    forbidden_rules = _format_rule_block("禁止项（必须避免）", WRITER_FORBIDDEN_RULES)
+
+    revise_prompt = f"""【原文】
+{original_content}
+
+【修改要求】
+{feedback}
+
+【本章任务】
+{plot_goal}（{emotion_tag}）
+
+{hard_rules}
+
+{forbidden_rules}
+
+请在保留原文优秀内容的基础上，针对上述问题进行局部修改。
+只输出修改后的完整正文，不要任何说明。"""
+
+    print(f"  [修改] 正在基于原文进行局部修改...")
+    full_content = call_author_api(
+        system_prompt=system_prompt + "\n\n" + REVISE_SYSTEM,
+        user_message=revise_prompt,
+        temperature=cfg("temperature", "revision", 0.70),
+        max_tokens=min(int(word_max * 1.75), 7000),
+    )
+    full_content = clean_content(full_content)
+    print(f"  [修改] 局部修改完成：{len(full_content)}字")
+
+    if len(full_content) < word_min * 0.5:
+        print("  [修改] 修改结果过短，回退到原文")
+        full_content = original_content
+
+    # 去AI化
+    full_content = _self_check_and_revise(
+        system_prompt=system_prompt,
+        chapter_num=chapter_num,
+        plot_goal=plot_goal,
+        emotion_tag=emotion_tag,
+        full_content=full_content,
+        beat_plan=beat_plan,
+        max_tokens=max_tokens_cfg,
+    )
+    full_content = re.sub(r'\n{3,}', '\n\n', full_content)
+
+    # 字数补写
+    supplement_round = 0
+    while len(full_content) < word_min and supplement_round < MAX_SUPPLEMENT_ROUNDS:
+        if len(full_content) >= word_max:
+            break
+        shortage = word_min - len(full_content)
+        supplement_round += 1
+        print(f"  [补写] 字数不足（{len(full_content)}/{word_min}），"
+              f"第{supplement_round}轮补充约{shortage}字...")
+        supplement = call_author_api(
+            system_prompt=SUPPLEMENT_SYSTEM,
+            user_message=(
+                f"当前章节结尾内容：\n...{full_content[-400:]}\n\n"
+                f"本章目标：{plot_goal}\n"
+                f"请在结尾处自然延伸，补充约{shortage}字的正文内容。"
+            ),
+            temperature=cfg("temperature", "writing_supplement", 0.75),
+            max_tokens=1024,
+        )
+        supplement = clean_content(supplement)
+        if not supplement:
+            break
+        full_content = f"{full_content}\n\n{supplement}"
+        full_content = re.sub(r'\n{3,}', '\n\n', full_content)
+        print(f"  补写完成，当前总字数：{len(full_content)}字")
+
+    total = len(full_content)
+    hard_limit = int(word_max * 1.2)
+    if total > hard_limit:
+        original_total = total
+        paragraphs = full_content.split('\n\n')
+        truncated = []
+        current_len = 0
+        for para in paragraphs:
+            if current_len + len(para) > hard_limit:
+                break
+            truncated.append(para)
+            current_len += len(para)
+        if truncated:
+            full_content = '\n\n'.join(truncated)
+            total = len(full_content)
+            print(f"  [裁剪] 字数{original_total}超过硬上限{hard_limit}，已裁剪至{total}字")
+
+    print(f"  [OK] 第{chapter_num}章修改完成，总字数：{total}字")
+    mm.save_chapter(
+        chapter_num, f"第{chapter_num}章",
+        full_content, "草稿",
+        word_target=word_target,
+        plot_goal=plot_goal,
+        emotion_tag=emotion_tag,
+    )
+    return full_content
+
+
 # ==================== 主写作函数 ====================
 
 def write_chapter(novel_name: str, chapter_num: int,
