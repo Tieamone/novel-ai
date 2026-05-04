@@ -301,7 +301,7 @@ class MemoryManager:
 
     def _is_macro_foreshadow(self, desc: str, age: int) -> bool:
         """判断是否为宏观悬念类伏笔"""
-        if len(desc) <= 20:
+        if len(desc) <= 8:
             return False
         return any(kw in desc for kw in self._MACRO_KEYWORDS)
 
