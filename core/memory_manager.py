@@ -297,10 +297,19 @@ class MemoryManager:
 
         return [h["hint"] for h in selected]
 
+    _MACRO_KEYWORDS = ("暗示", "背后", "阴谋", "命运", "秘密", "真相", "警告")
+
+    def _is_macro_foreshadow(self, desc: str, age: int) -> bool:
+        """判断是否为宏观悬念类伏笔"""
+        if age <= 30 or len(desc) <= 30:
+            return False
+        return any(kw in desc for kw in self._MACRO_KEYWORDS)
+
     def get_foreshadow_report(self, current_chapter: int) -> dict:
         """
         生成伏笔健康度报告。
-        返回：overdue / due_soon / recent_added / recent_redeemed / total_active / trend
+        返回：overdue / due_soon / macro / recent_added /
+              recent_redeemed / total_active / trend
         """
         import re
 
@@ -326,6 +335,7 @@ class MemoryManager:
 
         overdue = []    # 沉睡超过20章
         due_soon = []   # 5章内即将到期
+        macro = []      # 宏观悬念
 
         for row in active_rows:
             f = dict(row)
@@ -334,6 +344,17 @@ class MemoryManager:
             plant_ch = max(f.get("plant_chapter", 1) or 1, 1)
             expected = f.get("expected_redeem", "待定") or "待定"
             age = current_chapter - plant_ch
+
+            # 宏观悬念优先判定，符合条件的不计入严重超期
+            if self._is_macro_foreshadow(desc, age):
+                macro.append({
+                    "fid": fid,
+                    "description": desc,
+                    "plant_chapter": plant_ch,
+                    "expected_redeem": expected,
+                    "age": age,
+                })
+                continue
 
             # 严重超期：沉睡超过20章
             if age > 20:
@@ -372,6 +393,7 @@ class MemoryManager:
 
         # 按沉睡章数降序排列
         overdue.sort(key=lambda x: -x["age"])
+        macro.sort(key=lambda x: -x["age"])
 
         total_active = len(active_rows)
         trend = recent_added - recent_redeemed
@@ -379,6 +401,7 @@ class MemoryManager:
         return {
             "overdue": overdue,
             "due_soon": due_soon,
+            "macro": macro,
             "recent_added": recent_added,
             "recent_redeemed": recent_redeemed,
             "total_active": total_active,

@@ -1258,8 +1258,22 @@ def show_foreshadow_report(novel_name: str):
     else:
         print("    （无）")
 
+    macro = report["macro"]
+    print(f"\n  【宏观悬念】（沉睡30章以上的长线伏笔，共{len(macro)}个）")
+    if macro:
+        for f in macro[:10]:
+            print(f"  - {f['fid']}: {f['description']}"
+                  f"（第{f['plant_chapter']}章埋，已沉睡{f['age']}章）")
+        if len(macro) > 10:
+            print(f"  ... 还有 {len(macro) - 10} 条")
+    else:
+        print("    （无）")
+
     print("-" * 50)
     print("  提示：超期伏笔过多会影响L2审核分数")
+    if macro:
+        print("  注：宏观悬念类伏笔需在故事高潮章节统一处理，")
+        print("      建议在第120-140章集中兑现")
     print("=" * 50)
 
 
