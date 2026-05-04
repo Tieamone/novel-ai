@@ -297,6 +297,94 @@ class MemoryManager:
 
         return [h["hint"] for h in selected]
 
+    def get_foreshadow_report(self, current_chapter: int) -> dict:
+        """
+        生成伏笔健康度报告。
+        返回：overdue / due_soon / recent_added / recent_redeemed / total_active / trend
+        """
+        import re
+
+        with with_db_connection(self.novel_name) as conn:
+            # 当前未兑现伏笔
+            active_rows = conn.execute(
+                "SELECT * FROM foreshadowing WHERE status='active'"
+            ).fetchall()
+
+            # 最近10章新增的伏笔
+            recent_added = conn.execute(
+                "SELECT COUNT(*) as cnt FROM foreshadowing "
+                "WHERE plant_chapter > ?",
+                (max(0, current_chapter - 10),)
+            ).fetchone()["cnt"]
+
+            # 最近10章兑现的伏笔
+            recent_redeemed = conn.execute(
+                "SELECT COUNT(*) as cnt FROM foreshadowing "
+                "WHERE status='redeemed' AND redeemed_chapter > ?",
+                (max(0, current_chapter - 10),)
+            ).fetchone()["cnt"]
+
+        overdue = []    # 沉睡超过20章
+        due_soon = []   # 5章内即将到期
+
+        for row in active_rows:
+            f = dict(row)
+            fid = f.get("fid", "")
+            desc = f.get("description", "")
+            plant_ch = max(f.get("plant_chapter", 1) or 1, 1)
+            expected = f.get("expected_redeem", "待定") or "待定"
+            age = current_chapter - plant_ch
+
+            # 严重超期：沉睡超过20章
+            if age > 20:
+                overdue.append({
+                    "fid": fid,
+                    "description": desc,
+                    "plant_chapter": plant_ch,
+                    "expected_redeem": expected,
+                    "age": age,
+                })
+
+            # 即将到期：expected_redeem 在当前章节+5章以内
+            expected_clean = str(expected).strip()
+            if expected_clean and expected_clean != "待定":
+                range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected_clean)
+                if range_match:
+                    end_ch = int(range_match.group(2))
+                    if 0 < end_ch - current_chapter <= 5:
+                        due_soon.append({
+                            "fid": fid,
+                            "description": desc,
+                            "plant_chapter": plant_ch,
+                            "expected_redeem": expected,
+                        })
+                else:
+                    single_match = re.search(r'第?(\d+)', expected_clean)
+                    if single_match:
+                        target_ch = int(single_match.group(1))
+                        if 0 < target_ch - current_chapter <= 5:
+                            due_soon.append({
+                                "fid": fid,
+                                "description": desc,
+                                "plant_chapter": plant_ch,
+                                "expected_redeem": expected,
+                            })
+
+        # 按沉睡章数降序排列
+        overdue.sort(key=lambda x: -x["age"])
+
+        total_active = len(active_rows)
+        trend = recent_added - recent_redeemed
+
+        return {
+            "overdue": overdue,
+            "due_soon": due_soon,
+            "recent_added": recent_added,
+            "recent_redeemed": recent_redeemed,
+            "total_active": total_active,
+            "trend": trend,
+        }
+
     def _refresh_foreshadowing_md(self):
         with with_db_connection(self.novel_name) as conn:
             rows = conn.execute("SELECT * FROM foreshadowing").fetchall()

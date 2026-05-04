@@ -1211,6 +1211,58 @@ def _edit_task_card(novel_name: str):
     print(f"  情绪标签：{final_tag}")
 
 
+def show_foreshadow_report(novel_name: str):
+    """显示伏笔健康度报告"""
+    with with_db_connection(novel_name) as conn:
+        row = conn.execute(
+            "SELECT MAX(chapter_num) as mx FROM chapters"
+        ).fetchone()
+    current_chapter = row["mx"] if row and row["mx"] else 0
+
+    if current_chapter == 0:
+        print("\n[提示] 当前没有已写章节，无法生成伏笔报告")
+        return
+
+    mm = MemoryManager(novel_name)
+    report = mm.get_foreshadow_report(current_chapter)
+
+    trend = report["trend"]
+    trend_str = f"+{trend}" if trend > 0 else str(trend)
+
+    print("\n" + "=" * 50)
+    print("  伏笔健康度报告")
+    print("=" * 50)
+    print(f"  未兑现总数：{report['total_active']} 个"
+          f"  |  趋势：每章净增 {trend_str} 个")
+    print(f"  最近10章新增：{report['recent_added']} 个"
+          f"  |  已兑现：{report['recent_redeemed']} 个")
+    print("-" * 50)
+
+    due_soon = report["due_soon"]
+    print(f"  【即将到期】（5章内需兑现，共{len(due_soon)}个）")
+    if due_soon:
+        for f in due_soon:
+            print(f"  - {f['fid']}: {f['description']}"
+                  f"（第{f['plant_chapter']}章埋，计划{f['expected_redeem']}）")
+    else:
+        print("    （无）")
+
+    overdue = report["overdue"]
+    print(f"\n  【严重超期】（沉睡20章以上，共{len(overdue)}个）")
+    if overdue:
+        for f in overdue[:10]:
+            print(f"  - {f['fid']}: {f['description']}"
+                  f"（第{f['plant_chapter']}章埋，已沉睡{f['age']}章）")
+        if len(overdue) > 10:
+            print(f"  ... 还有 {len(overdue) - 10} 条")
+    else:
+        print("    （无）")
+
+    print("-" * 50)
+    print("  提示：超期伏笔过多会影响L2审核分数")
+    print("=" * 50)
+
+
 def chapters_menu(novel_name: str):
     clean_duplicate_chapters(novel_name)
 
@@ -1230,6 +1282,7 @@ def chapters_menu(novel_name: str):
         print("11. 高级模型配置（作者/审核/读者视角模型）")
         print("12. 查看失败统计与模型切换历史")
         print("13. 手动编辑任务卡（修改情节目标/情绪标签）")
+        print("14. 查看伏笔健康度报告")
         print("0. 返回主菜单")
 
         choice = input("\n请选择：").strip()
@@ -1324,6 +1377,9 @@ def chapters_menu(novel_name: str):
 
         elif choice == "13":
             _edit_task_card(novel_name)
+
+        elif choice == "14":
+            show_foreshadow_report(novel_name)
 
         elif choice == "0":
             from core.api_client import get_session_stats
