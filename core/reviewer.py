@@ -738,6 +738,8 @@ def write_and_review(novel_name: str, chapter_num: int,
                         _veto_code_counter.clear()
                         _failure_layers.clear()
                         _retry_feedback = ""
+                        _original_content = None
+                        _revise_mode = False
                         _task_rewrite_done = True
                         _rewrite_requested = True
                         print(f"  [OK] 新任务卡：{plot_goal}")
@@ -753,6 +755,8 @@ def write_and_review(novel_name: str, chapter_num: int,
                             _veto_code_counter.clear()
                             _failure_layers.clear()
                             _retry_feedback = ""
+                            _original_content = None
+                            _revise_mode = False
                             _task_rewrite_done = True
                             _rewrite_requested = True
                             # 同步写库
@@ -832,6 +836,9 @@ def write_and_review(novel_name: str, chapter_num: int,
                             set_reviewer_model(model_choice["model"], model_choice["provider"])
                             reset_failure_counter("author")
                             reset_failure_counter("reviewer")
+                            _revise_mode = False
+                            _original_content = None
+                            _retry_feedback = ""
                             print(f"\n  [OK] 已切换至 {model_choice['name']}")
                         # choice == "1"：继续局部修改，保持现有状态
 
@@ -943,6 +950,9 @@ def write_and_review(novel_name: str, chapter_num: int,
                             set_reviewer_model(model_choice["model"], model_choice["provider"])
                             reset_failure_counter("author")
                             reset_failure_counter("reviewer")
+                            _revise_mode = False
+                            _original_content = None
+                            _retry_feedback = ""
                             print(f"\n  [OK] 已切换至 {model_choice['name']}")
                 else:
                     print(f"\n{'='*60}")
