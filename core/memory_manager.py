@@ -297,7 +297,12 @@ class MemoryManager:
 
         return [h["hint"] for h in selected]
 
-    _MACRO_KEYWORDS = ("暗示", "背后", "阴谋", "命运", "秘密", "真相", "警告")
+    _MACRO_KEYWORDS = (
+        "暗示", "背后", "阴谋", "命运", "秘密", "真相", "警告",
+        "窥视", "阻止", "监视", "能力", "潜力",
+        "联系", "关联", "预示", "意味", "暗流",
+        "伏线", "隐患", "危机", "威胁",
+    )
 
     def _is_macro_foreshadow(self, desc: str, age: int) -> bool:
         """判断是否为宏观悬念类伏笔"""
