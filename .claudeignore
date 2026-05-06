@@ -1,0 +1,25 @@
+# Python 虚拟环境
+venv/
+
+# Python 缓存和编译产物
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 测试和代码质量工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# 打包产物
+*.egg-info/
+dist/
+build/
+
+# Git 内部文件
+.git/
+
+# 导出的小说章节（需要时再读取）
+output/
