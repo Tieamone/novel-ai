@@ -901,6 +901,32 @@ def rewrite_task_for_chapter(novel_name: str, chapter_num: int,
 
 emotion_tag 只能从以下 5 个中选 1 个：铺垫 / 冲突 / 爽点 / 低谷 / 反转"""
 
+    # 大纲伏笔强制任务注入
+    try:
+        from core.outline_manager import get_chapter_outline_tasks
+        outline_tasks = get_chapter_outline_tasks(novel_name, chapter_num)
+        to_plant = outline_tasks.get("to_plant", [])
+        to_resolve = outline_tasks.get("to_resolve", [])
+        if to_plant or to_resolve:
+            fs_lines = []
+            if to_plant:
+                fs_lines.append("【本章必须埋入】")
+                for t in to_plant:
+                    stars = "★" * (t.get("importance") or 3)
+                    fs_lines.append(
+                        f"- {t['fid']}: {t['description']}（重要度{stars}）"
+                    )
+            if to_resolve:
+                fs_lines.append("【本章必须兑现】")
+                for t in to_resolve:
+                    stars = "★" * (t.get("importance") or 3)
+                    fs_lines.append(
+                        f"- {t['fid']}: {t['description']}（重要度{stars}）"
+                    )
+            prompt += "\n\n=== 大纲伏笔强制任务 ===\n" + "\n".join(fs_lines)
+    except Exception:
+        pass
+
     raw = call_author_api(
         system_prompt=(
             "你是专业的中文网络小说策划师，"

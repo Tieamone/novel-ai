@@ -113,6 +113,36 @@ def delete_outline_foreshadow(novel_name: str, fid: str) -> bool:
             return cur.rowcount > 0
 
 
+def get_chapter_outline_tasks(novel_name: str, chapter_num: int) -> dict:
+    """
+    返回当前章节的大纲伏笔任务，供任务卡生成时注入。
+    失败时返回空 dict，不抛异常。
+    """
+    empty = {"to_plant": [], "to_resolve": []}
+    try:
+        ensure_database(novel_name)
+        with with_db_connection(novel_name) as conn:
+            to_plant = conn.execute(
+                "SELECT fid, description, importance "
+                "FROM outline_foreshadowing "
+                "WHERE novel_name=? AND plant_chapter=? AND status='planned'",
+                (novel_name, chapter_num),
+            ).fetchall()
+            to_resolve = conn.execute(
+                "SELECT fid, description, importance "
+                "FROM outline_foreshadowing "
+                "WHERE novel_name=? AND resolve_chapter=? "
+                "AND status IN ('planned', 'planted')",
+                (novel_name, chapter_num),
+            ).fetchall()
+        return {
+            "to_plant": [dict(r) for r in to_plant],
+            "to_resolve": [dict(r) for r in to_resolve],
+        }
+    except Exception:
+        return empty
+
+
 # ==================== 交互菜单 ====================
 
 _STATUS_LIST = ["planned", "planted", "resolved"]
