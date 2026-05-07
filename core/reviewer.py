@@ -670,6 +670,22 @@ def review_chapter(novel_name: str, chapter_num: int,
         increment_failure_counter("reviewer")
     else:
         reset_failure_counter("reviewer")
+        # 审稿通过 → 自动更新大纲伏笔状态
+        try:
+            from core.outline_manager import (
+                get_chapter_outline_tasks, mark_outline_foreshadow_status)
+            outline_tasks = get_chapter_outline_tasks(novel_name, chapter_num)
+            updated = []
+            for t in outline_tasks.get("to_resolve", []):
+                if mark_outline_foreshadow_status(novel_name, t["fid"], "resolved"):
+                    updated.append(f"{t['fid']}→resolved")
+            for t in outline_tasks.get("to_plant", []):
+                if mark_outline_foreshadow_status(novel_name, t["fid"], "planted"):
+                    updated.append(f"{t['fid']}→planted")
+            if updated:
+                print(f"  [大纲伏笔] 已更新: {', '.join(updated)}")
+        except Exception:
+            pass
 
     return result
 

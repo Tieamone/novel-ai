@@ -143,6 +143,20 @@ def get_chapter_outline_tasks(novel_name: str, chapter_num: int) -> dict:
         return empty
 
 
+def mark_outline_foreshadow_status(novel_name: str, fid: str,
+                                   status: str) -> bool:
+    """
+    标记大纲伏笔状态（planned/planted/resolved），审稿通过时自动调用。
+    失败时返回 False，不抛异常。
+    """
+    if status not in ("planned", "planted", "resolved"):
+        return False
+    try:
+        return update_outline_foreshadow(novel_name, fid, status=status)
+    except Exception:
+        return False
+
+
 # ==================== 交互菜单 ====================
 
 _STATUS_LIST = ["planned", "planted", "resolved"]
