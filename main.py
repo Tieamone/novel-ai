@@ -17,6 +17,7 @@ from core.config_loader import (
     get_data_dir,
     get_project_root,
 )
+from core.outline_manager import manage_outline_foreshadow
 
 MAX_NOVEL_NAME_LEN = 64
 INVALID_NOVEL_NAME_CHARS = set('<>:"/\\|?*')
@@ -1297,6 +1298,7 @@ def chapters_menu(novel_name: str):
         print("12. 查看失败统计与模型切换历史")
         print("13. 手动编辑任务卡（修改情节目标/情绪标签）")
         print("14. 查看伏笔健康度报告")
+        print("15. 大纲伏笔管理")
         print("0. 返回主菜单")
 
         choice = input("\n请选择：").strip()
@@ -1394,6 +1396,9 @@ def chapters_menu(novel_name: str):
 
         elif choice == "14":
             show_foreshadow_report(novel_name)
+
+        elif choice == "15":
+            manage_outline_foreshadow(novel_name)
 
         elif choice == "0":
             from core.api_client import get_session_stats
