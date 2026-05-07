@@ -87,6 +87,31 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
   "suggestions": "失败时给出具体可执行的修订建议（指出需要改哪段、怎么改）；通过写质量合格"
 }"""
 
+FORESHADOW_REVIEWER_SYSTEM = """你是伏笔专项审核员，负责评估章节对伏笔的处理质量。
+
+评分维度（每项0-10分）：
+1. **埋入自然度**（embed）：本章新增的伏笔/悬念是否自然融入情节，不突兀。
+   - 先从正文中识别本章新增的伏笔元素（读者首次接触到的悬念/暗示/未解之谜），再评估其自然度。
+   - 若本章无明显新增伏笔，给8-10分（没有不是问题）。
+
+2. **兑现完整度**（resolve）：应兑现的伏笔是否在本章得到实质呼应。
+   - 对照下方「应兑现伏笔」列表逐条检查。
+   - 实质呼应 = 有具体情节推进，而非一笔带过或侧面提及。
+   - 若无应兑现伏笔，给8-10分。
+
+3. **线索可追溯性**（traceable）：兑现时是否有足够细节让读者回想起原伏笔。
+   - 读者能否通过本章描写联想到当初埋下的线索。
+   - 若本章无兑现动作，给8-10分。
+
+4. **积压风险**（overload_risk）：伏笔管理是否健康。
+   - 10分 = 无积压风险（有兑现或无新增），0分 = 严重积压（大量新增却无兑现）。
+   - 综合考虑：本章新增伏笔数量 vs 兑现数量，以及总体活跃伏笔规模。
+
+说明要求：一句话概括本章伏笔处理情况。
+
+严格只输出JSON：
+{"embed":0-10,"resolve":0-10,"traceable":0-10,"overload_risk":0-10,"comment":"一句话说明"}"""
+
 
 def _normalize_issue_list(value) -> list:
     if value is None:
@@ -308,6 +333,171 @@ def _build_retry_feedback(result: dict) -> str:
     return suggestions
 
 
+def _build_foreshadow_list(ctx: dict, chapter_num: int) -> dict:
+    """
+    从写作上下文构建伏笔评分所需数据。
+    区分「应兑现」（priority 0-1）和「可铺垫/待推进」（priority 2+）。
+    """
+    active = ctx.get("active_foreshadowing", [])
+    hints_raw = ctx.get("foreshadow_hints", [])
+
+    to_resolve = []
+    for f in active:
+        desc = (f.get("description") or "").strip()
+        expected = (f.get("expected_redeem") or "待定").strip()
+        if not desc:
+            continue
+        if expected == "待定":
+            continue
+        planted_at = max(f.get("plant_chapter", 1) or 1, 1)
+        age = chapter_num - planted_at
+        is_due = False
+        range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected)
+        if range_match:
+            s, e = int(range_match.group(1)), int(range_match.group(2))
+            if chapter_num > e:
+                is_due = True
+            elif s <= chapter_num <= e:
+                is_due = True
+        else:
+            single = re.search(r'第?(\d+)', expected)
+            if single:
+                t = int(single.group(1))
+                if chapter_num > t or abs(t - chapter_num) <= 3:
+                    is_due = True
+        if is_due:
+            handle_type = "逾期未兑现" if (
+                range_match and chapter_num > int(range_match.group(2))
+            ) or (
+                not range_match and single and chapter_num > int(single.group(1))
+            ) else "应兑现"
+            to_resolve.append({
+                "fid": f.get("fid", ""),
+                "description": desc,
+                "handle_type": handle_type,
+            })
+
+    active_hints = "\n".join(hints_raw[:15]) if hints_raw else ""
+    if len(active_hints) > 1500:
+        active_hints = active_hints[:1500] + "..."
+
+    return {
+        "to_resolve": to_resolve,
+        "active_hints": active_hints,
+        "total_active": len(active),
+    }
+
+
+def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
+                        chapter_num: int = 0) -> dict | None:
+    """
+    伏笔专项评分（L2级别）。
+    失败时返回 None，不中断主审核流程。
+    """
+    to_resolve = foreshadow_list.get("to_resolve", [])
+    active_hints = foreshadow_list.get("active_hints", "")
+    total_active = foreshadow_list.get("total_active", 0)
+
+    if not to_resolve and not active_hints:
+        return None
+
+    chapter_text = _truncate_for_review(chapter_text, max_len=5000)
+
+    resolve_block = ""
+    if to_resolve:
+        resolve_lines = []
+        for f in to_resolve:
+            resolve_lines.append(
+                f"- [{f['fid']}] {f['description']}（{f['handle_type']}）"
+            )
+        resolve_block = "\n".join(resolve_lines)
+    else:
+        resolve_block = "（本章无应兑现伏笔）"
+
+    hints_block = active_hints if active_hints else "（暂无活跃伏笔）"
+
+    prompt = f"""=== 伏笔审核任务 ===
+章节：第{chapter_num}章
+当前活跃伏笔总数：{total_active}
+
+=== 应兑现伏笔 ===
+{resolve_block}
+
+=== 当前活跃伏笔参考（用于判断哪些是旧伏笔）===
+{hints_block}
+
+=== 待审正文 ===
+{chapter_text}
+
+请逐项评分后输出JSON。"""
+
+    try:
+        raw = call_reviewer_api(
+            system_prompt=FORESHADOW_REVIEWER_SYSTEM,
+            user_message=prompt,
+            temperature=0.2,
+            max_tokens=300,
+        )
+    except Exception:
+        return None
+
+    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+    parsed = extract_json_obj(raw)
+    if not parsed or not isinstance(parsed, dict):
+        return None
+
+    def _clamp(v):
+        try:
+            return max(0, min(10, int(v)))
+        except Exception:
+            return 5
+
+    return {
+        "embed": _clamp(parsed.get("embed", 5)),
+        "resolve": _clamp(parsed.get("resolve", 5)),
+        "traceable": _clamp(parsed.get("traceable", 5)),
+        "overload_risk": _clamp(parsed.get("overload_risk", 5)),
+        "comment": str(parsed.get("comment", "")).strip(),
+    }
+
+
+def _apply_foreshadow_l2_judgment(result: dict, fs_score: dict,
+                                  foreshadow_list: dict):
+    """
+    根据伏笔专项评分追加 L2 审核意见。
+    - resolve < 5 且有应兑现伏笔 → 提示兑现不足
+    - overload_risk < 4 → 提示积压风险
+    """
+    warnings = []
+
+    to_resolve = foreshadow_list.get("to_resolve", [])
+    if fs_score["resolve"] < 5 and to_resolve:
+        names = "、".join(
+            f.get("description", f.get("fid", ""))[:30]
+            for f in to_resolve[:3]
+        )
+        warnings.append(f"⚠️ 伏笔兑现不足（{fs_score['resolve']}/10），请补充对[{names}]的呼应")
+
+    if fs_score["overload_risk"] < 4:
+        warnings.append(
+            f"⚠️ 本章伏笔积压风险高（{fs_score['overload_risk']}/10），"
+            f"建议减少新伏笔或安排兑现"
+        )
+
+    if not warnings:
+        return
+
+    for w in warnings:
+        result.setdefault("l2_issues", []).append(w)
+
+    existing = result.get("suggestions", "").strip()
+    warn_text = "\n".join(warnings)
+    if existing and existing != "质量合格":
+        result["suggestions"] = f"{existing}\n{warn_text}"
+    else:
+        result["suggestions"] = warn_text
+
+
 def _persist_review_result(mm: MemoryManager, chapter_num: int, result: dict):
     try:
         mm.update_chapter_review_result(chapter_num, result)
@@ -431,6 +621,14 @@ def review_chapter(novel_name: str, chapter_num: int,
         return error_result
 
     result = _normalize_review_result(parsed)
+
+    # 伏笔专项评分（失败不中断主流程）
+    foreshadow_list = _build_foreshadow_list(ctx, chapter_num)
+    fs_score = score_foreshadowing(content, foreshadow_list, chapter_num)
+    if fs_score:
+        result["foreshadow_score"] = fs_score
+        _apply_foreshadow_l2_judgment(result, fs_score, foreshadow_list)
+
     _persist_review_result(mm, chapter_num, result)
 
     status = "通过" if result.get("pass") else "不通过"
@@ -443,6 +641,15 @@ def review_chapter(novel_name: str, chapter_num: int,
         print("  [责任编辑] 一票否决：")
         for item in result.get("veto_reasons", []):
             print(f"    - {item}")
+
+    if result.get("foreshadow_score"):
+        fs = result["foreshadow_score"]
+        print(
+            f"  [伏笔专项] 埋入:{fs['embed']}/10 兑现:{fs['resolve']}/10 "
+            f"可追溯:{fs['traceable']}/10 积压风险:{fs['overload_risk']}/10"
+        )
+        if fs.get("comment"):
+            print(f"    {fs['comment']}")
 
     if not result.get("pass"):
         attr = result.get("failure_attribution", {})
