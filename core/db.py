@@ -141,6 +141,22 @@ def init_database(novel_name: str):
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS outline_foreshadowing (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            novel_name TEXT NOT NULL,
+            fid TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT DEFAULT '情节伏笔',
+            plant_chapter INTEGER,
+            resolve_chapter INTEGER,
+            status TEXT DEFAULT 'planned',
+            importance INTEGER DEFAULT 3,
+            notes TEXT,
+            UNIQUE(novel_name, fid)
+        )
+    """)
+
     # 索引
     try:
         cursor.execute(
