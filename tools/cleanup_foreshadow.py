@@ -11,15 +11,8 @@ from pathlib import Path
 
 # ==================== 配置 ====================
 
-# 情节动词关键词——description 不含任何一条则视为疑似误记录
-PLOT_KEYWORDS = [
-    "发现", "知道", "得知", "揭露", "查明", "追查", "逃脱", "对抗",
-    "背叛", "牺牲", "决定", "选择", "暗示", "伏笔", "秘密", "真相",
-    "阴谋", "约定", "誓言",
-]
-
 # 描述长度阈值（小于此值视为疑似误记录）
-MIN_DESC_LEN = 15
+MIN_DESC_LEN = 10
 
 
 # ==================== 工具函数 ====================
@@ -42,18 +35,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def has_plot_keyword(description: str) -> bool:
-    """description 是否包含任何情节动词关键词"""
-    return any(kw in description for kw in PLOT_KEYWORDS)
-
-
 def classify_reasons(desc: str, plant_chapter) -> list:
     """返回该伏笔命中的疑似误记录原因列表"""
     reasons = []
     if len(desc) < MIN_DESC_LEN:
         reasons.append(f"描述过短({len(desc)}字)")
-    if not has_plot_keyword(desc):
-        reasons.append("无情节动词")
     if not plant_chapter:
         reasons.append("无埋入章节")
     return reasons
