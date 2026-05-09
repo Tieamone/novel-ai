@@ -1,5 +1,9 @@
+import json
+import re
+
 from core.db import ensure_database
 from core.utils import with_db_connection, DatabaseTransaction
+from core.config_loader import get_data_dir
 
 
 # ==================== 显示宽度工具 ====================
@@ -157,6 +161,181 @@ def mark_outline_foreshadow_status(novel_name: str, fid: str,
         return False
 
 
+# ==================== AI 辅助生成 ====================
+
+def ai_suggest_outline_foreshadow(novel_name: str):
+    """AI 根据总大纲生成伏笔建议列表，供用户选择录入。"""
+    # 1. 读取大纲
+    outline_path = get_data_dir(novel_name) / "master_outline.md"
+    if not outline_path.exists():
+        print("  [错误] 未找到总大纲文件（master_outline.md），请先创建大纲")
+        return
+    outline_text = outline_path.read_text(encoding="utf-8").strip()
+    if not outline_text:
+        print("  [错误] 总大纲文件为空")
+        return
+    outline_text = outline_text[:4000]
+
+    # 2. 读取目标章数
+    target_path = get_data_dir(novel_name) / "target_chapters.txt"
+    if target_path.exists():
+        try:
+            target_chapters = int(target_path.read_text(encoding="utf-8").strip())
+        except ValueError:
+            target_chapters = 0
+    else:
+        target_chapters = 0
+    target_str = str(target_chapters) if target_chapters > 0 else "未知"
+
+    # 3. 查询已完成的最大章节号
+    ensure_database(novel_name)
+    max_chapter = 0
+    try:
+        with with_db_connection(novel_name) as conn:
+            row = conn.execute(
+                "SELECT MAX(chapter_num) AS mc FROM chapters "
+                "WHERE status='approved'",
+            ).fetchone()
+            if row and row["mc"] is not None:
+                max_chapter = row["mc"]
+    except Exception:
+        pass
+
+    # 4. 调用作者模型
+    system_prompt = "你是专业的网络小说策划师，擅长设计伏笔结构。"
+    user_message = (
+        f"=== 小说总大纲 ===\n{outline_text}\n\n"
+        f"当前已完成章节：第{max_chapter}章\n"
+        f"目标总章节：{target_str}章\n\n"
+        "请根据大纲，设计20-30个关键伏笔，要求：\n"
+        "1. 每个伏笔必须有明确的埋入章节和兑现章节\n"
+        f"2. 埋入章节必须大于第{max_chapter}章（已完成章节不可再埋）\n"
+        "3. 分类：情节伏笔/人物伏笔/世界观/宏观悬念\n"
+        "4. 重要度1-5分\n"
+        "5. 严格输出JSON数组，不要任何其他内容：\n"
+        '[\n'
+        '  {\n'
+        '    "description": "伏笔描述",\n'
+        '    "category": "情节伏笔",\n'
+        '    "plant_chapter": 60,\n'
+        '    "resolve_chapter": 80,\n'
+        '    "importance": 4\n'
+        '  }\n'
+        ']'
+    )
+
+    print("  正在调用 AI 生成伏笔建议，请稍候...")
+    try:
+        from core.api_client import call_author_api
+        raw = call_author_api(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            max_tokens=4096,
+            temperature=0.7,
+        )
+    except Exception as e:
+        print(f"  [错误] API 调用失败：{e}")
+        return
+
+    # 5. 清除思考块 + 解析 JSON
+    raw_clean = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+    # 尝试提取 JSON 数组
+    json_match = re.search(r'\[.*\]', raw_clean, re.DOTALL)
+    if not json_match:
+        print("  [错误] AI 返回中未找到 JSON 数组")
+        print(f"  原始返回：\n{raw_clean[:500]}")
+        print("  请手动在菜单中录入伏笔（选项2）")
+        return
+
+    try:
+        suggestions = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        print("  [错误] JSON 解析失败")
+        print(f"  原始返回：\n{raw_clean[:500]}")
+        print("  请手动在菜单中录入伏笔（选项2）")
+        return
+
+    if not isinstance(suggestions, list) or len(suggestions) == 0:
+        print("  [提示] AI 未返回有效建议")
+        return
+
+    # 6. 打印候选列表
+    print(f"\n  AI 共生成 {len(suggestions)} 条伏笔建议：\n")
+    header = f"  {'序号':<5}{'描述':<28}{'分类':<10}{'埋入章':<8}{'兑现章':<8}{'重要度'}"
+    print(header)
+    print("  " + "─" * 70)
+    for i, s in enumerate(suggestions, 1):
+        desc = (s.get("description", "") or "")[:26]
+        cat = (s.get("category", "") or "")[:8]
+        plant = s.get("plant_chapter", "?")
+        resolve = s.get("resolve_chapter", "?")
+        imp = s.get("importance", "?")
+        stars = "★" * int(imp) if isinstance(imp, int) else str(imp)
+        print(f"  {i:<5}{desc:<28}{cat:<10}第{plant:<6}第{resolve:<6}{stars}")
+
+    # 7. 用户选择录入方式
+    print("\n  录入方式：")
+    print("    a. 全部录入")
+    print("    b. 逐条确认（y录入/n跳过/e编辑后录入）")
+    print("    c. 取消")
+    mode = input("  请选择：").strip().lower()
+
+    if mode == "a":
+        count = 0
+        for s in suggestions:
+            desc = (s.get("description") or "").strip()
+            if not desc:
+                continue
+            add_outline_foreshadow(
+                novel_name,
+                description=desc,
+                category=s.get("category", "情节伏笔"),
+                plant_chapter=int(s.get("plant_chapter", 0)),
+                resolve_chapter=int(s.get("resolve_chapter", 0)),
+                importance=int(s.get("importance", 3)),
+            )
+            count += 1
+        print(f"\n  [OK] 已录入 {count} 条伏笔")
+
+    elif mode == "b":
+        count = 0
+        for i, s in enumerate(suggestions, 1):
+            desc = (s.get("description") or "").strip()
+            cat = s.get("category", "情节伏笔")
+            plant = s.get("plant_chapter", 0)
+            resolve = s.get("resolve_chapter", 0)
+            imp = s.get("importance", 3)
+            print(f"\n  [{i}] {desc}  ({cat}, 埋入:{plant}, 兑现:{resolve}, 重要度:{imp})")
+            sub = input("  y录入/n跳过/e编辑：").strip().lower()
+            if sub == "y":
+                add_outline_foreshadow(
+                    novel_name, desc, cat, int(plant), int(resolve), int(imp),
+                )
+                count += 1
+                print("    [OK] 已录入")
+            elif sub == "e":
+                new_desc = input(f"    描述 [{desc}]: ").strip() or desc
+                new_cat = input(f"    分类 [{cat}]: ").strip() or cat
+                new_plant = input(f"    埋入章 [{plant}]: ").strip()
+                new_resolve = input(f"    兑现章 [{resolve}]: ").strip()
+                new_imp = input(f"    重要度 [{imp}]: ").strip()
+                add_outline_foreshadow(
+                    novel_name,
+                    description=new_desc,
+                    category=new_cat,
+                    plant_chapter=int(new_plant) if new_plant else int(plant),
+                    resolve_chapter=int(new_resolve) if new_resolve else int(resolve),
+                    importance=int(new_imp) if new_imp else int(imp),
+                )
+                count += 1
+                print("    [OK] 已录入（编辑后）")
+            else:
+                print("    [跳过]")
+        print(f"\n  [OK] 逐条确认完毕，共录入 {count} 条")
+    else:
+        print("  已取消")
+
+
 # ==================== 交互菜单 ====================
 
 _STATUS_LIST = ["planned", "planted", "resolved"]
@@ -174,6 +353,7 @@ def manage_outline_foreshadow(novel_name: str):
         print("2. 新增伏笔")
         print("3. 编辑伏笔")
         print("4. 删除伏笔")
+        print("5. AI辅助生成大纲伏笔建议")
         print("0. 返回主菜单")
 
         choice = input("\n请选择：").strip()
@@ -186,6 +366,8 @@ def manage_outline_foreshadow(novel_name: str):
             _edit_item(novel_name)
         elif choice == "4":
             _delete_item(novel_name)
+        elif choice == "5":
+            ai_suggest_outline_foreshadow(novel_name)
         elif choice == "0":
             break
 
