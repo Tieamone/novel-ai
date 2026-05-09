@@ -1037,6 +1037,28 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
     else:
         f_block = "（暂无需处理的伏笔）"
 
+    # ── 大纲伏笔强制任务 ──────────────────────────────────────
+    try:
+        from core.outline_manager import get_chapter_outline_tasks
+        outline_tasks = get_chapter_outline_tasks(ctx.get("novel_name", ""), chapter_num)
+        to_plant = outline_tasks.get("to_plant", [])
+        to_resolve = outline_tasks.get("to_resolve", [])
+        if to_plant or to_resolve:
+            lines = ["【大纲伏笔强制任务（必须执行，不可忽略）】"]
+            if to_plant:
+                lines.append("本章必须自然埋入以下伏笔：")
+                for t in to_plant:
+                    lines.append(f"  - {t['fid']}: {t['description']}")
+            if to_resolve:
+                lines.append("本章必须兑现以下伏笔：")
+                for t in to_resolve:
+                    lines.append(f"  - {t['fid']}: {t['description']}")
+            outline_block_fs = "\n".join(lines)
+        else:
+            outline_block_fs = ""
+    except Exception:
+        outline_block_fs = ""
+
     summaries = ctx.get("recent_summaries", [])
     s_str = "\n".join(
         [f"第{s['chapter_num']}章：{s['summary']}" for s in summaries]
@@ -1091,6 +1113,8 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 
 {behavior_constraint_block}
 {f_block}
+
+{outline_block_fs}
 
 【前面发生了什么】
 {s_str}
@@ -1203,6 +1227,7 @@ def revise_chapter(novel_name: str, chapter_num: int,
     """基于审核反馈对原文进行局部修改，保留未被指出问题的段落。"""
     mm = MemoryManager(novel_name)
     ctx = mm.load_context(chapter_num)
+    ctx["novel_name"] = novel_name
 
     word_target = cfg("novel", "chapter_word_target", 3500)
     word_min = cfg("novel", "chapter_word_min", 3000)
@@ -1331,6 +1356,7 @@ def write_chapter(novel_name: str, chapter_num: int,
                   retry_feedback: str = "") -> str:
     mm = MemoryManager(novel_name)
     ctx = mm.load_context(chapter_num)
+    ctx["novel_name"] = novel_name
 
     word_target = cfg("novel", "chapter_word_target", 3500)
     word_min = cfg("novel", "chapter_word_min", 3000)
