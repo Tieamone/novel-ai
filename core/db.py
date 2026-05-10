@@ -157,6 +157,29 @@ def init_database(novel_name: str):
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS beats_cache (
+            chapter_num   INTEGER PRIMARY KEY,
+            beats_text    TEXT    NOT NULL,
+            model_used    TEXT,
+            created_at    TEXT    DEFAULT (datetime('now','localtime')),
+            used_count    INTEGER DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS writing_sessions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            chapter_num    INTEGER NOT NULL,
+            attempt        INTEGER NOT NULL,
+            started_at     TEXT,
+            ended_at       TEXT,
+            end_reason     TEXT,
+            word_count     INTEGER,
+            review_score   REAL
+        )
+    """)
+
     # 索引
     try:
         cursor.execute(
@@ -251,12 +274,23 @@ def _migrate(conn, cursor):
          "ALTER TABLE chapter_tasks ADD COLUMN original_plot_goal TEXT"),
         ("rewrite_count",
          "ALTER TABLE chapter_tasks ADD COLUMN rewrite_count INTEGER DEFAULT 0"),
+        ("updated_at",
+         "ALTER TABLE chapter_tasks ADD COLUMN updated_at TIMESTAMP"),
     ]:
         if col not in task_existing:
             try:
                 cursor.execute(sql)
             except Exception:
                 pass
+
+    # 初始化存量 updated_at（避免全部为 NULL 导致误判）
+    try:
+        cursor.execute(
+            "UPDATE chapter_tasks SET updated_at=created_at "
+            "WHERE updated_at IS NULL"
+        )
+    except Exception:
+        pass
 
     try:
         cursor.execute(

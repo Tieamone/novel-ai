@@ -148,7 +148,8 @@ def _claim_task_for_writing(novel_name: str, chapter_num: int,
 
             cur = execute_with_retry(conn, """
                 UPDATE chapter_tasks
-                SET plot_goal=?, emotion_tag=?, status=?
+                SET plot_goal=?, emotion_tag=?, status=?,
+                    updated_at=datetime('now','localtime')
                 WHERE chapter_num=? AND COALESCE(status, ?) = ?
             """, (
                 final_goal, final_tag, TASK_IN_PROGRESS,
@@ -178,7 +179,8 @@ def _update_task_status(novel_name: str, chapter_num: int, status: str):
         with DatabaseTransaction(conn):
             cur = conn.execute("""
                 UPDATE chapter_tasks
-                SET status=?
+                SET status=?,
+                    updated_at=datetime('now','localtime')
                 WHERE chapter_num=?
             """, (status, chapter_num))
             if cur.rowcount == 0:
@@ -1201,7 +1203,8 @@ def _edit_task_card(novel_name: str):
         conn.execute(
             "UPDATE chapter_tasks "
             "SET plot_goal=?, emotion_tag=?, "
-            "original_plot_goal=?, rewrite_count=? "
+            "original_plot_goal=?, rewrite_count=?, "
+            "updated_at=datetime('now','localtime') "
             "WHERE chapter_num=?",
             (final_goal, final_tag, original, rewrite_count, chapter_num)
         )
@@ -1278,6 +1281,159 @@ def show_foreshadow_report(novel_name: str):
     print("=" * 50)
 
 
+def _breakpoint_menu(novel_name: str):
+    """断点管理菜单"""
+    while True:
+        print("\n========== 断点管理 ==========")
+        print("  [1] 查看异常任务（进行中超过30分钟）")
+        print("  [2] 强制重置任务状态 → 待处理")
+        print("  [3] 查看章节写作历史")
+        print("  [4] 重写指定章节（保留摘要）")
+        print("  [5] 清除节拍缓存（指定章节）")
+        print("  [0] 返回")
+        choice = input("请选择：").strip()
+
+        if choice == "0":
+            break
+
+        elif choice == "1":
+            def _query_stuck(conn):
+                return conn.execute("""
+                    SELECT chapter_num, status, updated_at
+                    FROM chapter_tasks
+                    WHERE status = ?
+                    AND updated_at < datetime('now', '-30 minutes', 'localtime')
+                    ORDER BY chapter_num
+                """, (TASK_IN_PROGRESS,)).fetchall()
+            rows = with_db_connection(novel_name, _query_stuck)
+            if not rows:
+                print("  ✅ 无异常任务（进行中任务均在30分钟内）")
+            else:
+                print(f"\n  发现 {len(rows)} 个异常任务：")
+                for r in rows:
+                    print(f"  第{r[0]}章 | 状态：{r[1]} | 最后更新：{r[2]}")
+                print("  提示：可用 [2] 强制重置这些任务")
+
+        elif choice == "2":
+            try:
+                num = int(input("  请输入要重置的章节号：").strip())
+            except ValueError:
+                print("  ❌ 请输入有效的章节号")
+                continue
+            def _query_status(conn):
+                row = conn.execute(
+                    "SELECT status, updated_at FROM chapter_tasks WHERE chapter_num=?",
+                    (num,)
+                ).fetchone()
+                return row
+            row = with_db_connection(novel_name, _query_status)
+            if not row:
+                print(f"  ❌ 第{num}章任务不存在")
+                continue
+            print(f"  当前状态：{row[0]} | 最后更新：{row[1]}")
+            confirm = input(f"  确认将第{num}章重置为「待处理」？(yes/no)：").strip()
+            if confirm.lower() != "yes":
+                print("  已取消")
+                continue
+            _update_task_status(novel_name, num, TASK_PENDING)
+            import core.writer as _writer_mod
+            _writer_mod._cached_beat_plan = ""
+            print(f"  ✅ 第{num}章已重置为「待处理」，节拍内存缓存已清除")
+
+        elif choice == "3":
+            try:
+                num = int(input("  请输入要查看的章节号：").strip())
+            except ValueError:
+                print("  ❌ 请输入有效的章节号")
+                continue
+            def _query_sessions(conn):
+                return conn.execute("""
+                    SELECT attempt, started_at, ended_at, end_reason, word_count, review_score
+                    FROM writing_sessions
+                    WHERE chapter_num=?
+                    ORDER BY attempt
+                """, (num,)).fetchall()
+            rows = with_db_connection(novel_name, _query_sessions)
+            if not rows:
+                print(f"  第{num}章暂无写作历史记录（功能持续完善中）")
+            else:
+                print(f"\n  第{num}章写作历史（共{len(rows)}次）：")
+                for r in rows:
+                    score_str = f"{r[5]:.0f}分" if r[5] else "未评分"
+                    print(f"  第{r[0]}次 | {r[1]} → {r[2]} | {r[3]} | {r[4]}字 | {score_str}")
+
+        elif choice == "4":
+            try:
+                num = int(input("  请输入要重写的章节号：").strip())
+            except ValueError:
+                print("  ❌ 请输入有效的章节号")
+                continue
+            def _query_chapter(conn):
+                return conn.execute(
+                    "SELECT title, word_count FROM chapters WHERE chapter_num=?",
+                    (num,)
+                ).fetchone()
+            ch = with_db_connection(novel_name, _query_chapter)
+            if not ch:
+                print(f"  ❌ 第{num}章不存在")
+                continue
+            print(f"  将重写：第{num}章《{ch[0]}》（{ch[1]}字）")
+            print("  ⚠️  章节正文将被清空，摘要保留，任务状态重置为待处理")
+            confirm = input("  确认？(yes/no)：").strip()
+            if confirm.lower() != "yes":
+                print("  已取消")
+                continue
+            def _do_rewrite(conn):
+                with DatabaseTransaction(conn):
+                    conn.execute(
+                        "UPDATE chapters SET content=NULL, status='草稿', "
+                        "review_score_total=NULL, review_score_l1=NULL, "
+                        "review_score_l2=NULL, review_score_l3=NULL, "
+                        "reader_review_score=NULL, reader_review_passed=NULL, "
+                        "updated_at=datetime('now','localtime') "
+                        "WHERE chapter_num=?", (num,)
+                    )
+                    conn.execute(
+                        "UPDATE chapter_tasks SET status=?, "
+                        "updated_at=datetime('now','localtime') "
+                        "WHERE chapter_num=?", (TASK_PENDING, num)
+                    )
+            with_db_connection(novel_name, _do_rewrite)
+            print(f"  ✅ 第{num}章已重置，摘要完整保留，可重新写作")
+
+        elif choice == "5":
+            try:
+                num = int(input("  请输入要清除节拍缓存的章节号：").strip())
+            except ValueError:
+                print("  ❌ 请输入有效的章节号")
+                continue
+            def _query_beats(conn):
+                return conn.execute(
+                    "SELECT beats_text, created_at FROM beats_cache WHERE chapter_num=?",
+                    (num,)
+                ).fetchone()
+            b = with_db_connection(novel_name, _query_beats)
+            if not b:
+                print(f"  第{num}章无节拍缓存")
+                continue
+            print(f"  缓存时间：{b[1]}")
+            print(f"  内容预览：{b[0][:60]}...")
+            confirm = input("  确认清除？(yes/no)：").strip()
+            if confirm.lower() != "yes":
+                print("  已取消")
+                continue
+            def _del_beats(conn):
+                conn.execute("DELETE FROM beats_cache WHERE chapter_num=?", (num,))
+                conn.commit()
+            with_db_connection(novel_name, _del_beats)
+            import core.writer as _writer_mod
+            _writer_mod._cached_beat_plan = ""
+            print(f"  ✅ 第{num}章节拍缓存已清除（DB + 内存）")
+
+        else:
+            print("  ❌ 无效选项")
+
+
 def chapters_menu(novel_name: str):
     clean_duplicate_chapters(novel_name)
 
@@ -1299,6 +1455,7 @@ def chapters_menu(novel_name: str):
         print("13. 手动编辑任务卡（修改情节目标/情绪标签）")
         print("14. 查看伏笔健康度报告")
         print("15. 大纲伏笔管理")
+        print("16. 断点管理")
         print("0. 返回主菜单")
 
         choice = input("\n请选择：").strip()
@@ -1399,6 +1556,9 @@ def chapters_menu(novel_name: str):
 
         elif choice == "15":
             manage_outline_foreshadow(novel_name)
+
+        elif choice == "16":
+            _breakpoint_menu(novel_name)
 
         elif choice == "0":
             from core.api_client import get_session_stats
@@ -1677,7 +1837,8 @@ def _register_sigint_handler():
                 with with_db_connection(_current_novel_name) as conn:
                     with DatabaseTransaction(conn):
                         conn.execute(
-                            "UPDATE chapter_tasks SET status='待处理' "
+                            "UPDATE chapter_tasks SET status='待处理', "
+                            "updated_at=datetime('now','localtime') "
                             "WHERE chapter_num=? AND status='进行中'",
                             (_current_chapter_num,)
                         )

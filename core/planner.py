@@ -968,7 +968,8 @@ emotion_tag 只能从以下 5 个中选 1 个：铺垫 / 冲突 / 爽点 / 低�
             conn.execute("""
                 UPDATE chapter_tasks
                 SET plot_goal=?, emotion_tag=?,
-                    original_plot_goal=?, rewrite_count=?
+                    original_plot_goal=?, rewrite_count=?,
+                    updated_at=datetime('now','localtime')
                 WHERE chapter_num=?
             """, (new_goal, new_tag, original, rewrite_count, chapter_num))
             conn.commit()

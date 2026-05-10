@@ -1,9 +1,10 @@
 import json
 import re
-from core.api_client import call_author_api, call_reviewer_api, increment_failure_counter, reset_failure_counter, get_current_author_model
+from core.api_client import call_author_api, call_reviewer_api, increment_failure_counter, reset_failure_counter, get_current_author_model, get_author_model
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg, get_data_dir
 from core.utils import extract_json_obj, is_transient_error
+import sqlite3 as _sqlite3
 
 # 节拍规划缓存（跨重试复用，任务卡不变则节拍不变）
 _cached_beat_plan = ""
@@ -761,6 +762,48 @@ def _count_matching_words(text1: str, text2: str) -> int:
     return match_count
 
 
+# ==================== 节拍缓存持久化 ====================
+
+def _save_beats_cache(novel_name: str, chapter_num: int, beats_text: str) -> None:
+    """将节拍规划持久化到 beats_cache 表"""
+    try:
+        db_path = get_data_dir(novel_name) / "novel.db"
+        with _sqlite3.connect(str(db_path), timeout=5) as conn:
+            conn.execute("""
+                INSERT INTO beats_cache (chapter_num, beats_text, model_used)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chapter_num) DO UPDATE SET
+                    beats_text=excluded.beats_text,
+                    model_used=excluded.model_used,
+                    created_at=datetime('now','localtime'),
+                    used_count=0
+            """, (chapter_num, beats_text, get_author_model()))
+            conn.commit()
+    except Exception as e:
+        print(f"  [提示] 节拍缓存写入失败（不影响写作）：{e}")
+
+
+def _load_beats_cache(novel_name: str, chapter_num: int) -> str:
+    """从 beats_cache 表读取持久化的节拍规划"""
+    try:
+        db_path = get_data_dir(novel_name) / "novel.db"
+        with _sqlite3.connect(str(db_path), timeout=5) as conn:
+            row = conn.execute(
+                "SELECT beats_text FROM beats_cache WHERE chapter_num=?",
+                (chapter_num,)
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE beats_cache SET used_count=used_count+1 WHERE chapter_num=?",
+                    (chapter_num,)
+                )
+                conn.commit()
+                return row[0]
+    except Exception:
+        pass
+    return ""
+
+
 # ==================== 节拍规划 ====================
 
 def _plan_chapter_beats(ctx: dict, chapter_num: int,
@@ -1396,14 +1439,35 @@ def write_chapter(novel_name: str, chapter_num: int,
     # 节拍规划（重试时复用缓存，任务卡不变则节拍不变）
     global _cached_beat_plan
     if _cached_beat_plan and retry_feedback:
+        # 优先级1：内存缓存（同进程内重试）
         beat_plan = _cached_beat_plan
         beat_count = len([ln for ln in beat_plan.splitlines() if ln.strip()])
-        print(f"  [复用] 沿用上次节拍规划（共{beat_count}条）")
+        print(f"  [复用] 沿用本次节拍规划（共{beat_count}条）")
+    elif retry_feedback:
+        # 优先级2：DB缓存（跨会话重试）
+        cached = _load_beats_cache(novel_name, chapter_num)
+        if cached:
+            beat_plan = cached
+            _cached_beat_plan = cached
+            beat_count = len([ln for ln in beat_plan.splitlines() if ln.strip()])
+            print(f"  [复用] 从数据库恢复节拍规划（共{beat_count}条）")
+        else:
+            print(f"  正在规划第{chapter_num}章节拍...")
+            beat_plan = _plan_chapter_beats(ctx, chapter_num, plot_goal, emotion_tag)
+            if beat_plan:
+                _cached_beat_plan = beat_plan
+                _save_beats_cache(novel_name, chapter_num, beat_plan)
+                beat_count = len([ln for ln in beat_plan.splitlines() if ln.strip()])
+                print(f"  节拍规划完成：{beat_count}条")
+            else:
+                print("  [提示] 节拍规划未返回有效结果，按目标直接推进")
     else:
+        # 优先级3：正常首次写作
         print(f"  正在规划第{chapter_num}章节拍...")
         beat_plan = _plan_chapter_beats(ctx, chapter_num, plot_goal, emotion_tag)
         if beat_plan:
             _cached_beat_plan = beat_plan
+            _save_beats_cache(novel_name, chapter_num, beat_plan)
             beat_count = len([ln for ln in beat_plan.splitlines() if ln.strip()])
             print(f"  节拍规划完成：{beat_count}条")
         else:

@@ -995,7 +995,8 @@ def write_and_review(novel_name: str, chapter_num: int,
                                     _rc   = ((_row["rewrite_count"] or 0) + 1) if _row else 1
                                     _conn.execute(
                                         "UPDATE chapter_tasks SET plot_goal=?, "
-                                        "original_plot_goal=?, rewrite_count=? "
+                                        "original_plot_goal=?, rewrite_count=?, "
+                                        "updated_at=datetime('now','localtime') "
                                         "WHERE chapter_num=?",
                                         (plot_goal, _orig, _rc, chapter_num)
                                     )
