@@ -62,7 +62,24 @@ d:\novel-ai/
 - （无）
 
 ### 待办事项
-- （无）
+- [ ] **P0 — 安全与稳定性** (2026-05-08 全面评估)
+  - [ ] SQL 注入风险修复（动态 SQL 标识符白名单校验）
+  - [ ] 裸 except 替换为精确异常处理 + 项目级异常体系
+  - [ ] write_and_review() 函数拆分（445行→多个子状态机）
+  - [ ] api_client.py 职责拆分（7种职责→API层/UI层/统计层分离）
+  - [ ] 核心路径单元测试（utils/reviewer/writer/db）
+- [ ] **P1 — 架构优化**
+  - [ ] 引入 AppContext + NovelSession 依赖注入（消除全局状态）
+  - [ ] Provider 抽象层（LLMProvider 接口，支持新 AI 后端）
+  - [ ] 魔法数字配置化（阈值、超时、截断字数移入 config.yaml）
+  - [ ] N+1 查询优化（人物关系批量更新、伏笔单次排序查询）
+  - [ ] 日志敏感信息脱敏（API Key、Token 掩码处理）
+  - [ ] 依赖版本锁定（requirements.txt 精确版本）
+- [ ] **P2 — 体验与性能**
+  - [ ] 字符串拼接改用 join() 模式
+  - [ ] 章节级缓存层（load_context/beat_plan/style 缓存）
+  - [ ] 审稿维度插件化（ReviewDimension 抽象类）
+  - [ ] 中期演进：FastAPI Web UI + asyncio 异步改造
 
 ## 核心并发安全机制（2026-04-03 新增）
 

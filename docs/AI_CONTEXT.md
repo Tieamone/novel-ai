@@ -2,12 +2,105 @@
 
 ## 当前上下文
 
-**时间**: 2026-04-26
-**任务**: 全项目代码审查——检查所有模块的 bug（已完成）
+**时间**: 2026-05-13
+**任务**: 项目全面代码库结构分析（已完成）
 
 ## 本次完成的工作
 
-### 任务: 完整项目代码审查（14个源文件 + 3个配置文件）
+### 任务: 代码库全面架构分析（模块依赖、数据流、接口盘点）
+
+已读取并分析全部 14 个核心源文件，产出完整的项目结构分析报告。关键发现如下：
+
+#### 模块依赖层次图
+```
+Layer 0 (基础设施):
+  core/config_loader.py  ── 配置加载（单例缓存，YAML→dict）
+  core/db.py             ── 数据库初始化、连接管理、迁移系统
+
+Layer 1 (核心服务):
+  core/utils.py          ── 公共工具（连接管理、重试、JSON提取）
+  core/model_manager.py  ── 模型发现与管理（缓存+动态发现）
+
+Layer 2 (AI 接口):
+  core/api_client.py     ── 统一 API 调用入口（DashScope+Mimo双Provider）
+
+Layer 3 (业务逻辑):
+  core/memory_manager.py ── 数据持久化（人物、伏笔、摘要、世界观）
+  core/writer.py         ── 章节写作（prompt构建、生成、自检修订）
+  core/reviewer.py       ── 双重审稿（责任编辑+伏笔评分+状态机）
+  core/reader_reviewer.py── 读者视角审稿（AI检测+阅读体验评估）
+  core/planner.py        ── 策划编排（大纲→世界观→角色→任务卡）
+  core/exporter.py       ── 章节导出（清理+敏感词+文件输出）
+  core/outline_manager.py── 大纲伏笔管理（CRUD+AI辅助建议）
+
+Layer 4 (应用层):
+  main.py                ── CLI主入口（菜单系统+完整控制流）
+```
+
+#### 数据流关键路径
+```
+新建流程: main.py → planner.py → writer.py → reviewer.py → memory_manager.py → db.py
+续写流程: main.py → reviewer.py → writer.py → reader_reviewer.py → memory_manager.py
+导出流程: main.py → exporter.py → memory_manager.py → db.py
+```
+
+#### 核心接口盘点（12 个关键接口）
+| 接口 | 模块 | 入参 | 出参 | 用途 |
+|------|------|------|------|------|
+| call_api() | api_client | system_prompt, user_message, model, tokens, temp | str | 统一LLM调用 |
+| call_author_api() | api_client | system_prompt, user_message, tokens, temp | str | 作者模型专用调用 |
+| call_reviewer_api() | api_client | system_prompt, user_message, tokens, temp | str | 审稿模型专用调用 |
+| call_reader_reviewer_api() | api_client | system_prompt, user_message, tokens, temp | str | 读者视角模型专用调用 |
+| write_chapter() | writer | novel_name, chapter_num, plot_goal, emotion_tag, retry_feedback | str | 章节生成主函数 |
+| write_and_review() | reviewer | novel_name, chapter_num, plot_goal, emotion_tag, max_retry | str | 写作+审稿完整流程 |
+| review_chapter() | reviewer | novel_name, chapter_num, content, plot_goal | dict | 责任编辑审稿 |
+| reader_review_chapter() | reader_reviewer | novel_name, chapter_num, current_content | dict | 读者视角审稿 |
+| load_context() | memory_manager | chapter_num | dict | 加载写作上下文 |
+| MemoryManager(novel_name) | memory_manager | novel_name | MemoryManager实例 | 数据访问统一入口 |
+| run_planner() | planner | novel_name, genre, keywords | (outline, style_key) | 新建小说策划 |
+| init_database() | db | novel_name | None | 数据库表结构初始化 |
+
+- **总体评分**: 2.6/5（功能原型→可维护产品的过渡阶段）
+- **最大风险**: 零测试覆盖、模块边界模糊（3个上帝模块）、裸except/SQL注入安全隐患
+- **最大优势**: 完整的写作流水线、去AI化系统、错误日志积累
+
+### 发现的 14 个问题（按优先级）
+
+**P0 — 立即修复（5项）**:
+| # | 问题 | 文件 |
+|---|------|------|
+| 10 | SQL 注入风险（动态SQL拼接） | db.py, main.py |
+| 5 | 裸 except + 异常体系缺失 | api_client.py, reviewer.py |
+| 13 | 零单元测试覆盖 | 全局 |
+| 4 | write_and_review() 445行超长函数 | reviewer.py:L777-L1221 |
+| 1 | api_client.py 上帝模块（7种职责） | api_client.py |
+
+**P1 — 短期优化（6项）**:
+| # | 问题 |
+|---|------|
+| 2 | 全局状态泛滥，缺乏依赖注入 |
+| 3 | 缺乏 Provider 抽象层（新增AI后端成本高） |
+| 6 | 魔法数字硬编码（阈值、超时、截断字数） |
+| 8 | N+1 查询（人物关系、伏笔排序） |
+| 11 | 日志敏感信息泄露风险 |
+| 14 | 依赖版本未锁定 |
+
+**P2 — 中期改进（3项）**:
+| # | 问题 |
+|---|------|
+| 7 | 字符串 += 拼接性能 |
+| 9 | 缺乏章节级缓存 |
+| 12 | 审稿维度缺乏插件化 |
+
+**详细评估报告**: 见对话记录中的完整分析。
+
+## 下一步计划
+- 用户确认 P0 优先级的修复范围后开始实施
+- 建议优先修复: SQL注入 → 裸except → 核心函数拆分 → 单元测试
+
+## 历史上下文
+
+### 2026-04-26: 全项目 Bug 审查
 
 - **结果**: 发现 **7 个 Bug** + **2 个代码质量问题**
 - **详细记录**: [docs/AI\_ERROR\_LOG.md](file:///d:/novel-ai/docs/AI_ERROR_LOG.md)
@@ -24,17 +117,7 @@
 | BUG-06 | 🔴  | reader\_reviewer.py:L217 | 禁用时返回字段缺失                     |
 | BUG-07 | 🟡  | writer.py:L759           | .lower() 对中文无意义               |
 
-## 下一步计划
-
-- 按优先级修复 BUG-04/BUG-05/BUG-06（影响面最大）
-- 清理死参数/死代码（BUG-02/BUG-03）
-- 考虑统一路径处理（CQ-01）
-
-***
-
-## 历史上下文（最近一次记录：2026-04-20）
-
-### 任务1: 模型列表更新与默认模型更换
+### 2026-04-20: 模型列表更新与默认模型更换
 
 - **位置**: [data/custom\_models.json](file:///d:/novel-ai/data/custom_models.json), [config.yaml](file:///d:/novel-ai/config.yaml), [core/model\_manager.py](file:///d:/novel-ai/core/model_manager.py)
 - **问题背景**: 用户反馈默认使用的 `qwen3.6-plus` 模型已无额度，需要将图片中的新模型添加到使用列表，并更换默认模型
@@ -76,13 +159,7 @@
 - 成功加载 16 个模型（全部为通义千问/智谱/Mimo模型）
 - 所有模型配置正确，分类映射完整
 
-## 下一步计划
-
-- （无待办任务，等待用户下一步指令）
-
-## 本次完成的工作
-
-### 任务1: 章节字数范围控制优化
+### 2026-04-04: 章节字数范围控制优化
 
 - **位置**: [core/writer.py](file:///d:/novel-ai/core/writer.py), [config.yaml](file:///d:/novel-ai/config.yaml)
 - **问题背景**: 用户反馈生成的章节字数过大（"太大杯"），需要控制在3000-4000字范围内
@@ -170,10 +247,6 @@
    - 3000 字保证基本情节完整（不会过于仓促）
    - 4000 字上限防止注水（避免为凑字数而重复表达）
    - 与用户需求完全一致："告诉模型生成3000-4000字就行"
-
-## 下一步计划
-
-- （无待办任务，等待用户下一步指令）
 
 ## 关键依赖关系图
 

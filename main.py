@@ -1297,15 +1297,14 @@ def _breakpoint_menu(novel_name: str):
             break
 
         elif choice == "1":
-            def _query_stuck(conn):
-                return conn.execute("""
+            with with_db_connection(novel_name) as conn:
+                rows = conn.execute("""
                     SELECT chapter_num, status, updated_at
                     FROM chapter_tasks
                     WHERE status = ?
                     AND updated_at < datetime('now', '-30 minutes', 'localtime')
                     ORDER BY chapter_num
                 """, (TASK_IN_PROGRESS,)).fetchall()
-            rows = with_db_connection(novel_name, _query_stuck)
             if not rows:
                 print("  ✅ 无异常任务（进行中任务均在30分钟内）")
             else:
@@ -1320,13 +1319,11 @@ def _breakpoint_menu(novel_name: str):
             except ValueError:
                 print("  ❌ 请输入有效的章节号")
                 continue
-            def _query_status(conn):
+            with with_db_connection(novel_name) as conn:
                 row = conn.execute(
                     "SELECT status, updated_at FROM chapter_tasks WHERE chapter_num=?",
                     (num,)
                 ).fetchone()
-                return row
-            row = with_db_connection(novel_name, _query_status)
             if not row:
                 print(f"  ❌ 第{num}章任务不存在")
                 continue
@@ -1346,14 +1343,13 @@ def _breakpoint_menu(novel_name: str):
             except ValueError:
                 print("  ❌ 请输入有效的章节号")
                 continue
-            def _query_sessions(conn):
-                return conn.execute("""
+            with with_db_connection(novel_name) as conn:
+                rows = conn.execute("""
                     SELECT attempt, started_at, ended_at, end_reason, word_count, review_score
                     FROM writing_sessions
                     WHERE chapter_num=?
                     ORDER BY attempt
                 """, (num,)).fetchall()
-            rows = with_db_connection(novel_name, _query_sessions)
             if not rows:
                 print(f"  第{num}章暂无写作历史记录（功能持续完善中）")
             else:
@@ -1368,12 +1364,11 @@ def _breakpoint_menu(novel_name: str):
             except ValueError:
                 print("  ❌ 请输入有效的章节号")
                 continue
-            def _query_chapter(conn):
-                return conn.execute(
+            with with_db_connection(novel_name) as conn:
+                ch = conn.execute(
                     "SELECT title, word_count FROM chapters WHERE chapter_num=?",
                     (num,)
                 ).fetchone()
-            ch = with_db_connection(novel_name, _query_chapter)
             if not ch:
                 print(f"  ❌ 第{num}章不存在")
                 continue
@@ -1383,7 +1378,7 @@ def _breakpoint_menu(novel_name: str):
             if confirm.lower() != "yes":
                 print("  已取消")
                 continue
-            def _do_rewrite(conn):
+            with with_db_connection(novel_name) as conn:
                 with DatabaseTransaction(conn):
                     conn.execute(
                         "UPDATE chapters SET content=NULL, status='草稿', "
@@ -1398,7 +1393,6 @@ def _breakpoint_menu(novel_name: str):
                         "updated_at=datetime('now','localtime') "
                         "WHERE chapter_num=?", (TASK_PENDING, num)
                     )
-            with_db_connection(novel_name, _do_rewrite)
             print(f"  ✅ 第{num}章已重置，摘要完整保留，可重新写作")
 
         elif choice == "5":
@@ -1407,12 +1401,11 @@ def _breakpoint_menu(novel_name: str):
             except ValueError:
                 print("  ❌ 请输入有效的章节号")
                 continue
-            def _query_beats(conn):
-                return conn.execute(
+            with with_db_connection(novel_name) as conn:
+                b = conn.execute(
                     "SELECT beats_text, created_at FROM beats_cache WHERE chapter_num=?",
                     (num,)
                 ).fetchone()
-            b = with_db_connection(novel_name, _query_beats)
             if not b:
                 print(f"  第{num}章无节拍缓存")
                 continue
@@ -1422,10 +1415,9 @@ def _breakpoint_menu(novel_name: str):
             if confirm.lower() != "yes":
                 print("  已取消")
                 continue
-            def _del_beats(conn):
-                conn.execute("DELETE FROM beats_cache WHERE chapter_num=?", (num,))
-                conn.commit()
-            with_db_connection(novel_name, _del_beats)
+            with with_db_connection(novel_name) as conn:
+                with DatabaseTransaction(conn):
+                    conn.execute("DELETE FROM beats_cache WHERE chapter_num=?", (num,))
             import core.writer as _writer_mod
             _writer_mod._cached_beat_plan = ""
             print(f"  ✅ 第{num}章节拍缓存已清除（DB + 内存）")
