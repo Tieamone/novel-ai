@@ -148,6 +148,29 @@ def get_current_author_model() -> dict:
     return {"model": _author_model, "provider": _author_provider, "context_length": 0}
 
 
+def get_current_author_max_tokens():
+    """
+    获取当前作者模型的最大输出 token 数。
+    优先从模型信息中读取，回退到 config.yaml 的 model.max_tokens。
+    若都无法获取，返回 None。
+    """
+    try:
+        model_info = get_current_author_model()
+        max_tok = model_info.get("max_output_tokens") or model_info.get("max_tokens")
+        if max_tok and isinstance(max_tok, (int, float)) and max_tok > 0:
+            return int(max_tok)
+    except Exception:
+        pass
+    try:
+        from core.config_loader import get as cfg
+        val = cfg("model", "max_tokens")
+        if val and isinstance(val, (int, float)) and val > 0:
+            return int(val)
+    except Exception:
+        pass
+    return None
+
+
 def get_model_pricing(model_name: str) -> dict:
     """
     获取模型定价。

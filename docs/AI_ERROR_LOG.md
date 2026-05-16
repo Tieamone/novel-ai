@@ -2,6 +2,7 @@
 
 | 日期 | 错误简述 | 原因分析 | 解决方案 | 状态 |
 |------|----------|----------|----------|------|
+| 2026-05-14 | 导入流程缺失大纲伏笔生成，导入的小说无任何伏笔规划 | 交互式创建(`run_planner`)包含Step 1.6 `generate_outline_foreshadow()`，但导入流程(`main.py` mode="2")完全跳过了这一步，直接存大纲→世界观→角色→任务卡 | 在导入流程的 `split_outline_to_tasks()` 之前添加 `generate_outline_foreshadow(novel_name, target_chapters, review_mode=False)` 调用 | ✅ 已修复 |
 | 2026-04-17 | 深度思考模型调用报400 url error | qwen3.6系列、glm-5等深度思考模型必须使用多模态接口，普通Generation.call()不支持 | 新增`_is_thinking_model()`函数识别思考模型，对这类模型添加`enable_thinking=False`参数 | ✅ 已解决 |
 | 2026-04-20 | 模型验证报400 url error | 自定义模型配置中使用了带日期后缀的模型名称（如qwen3.6-plus-2026-04-02），dashscope API无法识别这种格式 | 移除自定义模型配置中所有带日期后缀的模型，只保留标准格式的模型名称 | ✅ 已解决 |
 | 2026-04-03 | （无错误，所有改动一次通过） | N/A | N/A | N/A |

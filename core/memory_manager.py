@@ -823,6 +823,7 @@ class MemoryManager:
         )
 
         return {
+            "novel_name":           self.novel_name,
             "world_settings":       world_settings,
             "characters":           characters,
             "active_foreshadowing": active_foreshadowing,

@@ -52,6 +52,11 @@ novel:
   pre_split_chapters: 50
   failure_switch_threshold: 3
   progress_review_window: 10  # 进度面板审稿质量统计窗口（最近N章）
+  # 任务卡分批配置
+  batch_size_small: 10      # 小批次每批章数
+  batch_size_medium: 30     # 中批次每批章数
+  batch_size_large: 50      # 大批次每批章数
+  batch_bridge_count: 5     # 跨批次上下文桥接引入的任务卡数量
 
 paths:
   data_dir: data

@@ -182,6 +182,28 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
     else:
         f_block = "（暂无需处理的伏笔）"
 
+    # ── 大纲伏笔强制任务 ──────────────────────────────────────
+    try:
+        from core.outline_manager import get_chapter_outline_tasks
+        outline_tasks = get_chapter_outline_tasks(ctx.get("novel_name", ""), chapter_num)
+        to_plant = outline_tasks.get("to_plant", [])
+        to_resolve = outline_tasks.get("to_resolve", [])
+        if to_plant or to_resolve:
+            lines = ["【大纲伏笔强制任务（必须执行，不可忽略）】"]
+            if to_plant:
+                lines.append("本章必须自然埋入以下伏笔，融入情节而非生硬提及：")
+                for t in to_plant:
+                    lines.append(f"  - {t['fid']}: {t['description']}")
+            if to_resolve:
+                lines.append("本章必须兑现以下伏笔，给出明确的揭示或回收：")
+                for t in to_resolve:
+                    lines.append(f"  - {t['fid']}: {t['description']}")
+            outline_fs_block = "\n".join(lines)
+        else:
+            outline_fs_block = ""
+    except Exception:
+        outline_fs_block = ""
+
     summaries = ctx.get("recent_summaries", [])
     s_str = "\n".join(
         [f"第{s['chapter_num']}章：{s['summary']}" for s in summaries]
@@ -235,6 +257,7 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
 
 {behavior_constraint_block}
 {f_block}
+{outline_fs_block}
 
 【前面发生了什么】
 {s_str}

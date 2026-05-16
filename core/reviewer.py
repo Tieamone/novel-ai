@@ -714,6 +714,34 @@ def _increment_retry_safe(novel_name: str, chapter_num: int):
             """, (chapter_num,))
 
 
+def _sync_outline_foreshadow(novel_name: str, chapter_num: int, content: str):
+    """审稿通过后同步大纲伏笔状态：埋入项标为 planted，兑现项检查关键词自动 resolved。"""
+    try:
+        from core.outline_manager import get_chapter_outline_tasks, mark_outline_foreshadow_status
+        import re
+        _split_re = re.compile(r'[，。、；：！？\s,.;:!?\\/\-—()\[\]【】""''\u3000]+')
+        tasks = get_chapter_outline_tasks(novel_name, chapter_num)
+        to_plant = tasks.get("to_plant", [])
+        to_resolve = tasks.get("to_resolve", [])
+        content_lower = (content or "").lower()
+        for t in to_plant:
+            mark_outline_foreshadow_status(novel_name, t["fid"], "planted")
+            print(f"  [大纲伏笔] {t['fid']} 状态: planned → planted (第{chapter_num}章埋入)")
+        for t in to_resolve:
+            desc = (t.get("description") or "").lower()
+            keywords = [w for w in _split_re.split(desc) if len(w) >= 2]
+            if not keywords:
+                continue
+            matched = sum(1 for kw in keywords if kw in content_lower)
+            if matched >= min(3, len(keywords)) and (matched / max(len(keywords), 1)) >= 0.5:
+                mark_outline_foreshadow_status(novel_name, t["fid"], "resolved")
+                print(f"  [大纲伏笔] {t['fid']} 状态 → resolved (第{chapter_num}章兑现)")
+            else:
+                print(f"  [大纲伏笔] {t['fid']} 待兑现，关键词匹配不足({matched}/{len(keywords)})")
+    except Exception:
+        pass
+
+
 def _auto_redeem_foreshadowing(mm: MemoryManager, chapter_num: int, content: str):
     """章节审核通过后，检查逾期伏笔（priority=0），若正文包含相关关键词则自动兑现。"""
     if not content:
@@ -1127,6 +1155,9 @@ def write_and_review(novel_name: str, chapter_num: int,
 
                 # ── 自动兑现逾期伏笔 ────────────────────────────────
                 _auto_redeem_foreshadowing(mm, chapter_num, content)
+
+                # ── 同步大纲伏笔状态 ────────────────────────────
+                _sync_outline_foreshadow(novel_name, chapter_num, content)
 
                 return content
             else:

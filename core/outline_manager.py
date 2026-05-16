@@ -202,7 +202,19 @@ def ai_suggest_outline_foreshadow(novel_name: str):
         pass
 
     # 4. 调用作者模型
-    system_prompt = "你是专业的网络小说策划师，擅长设计伏笔结构。"
+    system_prompt = (
+        "你是专业的网络小说策划师，专精伏笔架构设计。\n"
+        "伏笔设计原则：\n"
+        "1. 伏笔是\"悬而未决的问题\"，每个伏笔应让读者产生疑问并渴望答案\n"
+        "2. 重要伏笔应有2-3个关联伏笔形成链条（暗示→强化→揭示），提高回收满足感\n"
+        "3. 每5-8章至少安排一个伏笔埋入或兑现，避免前密后疏\n"
+        "4. 世界观伏笔作为背景悬疑，情节伏笔驱动冲突，人物伏笔增加共情，宏观悬念贯穿全书\n"
+        "5. 重要度要有层次：不是所有伏笔都5星，穿插2-3星小悬念，大伏笔之间用小伏笔填充\n"
+        "6. 兑现不能早于埋入后10章，给读者发现和讨论的时间\n"
+        "7. 不要把\"事件倒计时\"当成伏笔——\"7天后护山大阵崩了\"是事件节点，不是伏笔，真正的伏笔是\"阵基处有一行不属于魔宗的刻字\"\n"
+        "8. 不要把\"确定性结果\"当成伏笔——\"XX人被击败\"\"XX地陷落\"是剧情推进的结果，不是伏笔，伏笔需挖掘事件中隐藏的\"秘密/原因/起源\"\n"
+        "9. 真正的伏笔必须包含\"悬而未决的问题\"，让读者产生疑问并渴望答案"
+    )
     user_message = (
         f"=== 小说总大纲 ===\n{outline_text}\n\n"
         f"当前已完成章节：第{max_chapter}章\n"
@@ -211,8 +223,11 @@ def ai_suggest_outline_foreshadow(novel_name: str):
         "1. 每个伏笔必须有明确的埋入章节和兑现章节\n"
         f"2. 埋入章节必须大于第{max_chapter}章（已完成章节不可再埋）\n"
         "3. 分类：情节伏笔/人物伏笔/世界观/宏观悬念\n"
-        "4. 重要度1-5分\n"
-        "5. 严格输出JSON数组，不要任何其他内容：\n"
+        "4. 重要度1-5分，至少30%的伏笔重要度不超过3分\n"
+        "5. 覆盖全章范围：在前期(前15%)、中期(15%-75%)、后期(75%-100%)都有伏笔分布\n"
+        "6. 不要生成倒计时/限期类伪伏笔\n"
+        "7. 不要在伏笔描述中写\"XX天后\"等明确时间期限\n"
+        "8. 严格输出JSON数组，不要任何其他内容：\n"
         '[\n'
         '  {\n'
         '    "description": "伏笔描述",\n'
@@ -258,6 +273,27 @@ def ai_suggest_outline_foreshadow(novel_name: str):
     if not isinstance(suggestions, list) or len(suggestions) == 0:
         print("  [提示] AI 未返回有效建议")
         return
+
+    try:
+        from core.memory_manager import MemoryManager
+        mm = MemoryManager(novel_name)
+        chars = mm.load_characters()
+        char_text_parts = []
+        for c in chars:
+            parts = [f"【{c['name']}】"]
+            if c.get('role'):
+                parts.append(f"身份：{c['role']}")
+            if c.get('personality'):
+                parts.append(f"性格：{c['personality']}")
+            if c.get('secret'):
+                parts.append(f"秘密：{c['secret']}")
+            char_text_parts.append("；".join(parts))
+        character_profiles = "\n".join(char_text_parts) if char_text_parts else "暂无人物档案"
+    except Exception:
+        character_profiles = "暂无人物档案"
+
+    review = review_outline_foreshadow(novel_name, suggestions, outline_text, character_profiles)
+    _print_review_table(suggestions, review)
 
     # 6. 打印候选列表
     print(f"\n  AI 共生成 {len(suggestions)} 条伏笔建议：\n")
@@ -334,6 +370,258 @@ def ai_suggest_outline_foreshadow(novel_name: str):
         print(f"\n  [OK] 逐条确认完毕，共录入 {count} 条")
     else:
         print("  已取消")
+
+
+def generate_outline_foreshadow(novel_name: str, target_chapters: int,
+                                review_mode: bool = False) -> int:
+    """自动化伏笔生成入口，供 run_planner 调用。
+
+    返回成功录入的伏笔数量。review_mode=True 时走手动确认流程，
+    否则检查是否已有伏笔（跳过重复生成）。
+    """
+    ensure_database(novel_name)
+    existing = list_outline_foreshadow(novel_name)
+    if existing and not review_mode:
+        print(f"  [跳过] 大纲伏笔已存在 {len(existing)} 条，跳过自动生成")
+        return len(existing)
+
+    if review_mode:
+        print("\n" + "-" * 50)
+        print("  大纲伏笔生成")
+        print("-" * 50)
+        print("  AI 将根据大纲自动设计 20-30 条伏笔，你可以逐条确认或批量录入")
+        ai_suggest_outline_foreshadow(novel_name)
+    else:
+        # 非交互模式：直接用 AI 全部录入
+        outline_path = get_data_dir(novel_name) / "master_outline.md"
+        if not outline_path.exists():
+            return 0
+        outline_text = outline_path.read_text(encoding="utf-8").strip()[:4000]
+        if not outline_text:
+            return 0
+
+        system_prompt = (
+            "你是专业的网络小说策划师，专精伏笔架构设计。\n"
+            "伏笔设计原则：\n"
+            "1. 伏笔是\"悬而未决的问题\"，每个伏笔应让读者产生疑问并渴望答案\n"
+            "2. 重要伏笔应有2-3个关联伏笔形成链条（暗示→强化→揭示）\n"
+            "3. 每5-8章至少安排一个伏笔埋入或兑现\n"
+            "4. 世界观伏笔作为背景悬疑，情节伏笔驱动冲突，人物伏笔增加共情，宏观悬念贯穿全书\n"
+            "5. 重要度要有层次，至少30%不超过3分\n"
+            "6. 兑现不能早于埋入后10章\n"
+            "7. 不要把\"事件倒计时\"当成伏笔——\"7天后护山大阵崩了\"是事件节点，不是伏笔，真正的伏笔是\"阵基处有一行不属于魔宗的刻字\"\n"
+            "8. 不要把\"确定性结果\"当成伏笔——\"XX人被击败\"\"XX地陷落\"是剧情推进的结果，不是伏笔，伏笔需挖掘事件中隐藏的\"秘密/原因/起源\"\n"
+            "9. 真正的伏笔必须包含\"悬而未决的问题\"，让读者产生疑问并渴望答案"
+        )
+        user_message = (
+            f"=== 小说总大纲 ===\n{outline_text}\n\n"
+            f"目标总章节：{target_chapters}章\n\n"
+            "请根据大纲，设计20-30个关键伏笔。\n"
+            "1. 每个伏笔必须指定埋入章节和兑现章节\n"
+            "2. 分类：情节伏笔/人物伏笔/世界观/宏观悬念\n"
+            "3. 重要度1-5分，至少30%不超过3分\n"
+            "4. 全章范围均匀分布\n"
+            "5. 不要生成倒计时/限期类伪伏笔\n"
+            "6. 不要在伏笔描述中写\"XX天后\"等明确时间期限\n"
+            "7. 严格输出JSON数组：\n"
+            '[{"description":"...","category":"情节伏笔","plant_chapter":10,"resolve_chapter":30,"importance":4}]'
+        )
+        print("  正在调用 AI 生成大纲伏笔，请稍候...")
+        try:
+            from core.api_client import call_author_api
+            raw = call_author_api(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                max_tokens=16000,
+                temperature=0.7,
+            )
+        except Exception as e:
+            print(f"  [错误] API 调用失败：{e}")
+            return 0
+
+        raw_clean = re.sub(
+            r'```(?:json)?\s*|```', '', raw, flags=re.DOTALL
+        ).strip()
+        raw_clean = re.sub(
+            r'[<\u2039]think[>\u203a]?[\s\S]*?[<\u2039]\/think[>\u203a]?', '',
+            raw_clean, flags=re.DOTALL
+        ).strip()
+        json_match = re.search(r'\[.*\]', raw_clean, re.DOTALL)
+        if not json_match:
+            print(f"  [错误] AI 返回中未找到 JSON，跳过伏笔生成")
+            print(f"  [调试] 原始返回前200字: {raw[:200]}")
+            return 0
+        try:
+            suggestions = json.loads(json_match.group())
+        except json.JSONDecodeError as e:
+            print(f"  [错误] JSON 解析失败: {e}")
+            print(f"  [调试] 匹配到的内容前200字: {json_match.group()[:200]}")
+            return 0
+
+        if not isinstance(suggestions, list):
+            return 0
+
+        try:
+            from core.memory_manager import MemoryManager
+            mm = MemoryManager(novel_name)
+            chars = mm.load_characters()
+            char_text_parts = []
+            for c in chars:
+                parts = [f"【{c['name']}】"]
+                if c.get('role'):
+                    parts.append(f"身份：{c['role']}")
+                if c.get('personality'):
+                    parts.append(f"性格：{c['personality']}")
+                if c.get('secret'):
+                    parts.append(f"秘密：{c['secret']}")
+                char_text_parts.append("；".join(parts))
+            character_profiles = "\n".join(char_text_parts) if char_text_parts else "暂无人物档案"
+        except Exception:
+            character_profiles = "暂无人物档案"
+
+        review = review_outline_foreshadow(novel_name, suggestions, outline_text, character_profiles)
+        _print_review_table(suggestions, review)
+
+        count = 0
+        skipped = 0
+        for i, s in enumerate(suggestions):
+            r = review.get(i, {"passed": True})
+            if not r["passed"]:
+                skipped += 1
+                continue
+            desc = (s.get("description") or "").strip()
+            if not desc:
+                continue
+            add_outline_foreshadow(
+                novel_name,
+                description=desc,
+                category=s.get("category", "情节伏笔"),
+                plant_chapter=int(s.get("plant_chapter", 0)),
+                resolve_chapter=int(s.get("resolve_chapter", 0)),
+                importance=int(s.get("importance", 3)),
+            )
+            count += 1
+        if skipped > 0:
+            print(f"  [提示] 跳过 {skipped} 条未通过审稿的伏笔")
+        print(f"  [OK] 自动生成并录入 {count} 条大纲伏笔（审稿通过）")
+        return count
+
+    return len(list_outline_foreshadow(novel_name))
+
+
+def review_outline_foreshadow(novel_name, suggestions, outline_text, character_profiles):
+    """审稿模型审查伏笔建议的质量，检测生硬/OOC/基调一致性/分布合理性。
+
+    Args:
+        novel_name: 小说名
+        suggestions: AI生成的伏笔建议列表
+        outline_text: 大纲文本
+        character_profiles: 人物档案文本
+
+    Returns:
+        dict: {index: {"passed": bool, "issues": [str], "suggestion": str}}
+    """
+    suggestions_text = json.dumps(suggestions, ensure_ascii=False, indent=2)
+
+    system_prompt = (
+        "你是专业的网络小说审稿师，专精伏笔质量控制。\n"
+        "请逐一审查以下伏笔建议，检查四个维度：\n"
+        "1. 生硬：伏笔是否过于刻意、矫揉造作，不自然\n"
+        "2. OOC：伏笔是否违反人物设定（需对照人物档案判断）\n"
+        "3. 基调一致性：伏笔是否与大纲的整体氛围、风格一致\n"
+        "4. 分布合理性：伏笔的埋入章节是否分布均匀，是否过于集中\n\n"
+        "审查规则：\n"
+        "- 只要任一维度不通过，该伏笔就判定为不通过(passed=false)\n"
+        "- 给出具体的问题描述和建议\n"
+        "- 严格输出JSON对象，key为序号(整数)，不要任何其他内容"
+    )
+
+    user_message = (
+        f"=== 小说大纲 ===\n{outline_text}\n\n"
+        f"=== 人物档案 ===\n{character_profiles}\n\n"
+        f"=== 伏笔建议列表 ===\n{suggestions_text}\n\n"
+        "请逐一审查上述伏笔，输出JSON对象：\n"
+        '{\n'
+        '  "1": {"passed": true, "issues": [], "suggestion": ""},\n'
+        '  "2": {"passed": false, "issues": ["生硬：..."], "suggestion": "建议改为..."},\n'
+        '  ...\n'
+        '}'
+    )
+
+    print("  正在调用审稿模型审查伏笔质量，请稍候...")
+    try:
+        from core.api_client import call_reviewer_api
+        raw = call_reviewer_api(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            max_tokens=4096,
+            temperature=0.3,
+        )
+    except Exception as e:
+        print(f"  [警告] 审稿API调用失败：{e}，跳过审查")
+        return {i: {"passed": True, "issues": [], "suggestion": ""} for i in range(len(suggestions))}
+
+    raw_clean = re.sub(
+        r'[<\u2039]think[>\u203a]?[\s\S]*?[<\u2039]\/think[>\u203a]?', '',
+        raw, flags=re.DOTALL
+    ).strip()
+    json_match = re.search(r'\{.*\}', raw_clean, re.DOTALL)
+    if not json_match:
+        print("  [警告] 审稿返回中未找到JSON，跳过审查")
+        return {i: {"passed": True, "issues": [], "suggestion": ""} for i in range(len(suggestions))}
+
+    try:
+        review_data = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        print("  [警告] 审稿JSON解析失败，跳过审查")
+        return {i: {"passed": True, "issues": [], "suggestion": ""} for i in range(len(suggestions))}
+
+    result = {}
+    for k, v in review_data.items():
+        try:
+            idx = int(k) - 1
+        except (ValueError, TypeError):
+            continue
+        result[idx] = {
+            "passed": bool(v.get("passed", True)),
+            "issues": v.get("issues", []) if isinstance(v.get("issues"), list) else [],
+            "suggestion": str(v.get("suggestion", "") or ""),
+        }
+
+    for i in range(len(suggestions)):
+        if i not in result:
+            result[i] = {"passed": True, "issues": [], "suggestion": ""}
+
+    return result
+
+
+def _print_review_table(suggestions, review):
+    """打印审稿结果表格。"""
+    print(f"\n  {'─' * 70}")
+    print(f"  {'审稿结果':^30}")
+    print(f"  {'─' * 70}")
+    header = f"  {'序号':<5}{'审查结果':<8}{'问题'}"
+    print(header)
+    print("  " + "─" * 70)
+    passed_count = 0
+    failed_count = 0
+    for i, s in enumerate(suggestions, 1):
+        r = review.get(i - 1, {"passed": True, "issues": [], "suggestion": ""})
+        desc = (s.get("description", "") or "")[:30]
+        if r["passed"]:
+            passed_count += 1
+            print(f"  {i:<5}{'✅ 通过':<8}{desc}")
+        else:
+            failed_count += 1
+            issues_str = "；".join(r["issues"][:2])
+            suggestion_str = r["suggestion"][:40]
+            print(f"  {i:<5}{'❌ 不通过':<8}{desc}")
+            if issues_str:
+                print(f"       {'':<8}问题：{issues_str}")
+            if suggestion_str:
+                print(f"       {'':<8}建议：{suggestion_str}")
+    print(f"\n  审查统计：通过 {passed_count} 条，不通过 {failed_count} 条")
+    return passed_count, failed_count
 
 
 # ==================== 交互菜单 ====================

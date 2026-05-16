@@ -97,7 +97,8 @@ def _build_outline_prompt(target_chapters: int) -> str:
 def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
                              start: int = 1,
                              prev_chapter_ending: str = "",
-                             urgent_foreshadowing: list = None) -> str:
+                             urgent_foreshadowing: list = None,
+                             novel_name: str = "") -> str:
     if start == 1:
         chapter_range = f"前{first_batch}章"
     else:
@@ -113,7 +114,7 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 """
         ending_rule = "\n6. 如果提供了【上章结尾悬念】，第一章任务卡必须与该悬念逻辑衔接，确保情节不断裂"
 
-    return f"""根据以下小说大纲，生成{chapter_range}的章节任务卡。
+    prompt = f"""根据以下小说大纲，生成{chapter_range}的章节任务卡。
 
 全书目标总章数为{full_target}章，请据此控制每章推进幅度，不要赶进度。
 
@@ -137,7 +138,6 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 
 情绪标签只能从以下5个中选1个：铺垫 / 冲突 / 爽点 / 低谷 / 反转"""
 
-    # 追加强制兑现伏笔块
     if urgent_foreshadowing:
         fs_lines = []
         for f in urgent_foreshadowing:
@@ -152,13 +152,18 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 以下伏笔沉睡过久，请在本批任务卡中安排至少1-2个章节明确兑现：
 {fs_block}"""
 
+    if novel_name:
+        prompt = _add_outline_fs_to_prompt(prompt, novel_name, start,
+                                           start + first_batch - 1)
+
     return prompt
 
 
 def _build_extend_task_prompt(from_chapter: int, end_chapter: int,
                               full_target: int, outline: str,
                               prev_chapter_ending: str = "",
-                              urgent_foreshadowing: list = None) -> str:
+                              urgent_foreshadowing: list = None,
+                              novel_name: str = "") -> str:
     ending_block = ""
     ending_rule = ""
     if prev_chapter_ending:
@@ -169,7 +174,7 @@ def _build_extend_task_prompt(from_chapter: int, end_chapter: int,
 """
         ending_rule = "\n5. 如果提供了【上章结尾悬念】，第一章任务卡必须与该悬念逻辑衔接，确保情节不断裂"
 
-    return f"""根据以下大纲，生成第{from_chapter}章到第{end_chapter}章的任务卡。
+    prompt = f"""根据以下大纲，生成第{from_chapter}章到第{end_chapter}章的任务卡。
 全书目标总章数为{full_target}章，当前进行到中段，请据此控制推进节奏。
 
 任务卡规则：
@@ -190,7 +195,6 @@ JSON格式：
 ]
 情绪标签只能从：铺垫 / 冲突 / 爽点 / 低谷 / 反转 中选1个"""
 
-    # 追加强制兑现伏笔块
     if urgent_foreshadowing:
         fs_lines = []
         for f in urgent_foreshadowing:
@@ -205,7 +209,55 @@ JSON格式：
 以下伏笔沉睡过久，请在本批任务卡中安排至少1-2个章节明确兑现：
 {fs_block}"""
 
+    if novel_name:
+        prompt = _add_outline_fs_to_prompt(prompt, novel_name, from_chapter,
+                                           end_chapter)
+
     return prompt
+
+
+def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
+                               chapter_from: int, chapter_to: int) -> str:
+    """从 outline_foreshadowing 表查询批次范围内的伏笔，追加到 prompt 中。
+
+    批次超过 60 章时仅注入前 60 章的伏笔，避免 prompt 溢出。
+    """
+    try:
+        from core.outline_manager import get_chapter_outline_tasks
+        actual_to = min(chapter_to, chapter_from + 59)
+        all_plant = []
+        all_resolve = []
+        for ch in range(chapter_from, actual_to + 1):
+            tasks = get_chapter_outline_tasks(novel_name, ch)
+            for item in tasks.get("to_plant", []):
+                item["_chapter"] = ch
+                all_plant.append(item)
+            for item in tasks.get("to_resolve", []):
+                item["_chapter"] = ch
+                all_resolve.append(item)
+        if not all_plant and not all_resolve:
+            return prompt
+        lines = ["\n【大纲伏笔任务（各章必须执行的埋入/兑现）】"]
+        if all_plant:
+            lines.append("以下为各章需要埋入的伏笔：")
+            for t in all_plant:
+                lines.append(
+                    f"  第{t['_chapter']}章必须埋入: {t['fid']} "
+                    f"{t['description']} (重要度{t['importance']})"
+                )
+        if all_resolve:
+            lines.append("以下为各章需要兑现的伏笔：")
+            for t in all_resolve:
+                lines.append(
+                    f"  第{t['_chapter']}章必须兑现: {t['fid']} "
+                    f"{t['description']} (重要度{t['importance']})"
+                )
+        if actual_to < chapter_to:
+            lines.append(f"(第{actual_to + 1}章及之后的伏笔将在后续批次中注入)")
+        lines.append("请务必将上述伏笔要求写入对应章节的 plot_goal。")
+        return prompt + "\n" + "\n".join(lines)
+    except Exception:
+        return prompt
 
 
 # ==================== 交互工具 ====================
@@ -653,9 +705,10 @@ def split_outline_to_tasks(outline: str, novel_name: str,
             first_batch, full_target, outline, start=start,
             prev_chapter_ending=prev_ending,
             urgent_foreshadowing=urgent_fs,
+            novel_name=novel_name,
         ),
         temperature=0.7,
-        max_tokens=8000 if first_batch > 100 else 4000,
+        max_tokens=8000 if first_batch > 100 else 8000,
     )
 
     match = re.search(r'\[.*\]', raw, re.DOTALL)
@@ -712,6 +765,7 @@ def split_outline_to_tasks(outline: str, novel_name: str,
                 shortage, shortage, outline, start=start_chapter,
                 prev_chapter_ending=prev_ending,
                 urgent_foreshadowing=urgent_fs,
+                novel_name=novel_name,
             ),
             temperature=0.7,
             max_tokens=8000,
@@ -781,17 +835,20 @@ def extend_tasks(novel_name: str, from_chapter: int):
             from_chapter, end_chapter, full_target or end_chapter, outline,
             prev_chapter_ending=prev_ending,
             urgent_foreshadowing=urgent_fs,
+            novel_name=novel_name,
         ),
         temperature=0.7,
-        max_tokens=4000,
+        max_tokens=12000,
     )
 
     match = re.search(r'\[.*\]', raw, re.DOTALL)
     if not match:
+        print(f"  [警告] AI 返回中未找到 JSON 数组，跳过扩展")
         return
     try:
         tasks = json.loads(match.group())
     except Exception:
+        print(f"  [警告] JSON 解析失败，跳过扩展")
         return
 
     valid_tags = ["铺垫", "冲突", "爽点", "低谷", "反转"]
@@ -1004,9 +1061,15 @@ def run_planner(novel_name: str, genre: str, keywords: str) -> tuple:
     )
     print("  [OK] 大纲已保存")
 
+    # Step 1.5：确定草稿审阅模式（影响伏笔生成和后续步骤的交互方式）
+    review_mode = _choose_draft_review_mode()
+
+    # Step 1.6：大纲伏笔生成（基于大纲自动设计伏笔并录入）
+    from core.outline_manager import generate_outline_foreshadow
+    generate_outline_foreshadow(novel_name, target_chapters, review_mode=review_mode)
+
     # Step 2：角色名单
     character_names = get_characters_choice(outline)
-    review_mode = _choose_draft_review_mode()
 
     # Step 3：世界观
     world = generate_world(

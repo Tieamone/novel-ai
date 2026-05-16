@@ -626,15 +626,16 @@ def _save_chapter_memory(novel_name: str, chapter_num: int,
             )
             print(f"  [OK] 关系更新（双向）：{name} ↔ {with_name} → {new_rel}")
 
-    for f in data.get("new_foreshadowing", []):
-        fid = f.get("fid", "")
-        desc = f.get("description", "")
-        redeem = f.get("expected_redeem", "待定")
-        if not redeem or redeem.strip() in ("待定", "", "未定", "暂定"):
-            redeem = f"第{chapter_num+10}-{chapter_num+20}章"
-        if fid and desc:
-            mm.add_foreshadowing(fid, chapter_num, desc, redeem)
-            print(f"  [OK] 新伏笔：{desc[:30]}...")
+    # 2026-05 伏笔系统改造：禁自动提取动态伏笔，改用大纲伏笔。旧代码保留以备回滚
+    # for f in data.get("new_foreshadowing", []):
+    #     fid = f.get("fid", "")
+    #     desc = f.get("description", "")
+    #     redeem = f.get("expected_redeem", "待定")
+    #     if not redeem or redeem.strip() in ("待定", "", "未定", "暂定"):
+    #         redeem = f"第{chapter_num+10}-{chapter_num+20}章"
+    #     if fid and desc:
+    #         mm.add_foreshadowing(fid, chapter_num, desc, redeem)
+    #         print(f"  [OK] 新伏笔：{desc[:30]}...")
 
     for fid in data.get("redeemed_foreshadowing", []):
         if fid:
@@ -1913,6 +1914,9 @@ def main():
                 (mm.data_dir / "target_chapters.txt").write_text(
                     str(target_chapters), encoding="utf-8"
                 )
+
+                from core.outline_manager import generate_outline_foreshadow
+                generate_outline_foreshadow(novel_name, target_chapters, review_mode=False)
 
                 split_outline_to_tasks(
                     import_data.get("outline", ""), novel_name,
