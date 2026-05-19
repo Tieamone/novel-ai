@@ -2,12 +2,44 @@
 
 ## 当前上下文
 
-**时间**: 2026-05-14
-**任务**: 修复导入流程缺失大纲伏笔生成
+**时间**: 2026-05-19
+**任务**: 竞品分析 → 筛选可引入的优化点 → 创建优化方案文档
 
 ## 本次完成的工作
 
-### 2026-05-14 (3): 修复导入流程缺失大纲伏笔生成
+### 2026-05-19 (3): 竞品分析 + 优化方案文档
+
+- **分析对象**: Narcooo/inkos（6.2k⭐）、NousResearch/autonovel（952⭐）、RhythmicWave/NovelForge（847⭐）
+- **筛选原则**: 只保留与 Python CLI 技术栈兼容 + 能直接提升输出稳定性的优化点
+- **输出**: [docs/newidea.md](file:///d:/novel-ai/docs/newidea.md) — 包含 5 个通过筛选的建议 + 10 个排除项及理由
+- **核心结论**:
+  - ✅ 采纳（按优先级）：平台期检测、输入治理控制面、Anti-Slop 三层升级、文法指纹分析、对抗性精简
+  - ❌ 排除：卡片式 UI、工作流系统（架构不兼容）；EPUB 导出、多模型路由（不提升输出质量）；封面/有声书（偏离核心目标）
+- **Phase 1 建议先行实施**：平台期检测（20行）+ 输入治理控制面（80行），投入极小、立竿见影
+
+### 2026-05-19 (2): PROJECT_PROFILE.md 白皮书信息更新
+
+- **背景**: 用户反馈白皮书信息落后，要求全面阅读项目后更新
+- **读取内容**:
+  - 完整阅读 [docs/PROJECT_PROFILE.md](file:///d:/novel-ai/docs/PROJECT_PROFILE.md)（当前白皮书）
+  - 完整阅读 [docs/AI_CONTEXT.md](file:///d:/novel-ai/docs/AI_CONTEXT.md)（历史上下文）
+  - 扫描目录结构，读取 [main.py](file:///d:/novel-ai/main.py), [core/api_client.py](file:///d:/novel-ai/core/api_client.py), [core/writer.py](file:///d:/novel-ai/core/writer.py), [core/reviewer.py](file:///d:/novel-ai/core/reviewer.py), [core/planner.py](file:///d:/novel-ai/core/planner.py), [core/memory_manager.py](file:///d:/novel-ai/core/memory_manager.py), [core/outline_manager.py](file:///d:/novel-ai/core/outline_manager.py), [core/db.py](file:///d:/novel-ai/core/db.py), [config.yaml](file:///d:/novel-ai/config.yaml), [requirements.txt](file:///d:/novel-ai/requirements.txt)
+  - 统计所有核心文件行数（排除 venv）
+- **更新内容**:
+  1. **项目概况**: 代码量 ~7500+ → ~10300+ 行，标注依赖版本见 requirements.txt
+  2. **目录结构**: 更新所有模块行数标注，新增 newbook_template.txt、requirements.txt、pytest.ini、check_dashscope.py、tools/cleanup_foreshadow.py、core/__init__.py、data/custom_models.json
+  3. **模块接口**: outline_manager.py (660+ → 839 行) 新增 review_outline_foreshadow()、CJK 宽度处理工具、交互式子函数；其他模块更新精确行数
+  4. **config.yaml 配置项**: 新增 novel.batch_size_small/medium/large、novel.batch_bridge_count 配置项说明
+  5. **已完成功能**: 新增 6 项（单章/批量删除、导入伏笔生成、模型分类、依赖锁定、测试配置、伏笔清理工具）
+  6. **待办事项**: P1 中移除"依赖版本锁定"（已完成）
+
+## 下一步计划
+- 伏笔系统改造后续步骤（大纲伏笔集成到写作流程）
+- 用户确认 P0 优先级的修复范围后开始实施
+
+---
+
+### 历史: 2026-05-14 (3): 修复导入流程缺失大纲伏笔生成
 
 - **问题**: 从 `newbook.txt` 导入小说时，`generate_outline_foreshadow()` 被完全跳过
 - **对比**:
