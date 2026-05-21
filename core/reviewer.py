@@ -670,22 +670,6 @@ def review_chapter(novel_name: str, chapter_num: int,
         increment_failure_counter("reviewer")
     else:
         reset_failure_counter("reviewer")
-        # 审稿通过 → 自动更新大纲伏笔状态
-        try:
-            from core.outline_manager import (
-                get_chapter_outline_tasks, mark_outline_foreshadow_status)
-            outline_tasks = get_chapter_outline_tasks(novel_name, chapter_num)
-            updated = []
-            for t in outline_tasks.get("to_resolve", []):
-                if mark_outline_foreshadow_status(novel_name, t["fid"], "resolved"):
-                    updated.append(f"{t['fid']}→resolved")
-            for t in outline_tasks.get("to_plant", []):
-                if mark_outline_foreshadow_status(novel_name, t["fid"], "planted"):
-                    updated.append(f"{t['fid']}→planted")
-            if updated:
-                print(f"  [大纲伏笔] 已更新: {', '.join(updated)}")
-        except Exception:
-            pass
 
     return result
 
@@ -714,6 +698,18 @@ def _increment_retry_safe(novel_name: str, chapter_num: int):
             """, (chapter_num,))
 
 
+
+_OUTLINE_STOPWORDS = frozenset([
+    "一个", "这个", "那个", "没有", "不是", "就是", "也是", "还是", "但是",
+    "然后", "因为", "所以", "如果", "可以", "已经", "他们", "她们", "自己",
+    "什么", "怎么", "知道", "发现", "开始", "觉得", "看到", "来到", "出来",
+    "起来", "下来", "回来", "过来", "到了", "的是", "不了", "之中", "之后",
+    "之前", "突然", "虽然", "然而", "于是", "可能", "有些", "这些", "那些",
+    "所有", "一切", "非常", "只是", "这样", "那样", "一样", "成为", "存在",
+    "出现", "不会", "不能", "不得", "他的", "她的", "它的", "我的",
+    "你的", "我们", "你们", "这里", "那里", "里面", "外面", "上面", "下面",
+])
+
 def _sync_outline_foreshadow(novel_name: str, chapter_num: int, content: str):
     """审稿通过后同步大纲伏笔状态：埋入项标为 planted，兑现项检查关键词自动 resolved。"""
     try:
@@ -729,11 +725,12 @@ def _sync_outline_foreshadow(novel_name: str, chapter_num: int, content: str):
             print(f"  [大纲伏笔] {t['fid']} 状态: planned → planted (第{chapter_num}章埋入)")
         for t in to_resolve:
             desc = (t.get("description") or "").lower()
-            keywords = [w for w in _split_re.split(desc) if len(w) >= 2]
+            keywords = [w for w in _split_re.split(desc)
+                        if len(w) >= 2 and w not in _OUTLINE_STOPWORDS]
             if not keywords:
                 continue
             matched = sum(1 for kw in keywords if kw in content_lower)
-            if matched >= min(3, len(keywords)) and (matched / max(len(keywords), 1)) >= 0.5:
+            if matched >= max(3, len(keywords) * 0.6):
                 mark_outline_foreshadow_status(novel_name, t["fid"], "resolved")
                 print(f"  [大纲伏笔] {t['fid']} 状态 → resolved (第{chapter_num}章兑现)")
             else:
@@ -746,17 +743,15 @@ def _auto_redeem_foreshadowing(mm: MemoryManager, chapter_num: int, content: str
     """章节审核通过后，检查逾期伏笔（priority=0），若正文包含相关关键词则自动兑现。"""
     if not content:
         return
-    try:
-        hints = mm.get_foreshadow_hints(chapter_num)
-    except Exception:
-        return
-    if not hints:
+
+    active = mm.load_active_foreshadowing()
+    if not active:
         return
 
-    # 从 hints 中提取 priority=0 的伏笔描述，与 active foreshadowing 做匹配
-    active = mm.load_active_foreshadowing()
     content_lower = content.lower()
+    _split_re = re.compile(r'[，。、；：！？\s,.;:!?\\/\-—()\[\]【】“”‘’]+')
     redeemed_any = False
+    overdue_count = 0
 
     for f in active:
         desc = (f.get("description") or "").strip()
@@ -764,29 +759,33 @@ def _auto_redeem_foreshadowing(mm: MemoryManager, chapter_num: int, content: str
         if not desc or not fid:
             continue
 
-        # 检查该伏笔是否在 priority=0 的 hints 中（逾期/应兑现）
+        # 直接计算是否逾期/应兑现（不依赖 hints 字符串匹配）
+        expected = (f.get("expected_redeem") or "待定").strip()
         is_overdue = False
-        for hint_str in hints:
-            if desc[:20] in hint_str and ("逾期" in hint_str or "应兑现" in hint_str):
-                is_overdue = True
-                break
+        if expected and expected != "待定":
+            range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected)
+            if range_match:
+                s, e = int(range_match.group(1)), int(range_match.group(2))
+                if chapter_num > e or s <= chapter_num <= e:
+                    is_overdue = True
+            else:
+                single = re.search(r'第?(\d+)', expected)
+                if single:
+                    t = int(single.group(1))
+                    if chapter_num > t or abs(t - chapter_num) <= 3:
+                        is_overdue = True
         if not is_overdue:
             continue
+        overdue_count += 1
 
         # 从伏笔描述中提取关键词
-        # 排除常见人名/地名词（长度<=3的纯名词高频词）
-        _name_like = re.compile(r'^[一-鿿]{2,3}$')
-        _split_re = re.compile(r'[，。、；：！？\s,.;:!?\\/\-—()\[\]【】“”‘’]+')
         raw_words = [w for w in _split_re.split(desc) if len(w) >= 2]
-        keywords = [w for w in raw_words if not _name_like.match(w)]
-        if not keywords:
-            keywords = raw_words  # 全被过滤时回退，避免漏判
+        keywords = raw_words
         if not keywords:
             continue
 
         matched = sum(1 for kw in keywords if kw in content_lower)
         match_ratio = matched / len(keywords) if keywords else 0
-        # 需同时满足：至少匹配3个关键词 且 匹配比例>=50%
         if matched >= min(3, len(keywords)) and match_ratio >= 0.5:
             try:
                 mm.redeem_foreshadowing(fid, chapter_num)
@@ -795,11 +794,27 @@ def _auto_redeem_foreshadowing(mm: MemoryManager, chapter_num: int, content: str
             except Exception as e:
                 print(f"  [警告] 伏笔 {fid} 自动兑现失败：{e}")
 
-    if not redeemed_any:
-        # 检查是否有逾期伏笔但未匹配到关键词的情况
-        overdue_count = sum(1 for h in hints if "逾期" in h or "应兑现" in h)
-        if overdue_count > 0:
-            print(f"  [伏笔提示] 有 {overdue_count} 个逾期伏笔未在本章兑现，请关注后续章节")
+            # 同步检查大纲伏笔表中描述相似的条目
+            try:
+                from core.outline_manager import list_outline_foreshadow, mark_outline_foreshadow_status
+                outline_items = list_outline_foreshadow(mm.novel_name)
+                desc_lower = desc.lower()
+                for item in outline_items:
+                    if item.get("status") == "resolved":
+                        continue
+                    item_desc = (item.get("description") or "").lower()
+                    item_words = [w for w in _split_re.split(item_desc) if len(w) >= 2]
+                    if not item_words:
+                        continue
+                    overlap = sum(1 for w in item_words if w in desc_lower or desc_lower in w)
+                    if overlap >= max(2, len(item_words) * 0.5):
+                        mark_outline_foreshadow_status(mm.novel_name, item["fid"], "resolved")
+                        print(f"  [大纲伏笔同步] {item['fid']} → resolved")
+            except Exception:
+                pass
+
+    if not redeemed_any and overdue_count > 0:
+        print(f"  [伏笔提示] 有 {overdue_count} 个逾期伏笔未在本章兑现，请关注后续章节")
 
 
 def write_and_review(novel_name: str, chapter_num: int,
