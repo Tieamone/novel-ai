@@ -94,6 +94,113 @@ def _build_outline_prompt(target_chapters: int) -> str:
 7. 总字数800字以内，直接输出大纲内容"""
 
 
+def _extract_tasks_json(raw: str) -> list | None:
+    """从 AI 返回中提取任务卡 JSON 数组，含截断自动修复。
+
+    返回解析成功的 task list，失败返回 None。
+    """
+    if not raw or not raw.strip():
+        print("  [诊断] AI 返回为空")
+        return None
+
+    # 1. 正则提取 JSON 数组
+    match = re.search(r'\[.*\]', raw, re.DOTALL)
+    if not match:
+        print(f"  [诊断] 未在返回中找到 JSON 数组。开头100字: {raw[:100]}")
+        return None
+
+    json_str = match.group()
+
+    # 2. 尝试直接解析
+    try:
+        tasks = json.loads(json_str)
+        if isinstance(tasks, list):
+            return tasks
+    except json.JSONDecodeError:
+        pass
+
+    # 3. 截断恢复：JSON 不完整，尝试修复
+    print(f"  [诊断] JSON 解析失败（{len(json_str)} 字），尝试截断恢复...")
+    tasks = _repair_truncated_json(json_str)
+    if tasks is not None:
+        print(f"  [OK] 截断恢复成功，找回 {len(tasks)} 条任务卡")
+        return tasks
+
+    # 4. 全部失败，输出诊断信息
+    print(f"  [诊断] JSON 尾部 200 字: ...{json_str[-200:]}")
+    return None
+
+
+def _repair_truncated_json(json_str: str) -> list | None:
+    """尝试修复被 max_tokens 截断的 JSON 数组。
+
+    常见截断模式：
+    - 在字符串中间截断：{"chapter_num": 37, "plot_goal": "林风在废墟中
+    - 在对象中间截断：{"chapter_num": 37, "plot_goal": "...",
+    - 数组未闭合：...}  ← 缺少 ]
+    """
+    stripped = json_str.strip()
+
+    # 策略1：只缺结尾的 ]（最后一个对象完整）
+    if stripped.endswith('}') and not stripped.endswith(']'):
+        repaired = stripped + '\n]'
+        try:
+            tasks = json.loads(repaired)
+            if isinstance(tasks, list):
+                return tasks
+        except json.JSONDecodeError:
+            pass
+
+    # 策略2：在对象/字符串内部被截断 —— 找到最后一个完整的 "},"
+    # "}," 是 JSON 数组中完整对象的可靠标记（非最后一个元素）
+    last_complete = stripped.rfind('},')
+    if last_complete > 0:
+        truncated = stripped[:last_complete + 1]  # 保留到 "}"
+        truncated = truncated.rstrip(', \t\n\r')
+        repaired = truncated + '\n]'
+        try:
+            tasks = json.loads(repaired)
+            if isinstance(tasks, list):
+                return tasks
+        except json.JSONDecodeError:
+            pass
+
+    # 策略3：最后一条刚好完整（以 } 结尾但没有逗号），但缺 ]
+    # 找到倒数第二个 }（跳过最后一个完整对象的 }）
+    last_brace = stripped.rfind('}')
+    if last_brace > 0:
+        second_last = stripped.rfind('},', 0, last_brace)
+        if second_last > 0:
+            truncated = stripped[:second_last + 1]
+            truncated = truncated.rstrip(', \t\n\r')
+            repaired = truncated + '\n]'
+            try:
+                tasks = json.loads(repaired)
+                if isinstance(tasks, list):
+                    return tasks
+            except json.JSONDecodeError:
+                pass
+
+    # 策略4：激进修复 —— 移除拖尾碎片，尝试加 "}]" + "]"
+    # 去掉最后一行（通常是被截断的不完整行），补全结尾
+    lines = stripped.split('\n')
+    if len(lines) >= 3:
+        # 去掉最后不完整的行
+        while lines and not lines[-1].strip().rstrip(',').endswith('}'):
+            lines.pop()
+        if lines:
+            truncated = '\n'.join(lines).rstrip(', \t\n\r')
+            repaired = truncated + '\n]'
+            try:
+                tasks = json.loads(repaired)
+                if isinstance(tasks, list):
+                    return tasks
+            except json.JSONDecodeError:
+                pass
+
+    return None
+
+
 def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
                              start: int = 1,
                              prev_chapter_ending: str = "",
@@ -114,6 +221,12 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 """
         ending_rule = "\n6. 如果提供了【上章结尾悬念】，第一章任务卡必须与该悬念逻辑衔接，确保情节不断裂"
 
+    # 动态编号的新增规则（接在 ending_rule 之后）
+    ban_phrase = '禁止使用"继续推进剧情"、"进一步发展"、"主角有了新发现"等空泛表述作为 plot_goal'
+    fs_advice = '如果 prompt 中包含伏笔建议，请将其自然融入对应章节的 plot_goal，不要为此改变原有的剧情逻辑和节奏'
+    new_rule_base = 6 if not ending_rule else 7
+    new_rules = f"\n{new_rule_base}. {ban_phrase}\n{new_rule_base + 1}. {fs_advice}"
+
     prompt = f"""根据以下小说大纲，生成{chapter_range}的章节任务卡。
 
 全书目标总章数为{full_target}章，请据此控制每章推进幅度，不要赶进度。
@@ -123,7 +236,7 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 2. plot_goal要具体到场景级别：不是"主角继续调查"，而是"主角在废弃图书馆找到一本残缺日记，发现其中有自己名字"
 3. 情绪标签的分布要有节奏：不要连续超过3章都是同一个标签，要有起伏
 4. 前5章的任务卡要重点建立世界感和人物关系，不要急着上大冲突
-5. 每隔5-8章要安排一个"高潮/转折"节点（冲突/爽点/反转），保持读者追读动力{ending_rule}
+5. 每隔5-8章要安排一个"高潮/转折"节点（冲突/爽点/反转），保持读者追读动力{ending_rule}{new_rules}
 {ending_block}大纲：
 {outline}
 
@@ -217,13 +330,20 @@ JSON格式：
 
 
 def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
-                               chapter_from: int, chapter_to: int) -> str:
+                               chapter_from: int, chapter_to: int,
+                               inject_style: str = None) -> str:
     """从 outline_foreshadowing 表查询批次范围内的伏笔，追加到 prompt 中。
 
     批次超过 60 章时仅注入前 60 章的伏笔，避免 prompt 溢出。
+    inject_style: "forced" 强制语气 / "guided" 引导语气（默认从 config 读取）
     """
     try:
+        from collections import defaultdict
         from core.outline_manager import get_chapter_outline_tasks
+
+        if inject_style is None:
+            inject_style = cfg("novel", "foreshadow_injection_style", "guided")
+
         actual_to = min(chapter_to, chapter_from + 59)
         all_plant = []
         all_resolve = []
@@ -235,26 +355,92 @@ def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
             for item in tasks.get("to_resolve", []):
                 item["_chapter"] = ch
                 all_resolve.append(item)
+
         if not all_plant and not all_resolve:
             return prompt
-        lines = ["\n【大纲伏笔任务（各章必须执行的埋入/兑现）】"]
-        if all_plant:
-            lines.append("以下为各章需要埋入的伏笔：")
-            for t in all_plant:
-                lines.append(
-                    f"  第{t['_chapter']}章必须埋入: {t['fid']} "
-                    f"{t['description']} (重要度{t['importance']})"
+
+        # ── 伏笔密度控制 ──
+        max_per_ch = cfg("novel", "max_foreshadow_per_chapter", 2)
+        ch_items = defaultdict(list)
+        for item in all_plant:
+            ch_items[item["_chapter"]].append(item)
+        for item in all_resolve:
+            ch_items[item["_chapter"]].append(item)
+
+        for ch, items in ch_items.items():
+            total = len(items)
+            if total > max_per_ch:
+                items_sorted = sorted(
+                    items, key=lambda x: x.get("importance", 0), reverse=True
                 )
-        if all_resolve:
-            lines.append("以下为各章需要兑现的伏笔：")
-            for t in all_resolve:
-                lines.append(
-                    f"  第{t['_chapter']}章必须兑现: {t['fid']} "
-                    f"{t['description']} (重要度{t['importance']})"
+                dropped = items_sorted[max_per_ch:]
+                dropped_fids = [d["fid"] for d in dropped]
+                print(
+                    f"  [伏笔密度] 第{ch}章超限({total}个)，"
+                    f"保留重要度最高的{max_per_ch}个，"
+                    f"降级: {', '.join(dropped_fids)}"
                 )
+                dropped_keys = {(d["fid"], d["_chapter"]) for d in dropped}
+                all_plant = [
+                    t for t in all_plant
+                    if (t["fid"], t["_chapter"]) not in dropped_keys
+                ]
+                all_resolve = [
+                    t for t in all_resolve
+                    if (t["fid"], t["_chapter"]) not in dropped_keys
+                ]
+
+        if not all_plant and not all_resolve:
+            return prompt
+
+        # ── 构建提示 ──
+        is_forced = (inject_style == "forced")
+        if is_forced:
+            lines = ["\n【大纲伏笔任务（各章必须执行的埋入/兑现）】"]
+            if all_plant:
+                lines.append("以下为各章需要埋入的伏笔：")
+                for t in all_plant:
+                    lines.append(
+                        f"  第{t['_chapter']}章必须埋入: {t['fid']} "
+                        f"{t['description']} (重要度{t['importance']})"
+                    )
+            if all_resolve:
+                lines.append("以下为各章需要兑现的伏笔：")
+                for t in all_resolve:
+                    lines.append(
+                        f"  第{t['_chapter']}章必须兑现: {t['fid']} "
+                        f"{t['description']} (重要度{t['importance']})"
+                    )
+        else:
+            lines = ["\n【大纲伏笔任务（各章建议执行的埋入/兑现）】"]
+            if all_plant:
+                lines.append("以下为各章建议埋入的伏笔：")
+                for t in all_plant:
+                    lines.append(
+                        f"  第{t['_chapter']}章建议埋入: {t['fid']} "
+                        f"{t['description']} (★重要度{t['importance']})"
+                    )
+                    lines.append(
+                        "  融入提示：可以在场景描写或角色对话中不经意地提及"
+                    )
+            if all_resolve:
+                lines.append("以下为各章建议兑现的伏笔：")
+                for t in all_resolve:
+                    lines.append(
+                        f"  第{t['_chapter']}章建议兑现: {t['fid']} "
+                        f"{t['description']} (★重要度{t['importance']})"
+                    )
+                    lines.append(
+                        "  融入提示：可以在场景描写或角色对话中不经意地提及"
+                    )
+
         if actual_to < chapter_to:
             lines.append(f"(第{actual_to + 1}章及之后的伏笔将在后续批次中注入)")
         lines.append("请务必将上述伏笔要求写入对应章节的 plot_goal。")
+        if not is_forced:
+            lines.append(
+                "请以情节自然流畅为优先，不得为埋入伏笔而强行改变情节走向。"
+            )
         return prompt + "\n" + "\n".join(lines)
     except Exception:
         return prompt
@@ -660,6 +846,34 @@ def _get_urgent_foreshadowing(mm: MemoryManager, current_chapter: int,
 
 # ==================== Step 6：任务卡 ====================
 
+def _get_model_max_output() -> int:
+    """获取当前作者模型的最大输出 tokens，用于计算每批任务卡数量。
+    取不到则回退到 16000。
+    """
+    try:
+        from core.api_client import get_current_author_max_tokens
+        val = get_current_author_max_tokens()
+        if val and val > 0:
+            return val
+    except Exception:
+        pass
+    return 16000
+
+
+def _compute_batch_params(chapter_count: int) -> tuple:
+    """根据模型能力和章节数计算 (每批章数, 每批 max_tokens, 总批次数)。
+    - 每章约需 200 tokens
+    - 每批 ≥ 10 章
+    - 总批次数做向上取整
+    """
+    import math
+    model_max = _get_model_max_output()
+    per_batch = max(model_max // 200, 10)
+    batch_max_tokens = max(8000, model_max)
+    total_batches = math.ceil(chapter_count / per_batch)
+    return per_batch, batch_max_tokens, total_batches
+
+
 def split_outline_to_tasks(outline: str, novel_name: str,
                            review_mode: bool = False,
                            target_chapters: int = 0,
@@ -667,28 +881,122 @@ def split_outline_to_tasks(outline: str, novel_name: str,
                            start: int = 1):
     """
     将大纲拆分为章节任务卡。
-    target_chapters: 小说总目标章数（0表示使用config默认值）。
-                     第一批次任务卡数量 = min(target_chapters, pre_split_chapters)。
-    full_batch: 是否一次性生成全书任务卡（默认False保持分批行为）。
+
+    full_batch=True: 一次性生成全书任务卡。若模型吞吐量不足，提示用户
+                     换模型或降级为分批。
+    full_batch=False: 分批生成，每批大小由模型能力动态决定。
     """
     from core.utils import with_db_connection
-    pre_split = cfg("novel", "pre_split_chapters", 50)
+    import math
 
     if target_chapters > 0:
         if full_batch:
             first_batch = target_chapters
         else:
-            first_batch = min(target_chapters, pre_split)
+            first_batch = min(target_chapters, cfg("novel", "pre_split_chapters", 50))
         full_target = target_chapters
     else:
-        first_batch = pre_split
-        full_target = pre_split
+        first_batch = cfg("novel", "pre_split_chapters", 50)
+        full_target = first_batch
 
+    # ── 模型能力检查 ──────────────────────────────────
+    per_batch, batch_max_tokens, total_batches = _compute_batch_params(first_batch)
+
+    if full_batch and first_batch > per_batch:
+        model_max = _get_model_max_output()
+        print(f"\n  {'='*55}")
+        print(f"  [模型吞吐量不足]")
+        print(f"  当前模型最大输出: {model_max} tokens")
+        print(f"  全量生成 {first_batch} 章约需: {first_batch * 200} tokens")
+        print(f"  最大单批能力: {per_batch} 章/批")
+        print(f"  {'='*55}")
+        print(f"  1. 切换模型（选择吞吐量更大的模型）")
+        print(f"  2. 改为分批生成（每批 {per_batch} 章，共 {total_batches} 批）")
+        print(f"  3. 取消")
+        choice = input("\n  请选择（默认2）：").strip() or "2"
+
+        if choice == "1":
+            from core.api_client import select_all_models_interactive, _select_single_model
+            print("\n  [提示] 请选择 max_output_tokens 较大的模型（如 qwen3.6-plus 或 glm-5.1）")
+            author_choice = _select_single_model("作者模型", default="1", usage="author")
+            from core.api_client import set_author_model
+            set_author_model(author_choice["model"], author_choice["provider"])
+            # 重新计算
+            per_batch, batch_max_tokens, total_batches = _compute_batch_params(first_batch)
+            if first_batch > per_batch:
+                print(f"\n  切换后仍不够（{first_batch}章 > 每批{per_batch}章），将自动分批生成。")
+                full_batch = False
+            else:
+                print(f"\n  [OK] 切换后可以一次性生成全部 {first_batch} 章")
+        elif choice == "3":
+            print("  [取消] 跳过任务卡生成")
+            return 0
+        else:
+            print(f"\n  将分批生成，每批 {per_batch} 章，共 {total_batches} 批")
+            full_batch = False
+
+    # ── 生成任务卡 ─────────────────────────────────────
     if full_batch:
         print(f"\n  正在一次性生成全部{first_batch}章任务卡（全书目标：{full_target}章）...")
+        batch_tokens = max(8000, min(first_batch * 200, batch_max_tokens))
+        print(f"  max_tokens={batch_tokens}，模型上限={_get_model_max_output()}")
+        saved = _generate_single_batch(
+            outline, novel_name, first_batch, full_target,
+            start=start, max_tokens=batch_tokens,
+            novel_name_for_fs=novel_name,
+            review_mode=review_mode,
+        )
+        if saved < first_batch:
+            saved = _supplement_tasks(
+                outline, novel_name, first_batch, full_target, saved
+            )
     else:
-        print(f"\n  正在将大纲拆分为前{first_batch}章任务卡"
-              f"（全书目标：{full_target}章）...")
+        # 分批生成：把章节分成多批，每批用独立 API 调用
+        saved = 0
+        for batch_idx in range(total_batches):
+            batch_start = start + batch_idx * per_batch
+            batch_count = min(per_batch, first_batch - batch_idx * per_batch)
+            batch_end = batch_start + batch_count - 1
+
+            print(f"\n  [{batch_idx+1}/{total_batches}] 正在生成第{batch_start}-{batch_end}章任务卡...")
+            batch_saved = _generate_single_batch(
+                outline, novel_name, batch_count, full_target,
+                start=batch_start, max_tokens=batch_max_tokens,
+                novel_name_for_fs=novel_name,
+                review_mode=review_mode,
+            )
+            saved += batch_saved
+            if batch_saved < batch_count:
+                saved = _supplement_tasks(
+                    outline, novel_name, batch_count, full_target,
+                    saved + (batch_start - start),
+                    batch_start=batch_start,
+                )
+
+        if total_batches > 1:
+            print(f"\n  [OK] 分批生成完成！总计 {saved} 个章节任务卡（{total_batches}批）")
+        else:
+            print(f"\n  [OK] 已生成 {saved} 个章节任务卡")
+
+    # ── 任务卡序列整体节奏报告 ──────────────────────────────
+    if saved > 0 and cfg("novel", "task_card_review_enabled", True):
+        from core.task_card_reviewer import generate_rhythm_report
+        try:
+            report = generate_rhythm_report(novel_name)
+            print("\n" + report)
+        except Exception as e:
+            print(f"  [节奏报告] 生成失败（非致命）：{e}")
+
+    return saved
+
+
+def _generate_single_batch(outline: str, novel_name: str,
+                           batch_count: int, full_target: int,
+                           start: int = 1, max_tokens: int = 8000,
+                           novel_name_for_fs: str = "",
+                           review_mode: bool = False) -> int:
+    """单次 API 调用生成一批任务卡，返回保存数量。"""
+    from core.utils import with_db_connection
 
     prev_ending = ""
     urgent_fs = []
@@ -699,34 +1007,58 @@ def split_outline_to_tasks(outline: str, novel_name: str,
         if urgent_fs:
             print(f"  [伏笔] 检测到 {len(urgent_fs)} 个沉睡伏笔，将在任务卡中强制安排兑现")
 
-    raw = call_author_api(
-        system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
-        user_message=_build_task_split_prompt(
-            first_batch, full_target, outline, start=start,
-            prev_chapter_ending=prev_ending,
-            urgent_foreshadowing=urgent_fs,
-            novel_name=novel_name,
-        ),
-        temperature=0.7,
-        max_tokens=8000 if first_batch > 100 else 8000,
-    )
-
-    match = re.search(r'\[.*\]', raw, re.DOTALL)
-    if not match:
-        print("  [警告] 任务卡解析失败，将使用实时分析模式")
+    for attempt in range(2):
+        raw = call_author_api(
+            system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
+            user_message=_build_task_split_prompt(
+                batch_count, full_target, outline, start=start,
+                prev_chapter_ending=prev_ending,
+                urgent_foreshadowing=urgent_fs,
+                novel_name=novel_name_for_fs,
+            ),
+            temperature=0.7,
+            max_tokens=max_tokens,
+        )
+        tasks = _extract_tasks_json(raw)
+        if tasks is not None:
+            break
+        if attempt == 0:
+            print("  [重试] 首次解析失败，尝试重新生成...")
+    else:
+        print("  [警告] 解析失败（已重试），跳过本批")
         return 0
 
-    try:
-        tasks = json.loads(match.group())
-    except Exception:
-        print("  [警告] 任务卡JSON解析失败，将使用实时分析模式")
-        return 0
+    # ── 任务卡质量审核 ──────────────────────────────────────
+    if cfg("novel", "task_card_review_enabled", True):
+        try:
+            from core.task_card_reviewer import review_task_cards, revise_task_cards
+            print(f"  [任务卡审核] 第{start}章-第{start + len(tasks) - 1}章 审核中...")
+            review_result = review_task_cards(novel_name, tasks, outline, start)
 
-    if review_mode:
-        tasks = _confirm_json_draft("任务卡JSON", tasks, 5)
-    if not isinstance(tasks, list):
-        print("  [警告] 任务卡不是列表结构，将使用实时分析模式")
-        return 0
+            if review_result.get("pass"):
+                pass  # 审核通过，继续入库
+            else:
+                # 审核不通过，自动修正一次
+                print(f"  [修正] 审核未通过({review_result.get('score_total', 0)}/40)，自动修正中...")
+                tasks = revise_task_cards(novel_name, tasks, review_result, outline)
+                # 重新审核
+                review_result2 = review_task_cards(novel_name, tasks, outline, start)
+                if not review_result2.get("pass"):
+                    if review_mode:
+                        # 交互模式：让用户选择
+                        print(f"  [警告] 修正后审核仍未通过({review_result2.get('score_total', 0)}/40)")
+                        print("  1. 接受当前任务卡（强制入库）")
+                        print("  2. 丢弃本批任务卡")
+                        choice = input("  请选择（默认1）：").strip() or "1"
+                        if choice == "2":
+                            return 0
+                    else:
+                        print(
+                            f"  [警告] 审核未通过({review_result2.get('score_total', 0)}/40)，"
+                            f"修正后仍未达标，继续入库"
+                        )
+        except Exception as e:
+            print(f"  [警告] 任务卡审核异常（非致命）：{e}，跳过审核直接入库")
 
     valid_tags = ["铺垫", "冲突", "爽点", "低谷", "反转"]
     with with_db_connection(novel_name) as conn:
@@ -745,62 +1077,84 @@ def split_outline_to_tasks(outline: str, novel_name: str,
                 """, (chapter_num, plot_goal, emotion_tag))
                 saved += 1
         conn.commit()
-    print(f"  [OK] 已生成 {saved} 个章节任务卡")
-
-    if full_batch and saved < first_batch:
-        shortage = first_batch - saved
-        print(f"\n  [提示] 任务卡数量不足（{saved}/{first_batch}），正在补充{shortage}章...")
-        start_chapter = saved + 1
-
-        prev_ending = ""
-        urgent_fs = []
-        if start_chapter > 1:
-            mm_tmp = MemoryManager(novel_name)
-            prev_ending = mm_tmp.get_last_chapter_ending(start_chapter, chars=400)
-            urgent_fs = _get_urgent_foreshadowing(mm_tmp, start_chapter)
-
-        supplement_raw = call_author_api(
-            system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
-            user_message=_build_task_split_prompt(
-                shortage, shortage, outline, start=start_chapter,
-                prev_chapter_ending=prev_ending,
-                urgent_foreshadowing=urgent_fs,
-                novel_name=novel_name,
-            ),
-            temperature=0.7,
-            max_tokens=8000,
-        )
-
-        sup_match = re.search(r'\[.*\]', supplement_raw, re.DOTALL)
-        if sup_match:
-            try:
-                sup_tasks = json.loads(sup_match.group())
-                if isinstance(sup_tasks, list):
-                    with with_db_connection(novel_name) as conn:
-                        for task in sup_tasks:
-                            chapter_num = task.get("chapter_num")
-                            plot_goal = task.get("plot_goal", "").strip()
-                            emotion_tag = task.get("emotion_tag", "铺垫").strip()
-                            if emotion_tag not in valid_tags:
-                                emotion_tag = "铺垫"
-                            if chapter_num and plot_goal:
-                                conn.execute("""
-                                    INSERT OR REPLACE INTO chapter_tasks
-                                    (chapter_num, plot_goal, emotion_tag, status)
-                                    VALUES (?, ?, ?, '待处理')
-                                """, (chapter_num, plot_goal, emotion_tag))
-                                saved += 1
-                        conn.commit()
-                    print(f"  [OK] 补充完成！总计 {saved} 个章节任务卡")
-            except Exception as e:
-                print(f"  [警告] 补充任务卡解析失败：{e}")
-        else:
-            print(f"  [警告] 补充任务卡返回格式错误")
-
     return saved
 
 
+def _supplement_tasks(outline: str, novel_name: str,
+                      batch_count: int, full_target: int,
+                      already_saved: int, batch_start: int = 1) -> int:
+    """补充缺失的任务卡（AI 返回数量不足时）。返回新的 total saved。"""
+    from core.utils import with_db_connection
+
+    shortage = batch_count - already_saved
+    if shortage <= 0:
+        return already_saved
+
+    start_chapter = batch_start + already_saved
+    print(f"\n  [提示] 任务卡数量不足（{already_saved}/{batch_count}），正在补充{shortage}章...")
+
+    _sup_max_tokens = max(8000, min(shortage * 200, 12000))
+    supplement_raw = call_author_api(
+        system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
+        user_message=_build_task_split_prompt(
+            shortage, full_target, outline, start=start_chapter,
+            novel_name=novel_name,
+        ),
+        temperature=0.7,
+        max_tokens=_sup_max_tokens,
+    )
+
+    sup_tasks = _extract_tasks_json(supplement_raw)
+    if sup_tasks is None or not isinstance(sup_tasks, list):
+        print(f"  [警告] 补充任务卡解析失败")
+        return already_saved
+
+    if not sup_tasks:
+        print(f"  [警告] AI 返回了空的补充任务卡列表，跳过")
+        return already_saved
+
+    # ── 任务卡质量审核（补充路径，非交互式）──────────────
+    if cfg("novel", "task_card_review_enabled", True):
+        try:
+            from core.task_card_reviewer import review_task_cards, revise_task_cards
+            print(f"  [任务卡审核] 第{start_chapter}章-第{start_chapter + len(sup_tasks) - 1}章 审核中...")
+            review_result = review_task_cards(novel_name, sup_tasks, outline, start_chapter)
+            if not review_result.get("pass"):
+                print(f"  [修正] 审核未通过({review_result.get('score_total', 0)}/40)，自动修正中...")
+                sup_tasks = revise_task_cards(novel_name, sup_tasks, review_result, outline)
+                review_result2 = review_task_cards(novel_name, sup_tasks, outline, start_chapter)
+                if not review_result2.get("pass"):
+                    print(
+                        f"  [警告] 修正后仍不达标({review_result2.get('score_total', 0)}/40)，"
+                        f"继续入库"
+                    )
+        except Exception as e:
+            print(f"  [警告] 补充任务卡审核异常（非致命）：{e}，跳过审核直接入库")
+
+    valid_tags = ["铺垫", "冲突", "爽点", "低谷", "反转"]
+    with with_db_connection(novel_name) as conn:
+        for task in sup_tasks:
+            chapter_num = task.get("chapter_num")
+            plot_goal = task.get("plot_goal", "").strip()
+            emotion_tag = task.get("emotion_tag", "铺垫").strip()
+            if emotion_tag not in valid_tags:
+                emotion_tag = "铺垫"
+            if chapter_num and plot_goal:
+                conn.execute("""
+                    INSERT OR REPLACE INTO chapter_tasks
+                    (chapter_num, plot_goal, emotion_tag, status)
+                    VALUES (?, ?, ?, '待处理')
+                """, (chapter_num, plot_goal, emotion_tag))
+                already_saved += 1
+        conn.commit()
+    print(f"  [OK] 补充完成！总计 {already_saved} 个章节任务卡")
+    return already_saved
+
+
 def extend_tasks(novel_name: str, from_chapter: int):
+    """运行时扩展任务卡。根据模型能力动态决定扩展多少章。
+    每次写作前自动触发：当 get_next_chapter_goal() 发现任务卡用完时调用。
+    """
     from core.utils import with_db_connection
     from core.config_loader import get as cfg, get_data_dir
 
@@ -810,9 +1164,6 @@ def extend_tasks(novel_name: str, from_chapter: int):
         return
 
     outline = outline_path.read_text(encoding="utf-8")
-    pre_split = cfg("novel", "pre_split_chapters", 50)
-    end_chapter = from_chapter + pre_split - 1
-
     target_path = data_dir / "target_chapters.txt"
     full_target = 0
     if target_path.exists():
@@ -821,7 +1172,19 @@ def extend_tasks(novel_name: str, from_chapter: int):
         except Exception:
             pass
 
-    print(f"  [扩展] 正在生成第{from_chapter}-{end_chapter}章任务卡...")
+    # 计算剩余章节数
+    remaining = (full_target - from_chapter + 1) if full_target > 0 else 50
+    # 根据模型能力决定这批扩展多少章
+    per_batch, batch_max_tokens, _ = _compute_batch_params(remaining)
+    batch_size = min(per_batch, remaining)
+    end_chapter = from_chapter + batch_size - 1
+
+    model_max = _get_model_max_output()
+    print(f"  [扩展] 任务卡不足，模型上限={model_max} tokens，本批扩展 {batch_size} 章"
+          f"（第{from_chapter}-{end_chapter}章）")
+
+    if full_target > 0:
+        print(f"  （全书目标 {full_target} 章，剩余 {remaining} 章未规划）")
 
     mm_tmp = MemoryManager(novel_name)
     prev_ending = mm_tmp.get_last_chapter_ending(from_chapter, chars=400)
@@ -829,27 +1192,49 @@ def extend_tasks(novel_name: str, from_chapter: int):
     if urgent_fs:
         print(f"  [伏笔] 检测到 {len(urgent_fs)} 个沉睡伏笔，将在任务卡中强制安排兑现")
 
-    raw = call_author_api(
-        system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
-        user_message=_build_extend_task_prompt(
-            from_chapter, end_chapter, full_target or end_chapter, outline,
-            prev_chapter_ending=prev_ending,
-            urgent_foreshadowing=urgent_fs,
-            novel_name=novel_name,
-        ),
-        temperature=0.7,
-        max_tokens=12000,
-    )
+    # 最多重试一次
+    for attempt in range(2):
+        raw = call_author_api(
+            system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
+            user_message=_build_extend_task_prompt(
+                from_chapter, end_chapter, full_target or end_chapter, outline,
+                prev_chapter_ending=prev_ending,
+                urgent_foreshadowing=urgent_fs,
+                novel_name=novel_name,
+            ),
+            temperature=0.7,
+            max_tokens=batch_max_tokens,
+        )
 
-    match = re.search(r'\[.*\]', raw, re.DOTALL)
-    if not match:
-        print(f"  [警告] AI 返回中未找到 JSON 数组，跳过扩展")
+        tasks = _extract_tasks_json(raw)
+        if tasks is not None:
+            break
+        if attempt == 0:
+            print(f"  [重试] 扩展任务卡首次解析失败，重试...")
+    else:
+        print(f"  [警告] 扩展任务卡解析失败（已重试），跳过扩展")
         return
-    try:
-        tasks = json.loads(match.group())
-    except Exception:
-        print(f"  [警告] JSON 解析失败，跳过扩展")
-        return
+
+    # ── 任务卡质量审核（运行时自动模式，不中断写作）──────
+    if cfg("novel", "task_card_review_enabled", True):
+        try:
+            from core.task_card_reviewer import review_task_cards, revise_task_cards
+            batch_end = from_chapter + len(tasks) - 1 if tasks else end_chapter
+            print(f"  [任务卡审核] 第{from_chapter}章-第{batch_end}章 审核中...")
+            review_result = review_task_cards(novel_name, tasks, outline, from_chapter)
+
+            if not review_result.get("pass"):
+                print(f"  [修正] 审核未通过({review_result.get('score_total', 0)}/40)，自动修正中...")
+                tasks = revise_task_cards(novel_name, tasks, review_result, outline)
+                # 重新审核
+                review_result2 = review_task_cards(novel_name, tasks, outline, from_chapter)
+                if not review_result2.get("pass"):
+                    print(
+                        f"  [警告] 修正后仍不达标({review_result2.get('score_total', 0)}/40)，"
+                        f"继续入库（不中断写作流程）"
+                    )
+        except Exception as e:
+            print(f"  [警告] 任务卡审核异常（非致命）：{e}，跳过审核直接入库")
 
     valid_tags = ["铺垫", "冲突", "爽点", "低谷", "反转"]
     with with_db_connection(novel_name) as conn:
@@ -1086,22 +1471,12 @@ def run_planner(novel_name: str, genre: str, keywords: str) -> tuple:
     # Step 5：写作风格
     style_key = get_style_choice()
 
-    # Step 6：任务卡
-    pre_split = cfg("novel", "pre_split_chapters", 50)
-    if target_chapters > pre_split:
-        print(f"\n任务卡生成方式：")
-        print(f"  1. 分批生成（每次{pre_split}章，推荐用于超长篇小说）")
-        print(f"  2. 一次性生成全部{target_chapters}章（推荐）")
-        batch_choice = input(f"\n请选择（默认2）：").strip() or "2"
-        full_batch = (batch_choice == "2")
-    else:
-        full_batch = True
-
+    # Step 6：任务卡（默认全量生成，模型不够时自动提示换模型或分批）
     split_outline_to_tasks(
         outline, novel_name,
         review_mode=review_mode,
         target_chapters=target_chapters,
-        full_batch=full_batch,
+        full_batch=True,
     )
 
     print("\n" + "=" * 50)

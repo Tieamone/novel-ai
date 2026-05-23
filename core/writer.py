@@ -1,9 +1,10 @@
 import json
 import re
+from pathlib import Path
 from core.api_client import call_author_api, call_reviewer_api, increment_failure_counter, reset_failure_counter, get_current_author_model, get_author_model
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg, get_data_dir
-from core.utils import extract_json_obj, is_transient_error
+from core.utils import extract_json_obj, is_transient_error, with_db_connection
 import sqlite3 as _sqlite3
 
 # 节拍规划缓存（跨重试复用，任务卡不变则节拍不变）
@@ -209,6 +210,41 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
         [f"第{s['chapter_num']}章：{s['summary']}" for s in summaries]
     ) if summaries else "这是开篇第一章"
 
+    # 创作意图注入（优化B：输入治理控制面）
+    intent_block = ""
+    _data_dir = ctx.get("data_dir")
+    if _data_dir:
+        _intent_path = Path(_data_dir) / "author_intent.md"
+        if _intent_path.exists():
+            try:
+                _intent_text = _intent_path.read_text(encoding="utf-8").strip()
+                if _intent_text:
+                    intent_block += f"\n=== 创作意图（长期方向）===\n{_intent_text}\n"
+            except Exception:
+                pass
+        _focus_path = Path(_data_dir) / "current_focus.md"
+        if _focus_path.exists():
+            try:
+                _focus_text = _focus_path.read_text(encoding="utf-8").strip()
+                if _focus_text:
+                    intent_block += f"\n=== 当前焦点（近期重点）===\n{_focus_text}\n"
+            except Exception:
+                pass
+
+    # 文法指纹注入（优化D）
+    fingerprint_block = ""
+    _novel_name = ctx.get("novel_name")
+    if _novel_name:
+        try:
+            from core.style_analyzer import load_fingerprint, build_style_prompt
+            fp = load_fingerprint(_novel_name)
+            if fp:
+                fp_text = build_style_prompt(fp)
+                if fp_text:
+                    fingerprint_block = f"\n=== 文法指纹（参考风格）===\n{fp_text}\n"
+        except Exception:
+            pass
+
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
     hard_rules = _format_rule_block("硬约束（必须满足）", WRITER_HARD_CONSTRAINTS)
     forbidden_rules = _format_rule_block("禁止项（必须避免）", WRITER_FORBIDDEN_RULES)
@@ -261,6 +297,8 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
 
 【前面发生了什么】
 {s_str}
+{intent_block}
+{fingerprint_block}
 {transition_block}
 {hard_rules}
 
@@ -723,6 +761,31 @@ AI_PATTERNS = [
     # ── 连续对话检测（正文中的多行裸对话）──────────────────────
     # 通过 _rule_based_ai_check 的段落逻辑检测，这里只加特殊模式
     (r'"[^"]{3,60}"\n"[^"]{3,60}"\n"[^"]{3,60}"\n"[^"]{3,60}"', '连续裸对话≥4行'),
+
+    # ── 模板化情绪（优化C：Anti-Slop L1 扩展）────────────────
+    (r'心中涌起一股[^，。]{2,15}[感之情]',                '情绪模板-涌起一股X感'),
+    (r'不禁[^，。]{2,15}起来',                            '情绪模板-不禁X起来'),
+    (r'下意识地[^，。]{2,15}了',                          '情绪模板-下意识地X了'),
+
+    # ── 模板化动作 ──────────────────────────────────────────────
+    (r'深吸一口气',                                       '动作模板-深吸一口气'),
+    (r'握紧拳头',                                         '动作模板-握紧拳头'),
+    (r'瞳孔一缩',                                         '动作模板-瞳孔一缩'),
+    (r'嘴角微微上扬',                                     '动作模板-嘴角上扬'),
+    (r'眉头[微微]?[一皱|紧锁|微蹙]',                     '动作模板-眉头X'),
+
+    # ── 模板化收束 ──────────────────────────────────────────────
+    (r'这一切[^，。]{0,15}才刚开始',                      '收束模板-才刚开始'),
+    (r'故事[^，。]{0,10}远未结束',                        '收束模板-远未结束'),
+    (r'无论[^，。]{0,20}都[^，。]{0,15}',                '收束模板-无论X都X'),
+
+    # ── 对称句式滥用 ────────────────────────────────────────────
+    (r'一方面[^，。]{5,30}另一方面',                      '对称句式-一方面另一方面'),
+    (r'不是[^，。]{3,15}而是[^，。]{3,15}而是',          '对称句式-不是而是而是'),
+
+    # ── 注水表达 ────────────────────────────────────────────────
+    (r'某种[^，。]{2,10}感觉',                            '注水-某种X感觉'),
+    (r'一种[^，。]{2,15}说不清道不明',                    '注水-说不清道不明'),
 ]
 
 
@@ -746,6 +809,45 @@ def _rule_based_ai_check(text: str) -> list:
     if max_streak >= 4:
         detected.append(f"连续对话超限: {max_streak}行")
     return detected
+
+
+def _check_cross_chapter_frequency(novel_name: str, current_chapter: int) -> list:
+    """检查最近3章的高频词重复（优化C：Anti-Slop L1 扩展）"""
+    from collections import Counter
+    mm = MemoryManager(novel_name)
+    warnings = []
+    recent_texts = []
+    for ch in range(max(1, current_chapter - 2), current_chapter):
+        with with_db_connection(novel_name) as conn:
+            row = conn.execute(
+                "SELECT summary FROM summaries WHERE chapter_num=?", (ch,)
+            ).fetchone()
+            if row and row["summary"]:
+                recent_texts.append(row["summary"])
+    if len(recent_texts) < 2:
+        return warnings
+    # 统计每章的高频词
+    _split_re = re.compile(r'[，。、；：！？\s,.;:!?\\/\-—()\[\]【】“”‘’]+')
+    _stopwords = frozenset([
+        "一个", "这个", "那个", "没有", "不是", "就是", "也是", "还是", "但是",
+        "然后", "因为", "所以", "如果", "可以", "已经", "他们", "她们", "自己",
+        "什么", "怎么", "知道", "发现", "开始", "觉得", "看到", "来到",
+        "出来", "起来", "下来", "回来", "过来", "到了", "的是", "不了", "之中",
+    ])
+    chapter_word_sets = []
+    for text in recent_texts:
+        words = [w for w in _split_re.split(text) if len(w) >= 2 and w not in _stopwords]
+        chapter_word_sets.append(Counter(words))
+    # 找出连续每章都出现>3次的词
+    if len(chapter_word_sets) >= 2:
+        common_words = set(chapter_word_sets[0].keys())
+        for cs in chapter_word_sets[1:]:
+            common_words &= set(cs.keys())
+        for word in common_words:
+            counts = [cs[word] for cs in chapter_word_sets]
+            if all(c >= 3 for c in counts):
+                warnings.append(f"跨章高频词「{word}」连续{len(counts)}章出现: {counts}")
+    return warnings
 
 
 # ==================== 工具函数 ====================
@@ -1130,6 +1232,41 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
         [f"第{s['chapter_num']}章：{s['summary']}" for s in summaries]
     ) if summaries else "这是开篇第一章"
 
+    # 创作意图注入（优化B：输入治理控制面）
+    intent_block = ""
+    _data_dir = ctx.get("data_dir")
+    if _data_dir:
+        _intent_path = Path(_data_dir) / "author_intent.md"
+        if _intent_path.exists():
+            try:
+                _intent_text = _intent_path.read_text(encoding="utf-8").strip()
+                if _intent_text:
+                    intent_block += f"\n=== 创作意图（长期方向）===\n{_intent_text}\n"
+            except Exception:
+                pass
+        _focus_path = Path(_data_dir) / "current_focus.md"
+        if _focus_path.exists():
+            try:
+                _focus_text = _focus_path.read_text(encoding="utf-8").strip()
+                if _focus_text:
+                    intent_block += f"\n=== 当前焦点（近期重点）===\n{_focus_text}\n"
+            except Exception:
+                pass
+
+    # 文法指纹注入（优化D）
+    fingerprint_block = ""
+    _novel_name = ctx.get("novel_name")
+    if _novel_name:
+        try:
+            from core.style_analyzer import load_fingerprint, build_style_prompt
+            fp = load_fingerprint(_novel_name)
+            if fp:
+                fp_text = build_style_prompt(fp)
+                if fp_text:
+                    fingerprint_block = f"\n=== 文法指纹（参考风格）===\n{fp_text}\n"
+        except Exception:
+            pass
+
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
     half_min = word_min // 2
     half_max = word_max // 2
@@ -1184,6 +1321,8 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 
 【前面发生了什么】
 {s_str}
+{intent_block}
+{fingerprint_block}
 {transition_block}
 {hard_rules}
 
@@ -1360,6 +1499,13 @@ def revise_chapter(novel_name: str, chapter_num: int,
         max_tokens=max_tokens_cfg,
     )
     full_content = re.sub(r'\n{3,}', '\n\n', full_content)
+
+    # 跨章词频检查（优化C）
+    cross_warnings = _check_cross_chapter_frequency(novel_name, chapter_num)
+    if cross_warnings:
+        print(f"  [自检] 跨章词频异常：")
+        for w in cross_warnings:
+            print(f"    ⚠ {w}")
 
     # 字数补写
     supplement_round = 0
@@ -1610,6 +1756,13 @@ def write_chapter(novel_name: str, chapter_num: int,
         max_tokens=max_tokens_cfg,
     )
     full_content = re.sub(r'\n{3,}', '\n\n', full_content)
+
+    # 跨章词频检查（优化C）
+    cross_warnings = _check_cross_chapter_frequency(novel_name, chapter_num)
+    if cross_warnings:
+        print(f"  [自检] 跨章词频异常：")
+        for w in cross_warnings:
+            print(f"    ⚠ {w}")
 
     total = len(full_content)
 

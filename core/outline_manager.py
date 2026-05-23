@@ -6,6 +6,66 @@ from core.utils import with_db_connection, DatabaseTransaction
 from core.config_loader import get_data_dir
 
 
+def _fix_llm_json(raw: str) -> str:
+    """修复 LLM 返回的 JSON 中常见问题（未转义引号、多余逗号等）"""
+    # 修复未转义的引号：在 JSON 字符串值内部，将裸露的 " 转为 \"
+    result = []
+    in_string = False
+    escape_next = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+            i += 1
+            continue
+        if ch == '\\' and in_string:
+            result.append(ch)
+            escape_next = True
+            i += 1
+            continue
+        if ch == '"':
+            if not in_string:
+                in_string = True
+                result.append(ch)
+            else:
+                # 判断这个引号是字符串结束还是字符串内部的引号
+                # 看下一个非空字符：如果是 , } ] : 则是结束引号
+                rest = raw[i + 1:].lstrip()
+                if rest and rest[0] in ',}]:':
+                    in_string = False
+                    result.append(ch)
+                elif not rest:
+                    in_string = False
+                    result.append(ch)
+                else:
+                    # 字符串内部的引号，转义之
+                    result.append('\\"')
+            i += 1
+            continue
+        result.append(ch)
+        i += 1
+    fixed = ''.join(result)
+    # 修复尾部逗号（trailing comma）
+    fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+    return fixed
+
+
+def _parse_json_robust(raw_str: str):
+    """健壮的 JSON 解析：先尝试标准解析，失败后修复再试"""
+    try:
+        return json.loads(raw_str)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # 尝试修复后解析
+    try:
+        fixed = _fix_llm_json(raw_str)
+        return json.loads(fixed)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 # ==================== 显示宽度工具 ====================
 
 def _cjk_width(ch: str) -> int:
@@ -262,9 +322,8 @@ def ai_suggest_outline_foreshadow(novel_name: str):
         print("  请手动在菜单中录入伏笔（选项2）")
         return
 
-    try:
-        suggestions = json.loads(json_match.group())
-    except json.JSONDecodeError:
+    suggestions = _parse_json_robust(json_match.group())
+    if suggestions is None:
         print("  [错误] JSON 解析失败")
         print(f"  原始返回：\n{raw_clean[:500]}")
         print("  请手动在菜单中录入伏笔（选项2）")
@@ -451,10 +510,9 @@ def generate_outline_foreshadow(novel_name: str, target_chapters: int,
             print(f"  [错误] AI 返回中未找到 JSON，跳过伏笔生成")
             print(f"  [调试] 原始返回前200字: {raw[:200]}")
             return 0
-        try:
-            suggestions = json.loads(json_match.group())
-        except json.JSONDecodeError as e:
-            print(f"  [错误] JSON 解析失败: {e}")
+        suggestions = _parse_json_robust(json_match.group())
+        if suggestions is None:
+            print(f"  [错误] JSON 解析失败")
             print(f"  [调试] 匹配到的内容前200字: {json_match.group()[:200]}")
             return 0
 
@@ -481,6 +539,19 @@ def generate_outline_foreshadow(novel_name: str, target_chapters: int,
 
         review = review_outline_foreshadow(novel_name, suggestions, outline_text, character_profiles)
         _print_review_table(suggestions, review)
+
+        # ── 修正不通过的伏笔 ──────────────────────────────────────
+        failed_indices = [i for i, r in review.items() if not r.get("passed")]
+        if failed_indices:
+            print(f"\n  [修正] 正在修正 {len(failed_indices)} 条未通过审稿的伏笔...")
+            suggestions = _revise_failed_foreshadow(
+                novel_name, suggestions, review, outline_text, character_profiles
+            )
+            # 修正后的伏笔重新审稿
+            print(f"  正在重新审稿修正后的伏笔...")
+            review = review_outline_foreshadow(novel_name, suggestions, outline_text, character_profiles)
+            _print_review_table(suggestions, review)
+        # ───────────────────────────────────────────────────────────
 
         count = 0
         skipped = 0
@@ -570,9 +641,8 @@ def review_outline_foreshadow(novel_name, suggestions, outline_text, character_p
         print("  [警告] 审稿返回中未找到JSON，跳过审查")
         return {i: {"passed": True, "issues": [], "suggestion": ""} for i in range(len(suggestions))}
 
-    try:
-        review_data = json.loads(json_match.group())
-    except json.JSONDecodeError:
+    review_data = _parse_json_robust(json_match.group())
+    if review_data is None:
         print("  [警告] 审稿JSON解析失败，跳过审查")
         return {i: {"passed": True, "issues": [], "suggestion": ""} for i in range(len(suggestions))}
 
@@ -592,6 +662,126 @@ def review_outline_foreshadow(novel_name, suggestions, outline_text, character_p
         if i not in result:
             result[i] = {"passed": True, "issues": [], "suggestion": ""}
 
+    return result
+
+
+def _revise_single_foreshadow(foreshadow: dict, review_item: dict,
+                               outline_text: str, character_profiles: str) -> dict | None:
+    """调用审稿模型修正单条不通过的大纲伏笔。
+
+    Args:
+        foreshadow: 原始伏笔 dict，含 description/category/plant_chapter/resolve_chapter/importance
+        review_item: 审稿结果 dict，含 issues(list) 和 suggestion(str)
+        outline_text: 大纲文本
+        character_profiles: 人物档案文本
+
+    Returns:
+        修正后的伏笔 dict（与输入同结构），失败返回 None
+    """
+    issues_str = "；".join(review_item.get("issues", []))
+    suggestion_str = review_item.get("suggestion", "")
+    original_json = json.dumps(foreshadow, ensure_ascii=False)
+
+    feedback_lines = []
+    if issues_str:
+        feedback_lines.append(f"审稿意见（问题）：{issues_str}")
+    if suggestion_str:
+        feedback_lines.append(f"修改建议：{suggestion_str}")
+    feedback = "\n".join(feedback_lines) if feedback_lines else "请重新构思，使伏笔更自然、符合人物设定和整体基调"
+
+    system_prompt = (
+        "你是专业的网络小说策划师，负责根据审稿意见修正伏笔设计。\n"
+        "修正原则：\n"
+        "1. 保持伏笔的核心悬念不变，只调整呈现方式使其更自然\n"
+        "2. 必须紧贴人物设定和世界观，不能凭空编造\n"
+        "3. 修正后的伏笔描述要具体、可执行，不要空泛\n"
+        "4. 严格输出JSON对象，不要任何其他内容"
+    )
+
+    user_message = (
+        f"=== 大纲参考 ===\n{outline_text[:2000]}\n\n"
+        f"=== 人物档案 ===\n{character_profiles[:1500]}\n\n"
+        f"=== 原始伏笔 ===\n{original_json}\n\n"
+        f"=== 审稿反馈 ===\n{feedback}\n\n"
+        "请根据审稿意见修正这个伏笔，输出JSON：\n"
+        '{"description":"修正后的伏笔描述","category":"情节伏笔|人物伏笔|世界观|宏观悬念",'
+        '"plant_chapter":埋入章节号,"resolve_chapter":兑现章节号,"importance":重要度1-5}'
+    )
+
+    try:
+        from core.api_client import call_reviewer_api
+        raw = call_reviewer_api(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            temperature=0.3,
+            max_tokens=512,
+        )
+    except Exception as e:
+        print(f"    [修正] API 调用失败（非致命）：{e}")
+        return None
+
+    # 清理思考块
+    raw_clean = re.sub(
+        r'[<\u2039]think[>\u203a]?[\s\S]*?[<\u2039]\/think[>\u203a]?', '',
+        raw, flags=re.DOTALL
+    ).strip()
+    raw_clean = re.sub(r'```(?:json)?\s*|```', '', raw_clean, flags=re.DOTALL).strip()
+
+    json_match = re.search(r'\{.*\}', raw_clean, re.DOTALL)
+    if not json_match:
+        print(f"    [修正] AI 返回中未找到 JSON")
+        return None
+
+    revised = _parse_json_robust(json_match.group())
+    if revised is None or not isinstance(revised, dict):
+        print(f"    [修正] JSON 解析失败")
+        return None
+
+    # 字段兜底：缺失字段沿用原始值
+    for key in ("description", "category", "plant_chapter", "resolve_chapter", "importance"):
+        if not revised.get(key):
+            revised[key] = foreshadow.get(key, "")
+    return revised
+
+
+def _revise_failed_foreshadow(novel_name: str, suggestions: list,
+                               review: dict, outline_text: str,
+                               character_profiles: str) -> list:
+    """对审稿不通过的伏笔进行修正。
+
+    Args:
+        novel_name: 小说名（仅用于日志）
+        suggestions: 原始伏笔列表
+        review: 审稿结果 {index: {"passed": bool, "issues": [...], "suggestion": "..."}}
+        outline_text: 大纲文本
+        character_profiles: 人物档案文本
+
+    Returns:
+        修正后的伏笔列表（通过的保持原样，不通过的用修正版本替换，修正失败则删除）
+    """
+    failed_count = 0
+    fixed_count = 0
+    result = []
+
+    for i, s in enumerate(suggestions):
+        r = review.get(i, {"passed": True})
+        if r["passed"]:
+            result.append(s)
+            continue
+
+        failed_count += 1
+        revised = _revise_single_foreshadow(s, r, outline_text, character_profiles)
+        if revised:
+            desc_preview = (revised.get("description", "") or "")[:30]
+            print(f"    [修正] 第{i+1}条伏笔已修正: {desc_preview}...")
+            result.append(revised)
+            fixed_count += 1
+        else:
+            desc_preview = (s.get("description", "") or "")[:30]
+            print(f"    [修正] 第{i+1}条伏笔修正失败，丢弃: {desc_preview}...")
+
+    if failed_count > 0:
+        print(f"  [修正总结] {failed_count} 条不通过 → {fixed_count} 条修正成功，{failed_count - fixed_count} 条丢弃")
     return result
 
 

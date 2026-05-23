@@ -797,6 +797,7 @@ class MemoryManager:
 
         return {
             "novel_name":           self.novel_name,
+            "data_dir":             str(self.data_dir),
             "world_settings":       world_settings,
             "characters":           characters,
             "active_foreshadowing": active_foreshadowing,

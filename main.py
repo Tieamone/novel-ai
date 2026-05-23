@@ -872,6 +872,7 @@ def _change_style(novel_name: str):
     for key, style in AUTHOR_STYLES.items():
         print(f"  {key}. {style['name']:<12} {style['desc']}")
     print("  7. 自定义风格（自己描述写作风格）")
+    print("  8. 上传参考文本生成文法指纹")
     print()
     choice = input("请输入编号（默认1）：").strip() or "1"
     if choice == "7":
@@ -882,10 +883,71 @@ def _change_style(novel_name: str):
             )
             print("[OK] 自定义风格已保存，下一章开始生效")
             return
+    if choice == "8":
+        _generate_style_fingerprint(novel_name)
+        return
     if choice not in AUTHOR_STYLES:
         choice = "1"
     (_data_dir(novel_name) / "style.txt").write_text(choice, encoding="utf-8")
     print(f"[OK] 风格已更换为：{AUTHOR_STYLES[choice]['name']}，下一章开始生效")
+
+
+def _generate_style_fingerprint(novel_name: str):
+    """从参考文本生成文法指纹（优化D）"""
+    from core.style_analyzer import analyze_style, save_fingerprint
+    print("\n" + "=" * 50)
+    print("  生成文法指纹")
+    print("=" * 50)
+    print("  请提供参考文本文件路径（.txt 文件）")
+    print("  参考文本应该是你想模仿的作者的章节或片段")
+    path = input("\n  文件路径：").strip().strip('"')
+    if not path:
+        print("  [已取消]")
+        return
+    from pathlib import Path
+    ref_path = Path(path)
+    if not ref_path.exists():
+        print(f"  [错误] 文件不存在: {path}")
+        return
+    try:
+        reference_text = ref_path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"  [错误] 读取文件失败: {e}")
+        return
+    if len(reference_text) < 200:
+        print(f"  [错误] 参考文本太短（{len(reference_text)}字），至少需要200字以上")
+        return
+    print(f"  [OK] 已读取 {len(reference_text)} 字参考文本")
+    fingerprint = analyze_style(reference_text)
+    save_fingerprint(novel_name, fingerprint)
+    print(f"\n  [OK] 文法指纹生成完成！下一章写作时将自动应用。")
+
+
+def _edit_author_intent(novel_name: str):
+    """编辑创作意图文件（优化B：输入治理控制面）"""
+    import os
+    dd = _data_dir(novel_name)
+    print("\n" + "=" * 50)
+    print("  编辑创作意图")
+    print("=" * 50)
+    print("  1. 编辑长期意图（author_intent.md）")
+    print("  2. 编辑当前焦点（current_focus.md）")
+    print("  0. 返回")
+    c = input("\n选择：").strip()
+    if c == "1":
+        path = dd / "author_intent.md"
+    elif c == "2":
+        path = dd / "current_focus.md"
+    else:
+        return
+    if not path.exists():
+        print(f"[提示] 文件不存在: {path}")
+        return
+    try:
+        os.startfile(str(path))
+        print(f"[OK] 已打开 {path.name}，编辑后保存即可生效")
+    except Exception:
+        print(f"[提示] 无法自动打开，请手动编辑: {path}")
 
 
 # ★ 需求2：章节删除功能
@@ -1449,6 +1511,7 @@ def chapters_menu(novel_name: str):
         print("14. 查看伏笔健康度报告")
         print("15. 大纲伏笔管理")
         print("16. 断点管理")
+        print("17. 编辑创作意图")
         print("0. 返回主菜单")
 
         choice = input("\n请选择：").strip()
@@ -1552,6 +1615,9 @@ def chapters_menu(novel_name: str):
 
         elif choice == "16":
             _breakpoint_menu(novel_name)
+
+        elif choice == "17":
+            _edit_author_intent(novel_name)
 
         elif choice == "0":
             from core.api_client import get_session_stats
@@ -1910,6 +1976,26 @@ def main():
                 style_key = get_style_choice()
                 (mm.data_dir / "style.txt").write_text(style_key, encoding="utf-8")
 
+                # 生成创作意图模板（优化B）
+                _intent_path = mm.data_dir / "author_intent.md"
+                if not _intent_path.exists():
+                    _intent_path.write_text(
+                        "# 创作意图\n\n"
+                        "## 这本书想成为什么\n"
+                        "（基调、主题、核心吸引力）\n\n"
+                        "## 不想变成什么样\n"
+                        "（避免的风格、雷区）\n",
+                        encoding="utf-8"
+                    )
+                _focus_path = mm.data_dir / "current_focus.md"
+                if not _focus_path.exists():
+                    _focus_path.write_text(
+                        "# 当前焦点\n\n"
+                        "## 最近 1-3 章的重点\n"
+                        "（当前弧线的核心冲突、需要推进的线索）\n",
+                        encoding="utf-8"
+                    )
+
                 target_chapters = import_data.get("target_chapters", 100)
                 (mm.data_dir / "target_chapters.txt").write_text(
                     str(target_chapters), encoding="utf-8"
@@ -1941,6 +2027,27 @@ def main():
 
             style_path = _data_dir(novel_name) / "style.txt"
             style_path.write_text(style_key, encoding="utf-8")
+
+            # 生成创作意图模板（优化B）
+            dd = _data_dir(novel_name)
+            _intent_path = dd / "author_intent.md"
+            if not _intent_path.exists():
+                _intent_path.write_text(
+                    "# 创作意图\n\n"
+                    "## 这本书想成为什么\n"
+                    "（基调、主题、核心吸引力）\n\n"
+                    "## 不想变成什么样\n"
+                    "（避免的风格、雷区）\n",
+                    encoding="utf-8"
+                )
+            _focus_path = dd / "current_focus.md"
+            if not _focus_path.exists():
+                _focus_path.write_text(
+                    "# 当前焦点\n\n"
+                    "## 最近 1-3 章的重点\n"
+                    "（当前弧线的核心冲突、需要推进的线索）\n",
+                    encoding="utf-8"
+                )
 
             print("\n策划完成！开始写章节。")
             chapters_menu(novel_name)
