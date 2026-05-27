@@ -164,14 +164,11 @@ class MemoryManager:
                           description: str, expected_redeem: str):
         with with_db_connection(self.novel_name) as conn:
             with DatabaseTransaction(conn):
-                try:
-                    conn.execute("""
-                        INSERT OR REPLACE INTO foreshadowing
-                        (fid, plant_chapter, description, expected_redeem, status)
-                        VALUES (?, ?, ?, ?, 'active')
-                    """, (fid, plant_chapter, description, expected_redeem))
-                except Exception:
-                    pass
+                conn.execute("""
+                    INSERT OR REPLACE INTO foreshadowing
+                    (fid, plant_chapter, description, expected_redeem, status)
+                    VALUES (?, ?, ?, ?, 'active')
+                """, (fid, plant_chapter, description, expected_redeem))
         self._refresh_foreshadowing_md()
 
     def redeem_foreshadowing(self, fid: str, chapter_num: int):
@@ -192,109 +189,79 @@ class MemoryManager:
         return [dict(row) for row in rows]
 
     def get_foreshadow_hints(self, chapter_num: int) -> list:
-        """
-        根据当前章节号，智能匹配应该在本章处理（兑现/铺垫）的伏笔。
+        """根据当前章节号，智能匹配应该在本章处理（兑现/铺垫）的伏笔。"""
+        return self._compute_hints(self.load_active_foreshadowing(), chapter_num)
 
-        匹配规则：
-        1. 有明确计划章节的：精确窗口匹配，逾期的强制提醒
-        2. 待定/模糊的：按"沉睡时长"分级，越久未处理越紧迫，永不遗忘
-        3. 智能分批：每章最多 MAX_HINTS 条，但紧急项（逾期/久悬）全部保留
-
-        priority 越小越紧迫：
+    def _compute_hints(self, active_list: list, chapter_num: int) -> list:
+        """伏笔提示核心逻辑。priority 越小越紧迫：
           0 = 应兑现 / 逾期未兑现
-          1 = 即将兑现（3章内）
-          2 = 久悬未兑现（待定且沉睡 >URGENT_AGE 章）
+          1 = 即将兑现（3章内）/ 久悬未兑现（待定且沉睡 >URGENT_AGE 章）
           3 = 待推进（待定且沉睡 NORMAL_AGE~URGENT_AGE 章）
           4 = 可铺垫（待定且沉睡 <NORMAL_AGE 章）
           5 = 可推进（关键词模糊匹配）
         """
         import re
 
-        MAX_HINTS   = 8     # 每章最多提示条数，避免提示词过载
-        URGENT_AGE  = 20    # 沉睡超过此章节数 → 久悬，强提醒
-        NORMAL_AGE  = 10    # 沉睡超过此章节数 → 待推进
-
-        all_active = self.load_active_foreshadowing()
+        MAX_HINTS   = 8
+        URGENT_AGE  = 20
+        NORMAL_AGE  = 10
         hints = []
 
-        for f in all_active:
+        for f in active_list:
             desc        = f.get('description', '')
             expected    = f.get('expected_redeem', '待定')
-            # planted_at=0 是数据库默认值，统一视为第1章埋下
             planted_at  = max(f.get('plant_chapter', 1) or 1, 1)
-            age         = chapter_num - planted_at   # 该伏笔已沉睡几章
+            age         = chapter_num - planted_at
 
             should_handle = False
             handle_type   = "可铺垫"
             priority      = 4
-
             expected_clean = str(expected).strip() if expected else ""
 
             if not expected_clean or expected_clean == "待定":
-                # ── 待定伏笔：永不丢弃，按沉睡时长分级 ──────────────────
                 should_handle = True
                 if age >= URGENT_AGE:
-                    handle_type = "久悬未兑现"
-                    priority    = 2
+                    handle_type, priority = "久悬未兑现", 1
                 elif age >= NORMAL_AGE:
-                    handle_type = "待推进"
-                    priority    = 3
+                    handle_type, priority = "待推进", 3
                 else:
-                    handle_type = "可铺垫"
-                    priority    = 4
+                    handle_type, priority = "可铺垫", 4
             else:
-                # ── 有计划的伏笔：精确匹配 ───────────────────────────────
                 range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected_clean)
                 if range_match:
                     start_ch = int(range_match.group(1))
                     end_ch   = int(range_match.group(2))
                     if start_ch <= chapter_num <= end_ch:
-                        should_handle = True
-                        handle_type   = "应兑现"
-                        priority      = 0
+                        should_handle, handle_type, priority = True, "应兑现", 0
                     elif chapter_num > end_ch:
-                        # 已过计划窗口还没兑现 → 强提醒
-                        should_handle = True
-                        handle_type   = "逾期未兑现"
-                        priority      = 0
+                        should_handle, handle_type, priority = True, "逾期未兑现", 0
                 else:
                     single_match = re.search(r'第?(\d+)', expected_clean)
                     if single_match:
                         target_ch = int(single_match.group(1))
                         if chapter_num > target_ch:
-                            # 已过计划章节还没兑现 → 强提醒
-                            should_handle = True
-                            handle_type   = "逾期未兑现"
-                            priority      = 0
+                            should_handle, handle_type, priority = True, "逾期未兑现", 0
                         elif abs(target_ch - chapter_num) <= 3:
                             should_handle = True
-                            handle_type   = "应兑现" if target_ch <= chapter_num else "即将兑现"
-                            priority      = 0 if target_ch <= chapter_num else 1
+                            handle_type = "应兑现" if target_ch <= chapter_num else "即将兑现"
+                            priority = 0 if target_ch <= chapter_num else 1
                     elif any(kw in expected_clean for kw in ['高潮', '结局', '终章', '决战']):
                         if age >= 5:
-                            should_handle = True
-                            handle_type   = "可推进"
-                            priority      = 5
+                            should_handle, handle_type, priority = True, "可推进", 5
 
             if should_handle:
                 hint = f"[{handle_type}] {desc}"
                 if expected_clean and expected_clean != "待定":
                     hint += f"（计划：{expected_clean}）"
                 hints.append({
-                    "hint":        hint,
-                    "handle_type": handle_type,
-                    "priority":    priority,
-                    "age":         age,
+                    "hint": hint, "handle_type": handle_type,
+                    "priority": priority, "age": age,
                 })
 
-        # 排序：优先级升序 → 同优先级内沉睡越久越靠前
         hints.sort(key=lambda x: (x["priority"], -x["age"]))
-
-        # 分批：紧急项（priority<=2）全部保留，其余截取到 MAX_HINTS
         urgent  = [h for h in hints if h["priority"] <= 2]
         others  = [h for h in hints if h["priority"] >  2]
         selected = urgent + others[:max(0, MAX_HINTS - len(urgent))]
-
         return [h["hint"] for h in selected]
 
     _MACRO_KEYWORDS = (
@@ -370,6 +337,7 @@ class MemoryManager:
                     "expected_redeem": expected,
                     "age": age,
                 })
+                continue
 
             # 即将到期：expected_redeem 在当前章节+5章以内
             expected_clean = str(expected).strip()
@@ -728,18 +696,23 @@ class MemoryManager:
 
     def delete_chapter(self, chapter_num: int):
         """
-        删除章节的数据库记录及其摘要。
+        删除章节的数据库记录及其摘要，回滚本章兑现的伏笔。
         任务卡重置（status→待处理）由调用方负责。
-        注意：伏笔记录不自动回滚，需人工处理。
         """
         with with_db_connection(self.novel_name) as conn:
             with DatabaseTransaction(conn):
+                # 回滚本章兑现的运行时伏笔
+                conn.execute(
+                    "UPDATE foreshadowing SET status='active', redeemed_chapter=NULL "
+                    "WHERE redeemed_chapter=?", (chapter_num,)
+                )
                 conn.execute(
                     "DELETE FROM chapters WHERE chapter_num=?", (chapter_num,)
                 )
                 conn.execute(
                     "DELETE FROM summaries WHERE chapter_num=?", (chapter_num,)
                 )
+        self._refresh_foreshadowing_md()
 
     def load_context(self, chapter_num: int) -> dict:
         """
@@ -824,6 +797,7 @@ class MemoryManager:
 
         return {
             "novel_name":           self.novel_name,
+            "data_dir":             str(self.data_dir),
             "world_settings":       world_settings,
             "characters":           characters,
             "active_foreshadowing": active_foreshadowing,
@@ -835,60 +809,8 @@ class MemoryManager:
         }
 
     def _get_foreshadow_hints_from_list(self, active_list: list, chapter_num: int) -> list:
-        """从已加载的伏笔列表计算提示（复用 get_foreshadow_hints 逻辑，避免重复查 DB）"""
-        import re
-        MAX_HINTS = 8
-        URGENT_AGE = 20
-        NORMAL_AGE = 10
-        hints = []
-        for f in active_list:
-            desc        = f.get('description', '')
-            expected    = f.get('expected_redeem', '待定')
-            planted_at  = max(f.get('plant_chapter', 1) or 1, 1)
-            age         = chapter_num - planted_at
-            should_handle = False
-            handle_type   = "可铺垫"
-            priority      = 4
-            expected_clean = str(expected).strip() if expected else ""
-            if not expected_clean or expected_clean == "待定":
-                should_handle = True
-                if age >= URGENT_AGE:
-                    handle_type, priority = "久悬未兑现", 2
-                elif age >= NORMAL_AGE:
-                    handle_type, priority = "待推进", 3
-                else:
-                    handle_type, priority = "可铺垫", 4
-            else:
-                range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected_clean)
-                if range_match:
-                    s, e = int(range_match.group(1)), int(range_match.group(2))
-                    if s <= chapter_num <= e:
-                        should_handle, handle_type, priority = True, "应兑现", 0
-                    elif chapter_num > e:
-                        should_handle, handle_type, priority = True, "逾期未兑现", 0
-                else:
-                    single = re.search(r'第?(\d+)', expected_clean)
-                    if single:
-                        t = int(single.group(1))
-                        if chapter_num > t:
-                            should_handle, handle_type, priority = True, "逾期未兑现", 0
-                        elif abs(t - chapter_num) <= 3:
-                            should_handle = True
-                            handle_type = "应兑现" if t <= chapter_num else "即将兑现"
-                            priority = 0 if t <= chapter_num else 1
-                    elif any(kw in expected_clean for kw in ['高潮', '结局', '终章', '决战']):
-                        if age >= 5:
-                            should_handle, handle_type, priority = True, "可推进", 5
-            if should_handle:
-                hint = f"[{handle_type}] {desc}"
-                if expected_clean and expected_clean != "待定":
-                    hint += f"（计划：{expected_clean}）"
-                hints.append({"hint": hint, "handle_type": handle_type, "priority": priority, "age": age})
-        hints.sort(key=lambda x: (x["priority"], -x["age"]))
-        urgent  = [h for h in hints if h["priority"] <= 2]
-        others  = [h for h in hints if h["priority"] >  2]
-        selected = urgent + others[:max(0, MAX_HINTS - len(urgent))]
-        return [h["hint"] for h in selected]
+        """从已加载的伏笔列表计算提示，避免重复查 DB。"""
+        return self._compute_hints(active_list, chapter_num)
 
     def get_last_chapter_ending(self, chapter_num: int, chars: int = 400) -> str:
         prev_num = chapter_num - 1

@@ -2,6 +2,8 @@
 
 | 日期 | 错误简述 | 原因分析 | 解决方案 | 状态 |
 |------|----------|----------|----------|------|
+| 2026-05-22 | 创建新小说时任务卡生成失败（返回0），无法正常拆分大纲 | 1. `split_outline_to_tasks()` 中 `max_tokens` 固定为 8000，AI 生成50章任务卡 JSON 约需 7500-11000 tokens，常被截断导致 JSON 不完整无法解析；2. 无截断恢复机制，截断后直接放弃；3. 无重试机制 | 1. `max_tokens` 改为动态计算 `max(8000, min(chapters*200, 16000))`，50章→10000 tokens；2. 新增 `_extract_tasks_json()` 统一提取函数，内置 4 种截断修复策略；3. 解析失败自动重试一次；4. 增加详细的诊断日志输出 | ✅ 已修复 |
+| 2026-05-22 | 任务卡分批生成导致剧情落差，且分批逻辑写死 50 章/批不灵活 | 1. `split_outline_to_tasks()` 分批时固定 50 章/批，`extend_tasks()` 也是固定 50 章；2. 没有利用模型实际 max_output_tokens 能力；3. 全量模式遇到大章数时直接 16000 cap 不够用且无提示 | 1. 新增 `_get_model_max_output()` / `_compute_batch_params()` 动态计算每批大小；2. 全量模式下模型不够时提示用户换模型或降级分批；3. `run_planner()` 默认全量生成（`full_batch=True`）；4. `extend_tasks()` 改为动态批次大小并告知用户扩展规模 | ✅ 已修复 |
 | 2026-05-14 | 导入流程缺失大纲伏笔生成，导入的小说无任何伏笔规划 | 交互式创建(`run_planner`)包含Step 1.6 `generate_outline_foreshadow()`，但导入流程(`main.py` mode="2")完全跳过了这一步，直接存大纲→世界观→角色→任务卡 | 在导入流程的 `split_outline_to_tasks()` 之前添加 `generate_outline_foreshadow(novel_name, target_chapters, review_mode=False)` 调用 | ✅ 已修复 |
 | 2026-04-17 | 深度思考模型调用报400 url error | qwen3.6系列、glm-5等深度思考模型必须使用多模态接口，普通Generation.call()不支持 | 新增`_is_thinking_model()`函数识别思考模型，对这类模型添加`enable_thinking=False`参数 | ✅ 已解决 |
 | 2026-04-20 | 模型验证报400 url error | 自定义模型配置中使用了带日期后缀的模型名称（如qwen3.6-plus-2026-04-02），dashscope API无法识别这种格式 | 移除自定义模型配置中所有带日期后缀的模型，只保留标准格式的模型名称 | ✅ 已解决 |

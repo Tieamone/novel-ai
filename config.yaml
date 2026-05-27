@@ -52,6 +52,13 @@ novel:
   pre_split_chapters: 50
   failure_switch_threshold: 3
   progress_review_window: 10  # 进度面板审稿质量统计窗口（最近N章）
+  # 任务卡质量审核
+  task_card_review_enabled: true     # 是否启用任务卡审核
+  task_card_review_pass_score: 28    # 审核通过线（满分40）
+  max_foreshadow_per_chapter: 2      # 每章伏笔埋入/兑现上限
+  foreshadow_injection_style: "guided"  # 伏笔注入语气: guided(引导式) / forced(强制式)
+  plateau_threshold: 5       # 平台期检测：评分波动低于此值视为平台期
+  plateau_window: 3          # 平台期检测：最近N轮评分
   # 任务卡分批配置
   batch_size_small: 10      # 小批次每批章数
   batch_size_medium: 30     # 中批次每批章数

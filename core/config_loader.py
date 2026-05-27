@@ -112,6 +112,8 @@ def _get_defaults() -> dict:
             "pre_split_chapters": 50,
             "failure_switch_threshold": 3,
             "progress_review_window": 10,
+            "plateau_threshold": 5,
+            "plateau_window": 3,
         },
         "paths": {
             "data_dir": "data",
