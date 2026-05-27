@@ -994,10 +994,8 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
                            plot_goal: str, emotion_tag: str,
                            full_content: str, beat_plan: str,
                            max_tokens: int) -> str:
-    hard_rules = _format_rule_block("硬约束", WRITER_HARD_CONSTRAINTS)
-    forbidden_rules = _format_rule_block("禁止项", WRITER_FORBIDDEN_RULES)
-
-    # ── 专项去AI化处理 ──────────────────────────────────────────
+    """轻量去AI化 + 诊断报告（不再触发全量修订，避免过度打磨）。"""
+    # ── 专项去AI化处理（轻量 API 打磨，仅三类明确问题）─────────
     _deai_system = (
         "你是网文文字打磨师，专门处理三类问题：\n"
         "1. 比喻过密：每500字最多保留1个比喻，其余改为直接感官描写\n"
@@ -1022,127 +1020,50 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
             print("  [去AI化] 缩减过度，保留原稿")
     except Exception as e:
         print(f"  [去AI化] 跳过（{type(e).__name__}）")
-    # ─────────────────────────────────────────────────────────────
 
+    # ── 规则诊断（仅报告，不修订）─────────────────────────────
     detected_issues = _rule_based_ai_check(full_content)
-
     if detected_issues:
-        print(f"  [自检] 发现{len(detected_issues)}项AI痕迹问题，执行修订...")
-        issue_lines = "\n".join([f"- {x}" for x in detected_issues])
-        revise_prompt = f"""请根据问题清单直接修订正文，输出完整章节。
+        summary = "；".join([x[:40] for x in detected_issues[:3]])
+        print(f"  [诊断] 规则检测到 {len(detected_issues)} 项AI痕迹：{summary}")
+
+    # ── AI 自检诊断（仅报告，不修订）─────────────────────────
+    print("  [诊断] 正在评估写作质量...")
+    try:
+        check_prompt = f"""请按规则检查本章质量。
 
 章节：第{chapter_num}章
 本章目标：{plot_goal}
 情绪标签：{emotion_tag}
-
-本章节拍计划：
-{beat_plan or "未提供"}
-
-{hard_rules}
-
-{forbidden_rules}
-
-【必须修复的问题 - 全部是AI痕迹】
-{issue_lines}
-
-【修复要求】
-1. 用具体行为/生理反应替换所有"他知道/她感到"类心理陈述
-2. 用具体感官细节替换所有情绪标签直给
-3. 删掉所有"才刚开始/路还很长/无论前方"类模板句
-4. 对话必须与动作/表情/环境描写交替出现
-5. 结尾落在一个具体的行动或画面，不能是总结句
-
-【待修订正文】
-{full_content}"""
-        revised = call_author_api(
-            system_prompt=system_prompt + "\n\n" + REVISION_SYSTEM,
-            user_message=revise_prompt,
-            temperature=cfg("temperature", "revision", 0.70),
-            max_tokens=max_tokens,
-        )
-        revised = clean_content(revised)
-        if revised and len(revised) >= int(len(full_content) * 0.65):
-            print(f"  [自检] 修订完成：{len(revised)}字")
-            return revised
-
-    check_prompt = f"""请按规则检查本章质量。
-
-章节：第{chapter_num}章
-本章目标：{plot_goal}
-情绪标签：{emotion_tag}
-
-本章节拍计划：
-{beat_plan or "未提供"}
-
-{hard_rules}
-
-{forbidden_rules}
 
 正文：
-{full_content}
+{full_content[:3000]}
 """
-    raw = call_reviewer_api(
-        system_prompt=SELF_CHECK_SYSTEM,
-        user_message=check_prompt,
-        temperature=cfg("temperature", "self_check", 0.20),
-        max_tokens=600,
-    )
-    result = extract_json_obj(raw)
-    if not result:
-        print("  [自检] 结果解析失败，跳过自动修订")
-        return full_content
+        raw = call_reviewer_api(
+            system_prompt=SELF_CHECK_SYSTEM,
+            user_message=check_prompt,
+            temperature=cfg("temperature", "self_check", 0.20),
+            max_tokens=400,
+        )
+        result = extract_json_obj(raw)
+        if result:
+            passed = bool(result.get("pass"))
+            need_revision = bool(result.get("need_revision"))
+            issues = result.get("issues", [])
+            if isinstance(issues, str):
+                issues = [issues]
+            issues = [str(i).strip() for i in (issues or []) if str(i).strip()]
 
-    issues = result.get("issues", [])
-    if isinstance(issues, str):
-        issues = [issues]
-    if not isinstance(issues, list):
-        issues = []
-    issues = [str(i).strip() for i in issues if str(i).strip()]
+            if passed and not need_revision:
+                print("  [诊断] ✅ 自检通过")
+            elif issues:
+                issue_summary = "；".join([x[:50] for x in issues[:2]])
+                print(f"  [诊断] 自检发现 {len(issues)} 项问题：{issue_summary}")
+                print(f"  [诊断] （问题已记录，将由责任编辑统一审核，不在此处修订）")
+    except Exception as e:
+        print(f"  [诊断] 跳过（{type(e).__name__}）")
 
-    passed = bool(result.get("pass"))
-    need_revision = bool(result.get("need_revision"))
-    if passed and not need_revision:
-        print("  [自检] 通过")
-        return full_content
-
-    if not issues:
-        issues = ["情节推进、节奏或人物行为仍有改进空间"]
-    print(f"  [自检] 发现{len(issues)}项问题，执行1轮修订...")
-    issue_lines = "\n".join([f"- {x}" for x in issues])
-    revise_prompt = f"""请根据问题清单直接修订正文，输出完整章节。
-
-章节：第{chapter_num}章
-本章目标：{plot_goal}
-情绪标签：{emotion_tag}
-
-本章节拍计划：
-{beat_plan or "未提供"}
-
-{hard_rules}
-
-{forbidden_rules}
-
-【必须修复的问题】
-{issue_lines}
-
-【待修订正文】
-{full_content}
-"""
-    revised = call_author_api(
-        system_prompt=system_prompt + "\n\n" + REVISION_SYSTEM,
-        user_message=revise_prompt,
-        temperature=cfg("temperature", "revision", 0.70),
-        max_tokens=max_tokens,
-    )
-    revised = clean_content(revised)
-    if not revised:
-        print("  [自检] 修订返回为空，保留原稿")
-        return full_content
-    if len(revised) < int(len(full_content) * 0.65):
-        print("  [自检] 修订结果过短，保留原稿")
-        return full_content
-    print(f"  [自检] 修订完成：{len(revised)}字")
-    return revised
+    return full_content
 
 
 # ==================== 提示词构建 ====================
