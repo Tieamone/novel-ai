@@ -122,7 +122,12 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(chapter["status"], "已审核")
         self.assertEqual(chapter["summary"], "找到了码头记录")
         self.assertNotIn("灯塔上的窗户亮了一下。", chapter["content"])
-        self.assertEqual(self.get("/api/book")["tasks"][0]["status"], "已完成")
+        book = self.get("/api/book")
+        self.assertEqual(book["tasks"][0]["status"], "已完成")
+        self.assertEqual(book["progress"]["approved"], 1)
+        self.assertEqual(book["progress"]["quality_count"], 1)
+        self.assertEqual(book["progress"]["avg_total"], 94)
+        self.assertEqual(book["progress"]["task_status"]["已完成"], 1)
         self.assertEqual(self.completed("export")["downloads"], ["第001章.txt"])
         response = self.client.get("/api/download/第001章.txt", query_string={"novel": BOOK})
         with response:
@@ -134,8 +139,11 @@ class WorkbenchTests(unittest.TestCase):
         self.completed("task", chapter=1, plot_goal=GOAL + "以及仓库里的旧账本", emotion_tag="冲突")
         self.completed("style", style="custom", custom="短句与对话")
         self.completed("intent", field="focus", content="保持第一人称叙事")
-        with patch("workbench.actions.analyze_style", return_value={"stats": {}}):
+        with patch("core.style_analyzer.call_author_api", return_value='{"rhythm":"短句较多"}') as provider:
             self.completed("fingerprint", content=CONTENT)
+        provider.assert_called_once()
+        fingerprint = self.root / "data" / BOOK / "style_fingerprint.json"
+        self.assertEqual(json.loads(fingerprint.read_text(encoding="utf-8"))["style_guide"]["rhythm"], "短句较多")
         fields = {"description": "钥匙上的编号对应一艘失踪船", "category": "情节伏笔",
                   "plant_chapter": 1, "resolve_chapter": 5, "importance": 3, "notes": ""}
         self.completed("foreshadow", **fields)
@@ -238,14 +246,19 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(created["target"], 10)
         self.assertEqual(len(created["tasks"]), 10)
         content = "书名：导入的故事\n类型：悬疑\n目标章数：20\n【大纲】\n旧仓库\n【主要角色】\n林舟\n【时间线】\n十月\n【核心冲突】\n寻找旧船"
+        imported_tasks = json.dumps([{"chapter_num": num, "plot_goal": GOAL, "emotion_tag": "铺垫"}
+                                     for num in range(1, 21)], ensure_ascii=False)
         with (patch.object(outline_manager, "generate_outline_foreshadow"),
-              patch.object(cli, "split_outline_to_tasks")):
+              patch.object(planner, "call_author_api", return_value=imported_tasks) as provider):
             job_id = self.submit("import", content=content)
             waiting = self.wait(job_id, "waiting")
             self.answer(job_id, waiting["prompt"]["id"], "yes")
             style = self.wait(job_id, "waiting", prompt_id=2)
             self.answer(job_id, style["prompt"]["id"], "1")
             self.assertEqual(self.wait(job_id, "completed")["result"]["novel"], "导入的故事")
+        provider.assert_called_once()
+        imported = self.client.get("/api/book", query_string={"novel": "导入的故事"}).json
+        self.assertEqual(len(imported["tasks"]), 20)
         self.assertIn("十月", (self.root / "data" / "导入的故事" / "settings.md").read_text(encoding="utf-8"))
 
     def test_local_requests_and_model_session(self):
@@ -263,13 +276,59 @@ class WorkbenchTests(unittest.TestCase):
             patch.object(api_client, "get_available_models", return_value={"1": option}),
             patch.object(api_client, "_author_model", "original-model"),
             patch.object(api_client, "_author_provider", "dashscope"),
+            patch.object(api_client, "_reviewer_model", "test-model"),
+            patch.object(api_client, "_reader_reviewer_model", "test-model"),
             patch.object(api_client, "_switch_history", []),
-            patch.object(api_client, "call_api", return_value="ok"),
+            patch.object(api_client, "call_api", return_value="ok") as provider,
         ):
-            self.completed("models", author="test-model")
+            result = self.completed("models", author="test-model")
+            self.assertTrue(result["saved"])
+            self.assertEqual(result["verification"][0]["roles"], ["作者模型", "责任编辑", "读者审稿"])
+            self.assertEqual(result["verification"][0]["detail"], "ok")
+            provider.assert_called_once()
+            self.assertEqual(provider.call_args.kwargs["model_name"], "test-model")
+            result = self.completed("models")
+            self.assertFalse(result["saved"])
+            self.assertEqual(result["verification"][0]["status"], "passed")
+            self.assertEqual(provider.call_count, 2)
             models = self.get("/api/models")
             self.assertEqual(models["roles"]["author"]["current"], "test-model")
             self.assertNotIn("local-test-value", json.dumps(models))
+
+    def test_model_results_distinguish_failed_skipped_and_passed(self):
+        options = {
+            str(i): {"name": model, "model": model, "provider": "dashscope", "env_key": env}
+            for i, (model, env) in enumerate([
+                ("normal-model", "TEST_API_KEY"), ("empty-model", "TEST_API_KEY"), ("no-key", "MISSING_TEST_API_KEY"),
+            ])
+        }
+        with (
+            patch.dict("os.environ", {"TEST_API_KEY": "local-test-value", "MISSING_TEST_API_KEY": ""}),
+            patch.object(api_client, "get_available_models", return_value=options),
+            patch.object(api_client, "_author_model", "original-model"),
+            patch.object(api_client, "call_api", side_effect=["local-test-value", ""]) as provider,
+        ):
+            result = self.completed("models", author="normal-model", reviewer="empty-model", reader_reviewer="no-key")
+        self.assertEqual(provider.call_count, 2)
+        self.assertFalse(result["saved"])
+        self.assertEqual([row["status"] for row in result["verification"]], ["passed", "failed", "skipped"])
+        self.assertEqual(result["verification"][0]["detail"], "已隐藏")
+        self.assertIsInstance(result["verification"][0]["elapsed_ms"], int)
+        self.assertNotIn("local-test-value", json.dumps(result))
+
+    def test_provider_errors_do_not_report_generated_artifacts(self):
+        (self.root / "data" / BOOK / "master_outline.md").write_text("调查灯塔的航行记录。", encoding="utf-8")
+        with patch.object(api_client, "call_author_api", side_effect=RuntimeError("请求失败")):
+            error = self.wait(self.submit("suggest"), "failed")
+            self.assertIn("模型调用失败", error["error"])
+        with patch("core.style_analyzer.call_author_api", side_effect=RuntimeError("请求失败")):
+            error = self.wait(self.submit("fingerprint", content=CONTENT), "failed")
+            self.assertIn("模型未完成", error["error"])
+        self.assertFalse((self.root / "data" / BOOK / "style_fingerprint.json").exists())
+        self.assertEqual(self.get("/api/book")["foreshadow"], [])
+        self.assertIn("没有可导出", self.wait(self.submit("export"), "failed")["error"])
+        MemoryManager(BOOK).save_chapter(1, "空章", "", "审稿失败", GOAL, "铺垫")
+        self.assertIn("正文为空", self.wait(self.submit("recover", chapter=1, method="1"), "failed")["error"])
 
     def test_legacy_book_opens_read_only_and_asks_before_migration(self):
         name = "旧版小说"

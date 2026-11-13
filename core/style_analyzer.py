@@ -95,7 +95,7 @@ _STYLE_ANALYSIS_PROMPT = """你是一位专业的文学风格分析师。请分�
 }}"""
 
 
-def _analyze_semantic(reference_text: str) -> dict:
+def _analyze_semantic(reference_text: str, *, required=False) -> dict:
     """调用 LLM 提取语义层风格特征"""
     # 截取参考文本，避免超出 token 限制
     truncated = reference_text[:3000] if len(reference_text) > 3000 else reference_text
@@ -115,9 +115,13 @@ def _analyze_semantic(reference_text: str) -> dict:
             raw = re.sub(r'^```(?:json)?\s*', '', raw)
             raw = re.sub(r'\s*```$', '', raw)
         result = _json.loads(raw)
+        if not isinstance(result, dict) or not result:
+            raise ValueError("服务商返回的风格分析为空或格式不正确")
         return result
     except Exception as e:
         print(f"  [文法指纹] 语义分析失败：{e}")
+        if required:
+            raise ValueError("模型未完成风格分析，请查看任务记录后重试") from e
         return {
             "rhetoric": "未知",
             "rhythm": "未知",
@@ -131,13 +135,13 @@ def _analyze_semantic(reference_text: str) -> dict:
 
 # ==================== 核心接口 ====================
 
-def analyze_style(reference_text: str) -> dict:
+def analyze_style(reference_text: str, *, require_semantic=False) -> dict:
     """从参考文本提取文法指纹（统计层 + 语义层）"""
     print("  [文法指纹] 正在分析统计特征...")
     stats = _compute_stats(reference_text)
 
     print("  [文法指纹] 正在分析语义特征...")
-    style_guide = _analyze_semantic(reference_text)
+    style_guide = _analyze_semantic(reference_text, required=require_semantic)
 
     return {
         "stats": stats,

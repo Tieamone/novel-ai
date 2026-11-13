@@ -280,40 +280,50 @@ def _has_chapter_summary(novel_name: str, chapter_num: int) -> bool:
     return bool((row["summary"] or "").strip())
 
 
-def show_progress(novel_name: str):
-    with with_db_connection(novel_name) as conn:
+def get_novel_progress(novel_name: str, *, readonly=False) -> dict:
+    with with_db_connection(novel_name, readonly=readonly) as conn:
+        def has_table(name):
+            return conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone() is not None
+
+        chapter_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chapters)")}
+        has_status = "status" in chapter_columns
+        has_content = "content" in chapter_columns
         approved = conn.execute(
             "SELECT COUNT(*) as cnt FROM chapters "
             "WHERE status IN ('已审核', '强制通过')"
-        ).fetchone()["cnt"]
+        ).fetchone()["cnt"] if has_status else 0
 
         draft = conn.execute(
             "SELECT COUNT(*) as cnt FROM chapters "
             "WHERE status IN ('草稿', '草稿(有问题)')"
-        ).fetchone()["cnt"]
+        ).fetchone()["cnt"] if has_status else 0
 
-        total_chars = conn.execute(
+        total_chars = (conn.execute(
             "SELECT SUM(LENGTH(content)) as s FROM chapters"
-        ).fetchone()["s"] or 0
+        ).fetchone()["s"] or 0) if has_content else 0
 
         recent = conn.execute(
             "SELECT chapter_num, status, LENGTH(content) as chars "
             "FROM chapters ORDER BY chapter_num DESC LIMIT 3"
-        ).fetchall()
+        ).fetchall() if has_status and has_content else []
 
         foreshadow_cnt = conn.execute(
             "SELECT COUNT(*) as cnt FROM foreshadowing WHERE status='active'"
-        ).fetchone()["cnt"]
+        ).fetchone()["cnt"] if has_table("foreshadowing") else 0
 
         task_cnt = conn.execute(
             "SELECT COUNT(*) as cnt FROM chapter_tasks"
-        ).fetchone()["cnt"]
+        ).fetchone()["cnt"] if has_table("chapter_tasks") else 0
 
         task_status_rows = conn.execute("""
             SELECT COALESCE(status, ?) as status, COUNT(*) as cnt
             FROM chapter_tasks
             GROUP BY COALESCE(status, ?)
-        """, (TASK_PENDING, TASK_PENDING)).fetchall()
+        """, (TASK_PENDING, TASK_PENDING)).fetchall() if "status" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(chapter_tasks)")
+        } else []
 
         review_window = int(cfg("novel", "progress_review_window", 10))
         if review_window <= 0:
@@ -341,9 +351,9 @@ def show_progress(novel_name: str):
         TASK_REVIEW_FAILED: 0,
     }
     for row in task_status_rows:
-        status = row["status"] or TASK_PENDING
+        status = TASK_PENDING if row["status"] == "pending" else row["status"] or TASK_PENDING
         if status in task_status_map:
-            task_status_map[status] = row["cnt"]
+            task_status_map[status] += row["cnt"]
 
     quality_count = len(review_rows)
     avg_total = avg_l1 = avg_l2 = avg_l3 = 0.0
@@ -370,6 +380,19 @@ def show_progress(novel_name: str):
                     veto_hits += 1
             except Exception:
                 veto_hits += 1
+
+    return {
+        "approved": approved, "draft": draft, "total_chars": total_chars,
+        "recent": [dict(row) for row in recent], "foreshadow_count": foreshadow_cnt,
+        "task_count": task_cnt, "task_status": task_status_map, "quality_count": quality_count,
+        "review_window": review_window, "avg_total": avg_total, "avg_l1": avg_l1,
+        "avg_l2": avg_l2, "avg_l3": avg_l3, "veto_hits": veto_hits,
+    }
+
+
+def show_progress(novel_name: str):
+    progress = get_novel_progress(novel_name)
+    approved, draft, total_chars = (progress[key] for key in ("approved", "draft", "total_chars"))
 
     style_path = _data_dir(novel_name) / "style.txt"
     style_name = "未设置"
@@ -405,29 +428,29 @@ def show_progress(novel_name: str):
     print(f"  [{bar}] {percent}%")
     print(f"  目标：{target}章  |  已完成：{approved}章  |  草稿：{draft}章")
     print(f"  累计字数：{total_chars:,} 字  ({chars_display})")
-    print(f"  未兑现伏笔：{foreshadow_cnt} 个  |  任务卡：{task_cnt} 张")
+    print(f"  未兑现伏笔：{progress['foreshadow_count']} 个  |  任务卡：{progress['task_count']} 张")
     print("  任务状态："
-          f"待处理 {task_status_map[TASK_PENDING]}  |  "
-          f"进行中 {task_status_map[TASK_IN_PROGRESS]}  |  "
-          f"已完成 {task_status_map[TASK_COMPLETED]}  |  "
-          f"审稿失败 {task_status_map[TASK_REVIEW_FAILED]}")
-    if quality_count:
+          f"待处理 {progress['task_status'][TASK_PENDING]}  |  "
+          f"进行中 {progress['task_status'][TASK_IN_PROGRESS]}  |  "
+          f"已完成 {progress['task_status'][TASK_COMPLETED]}  |  "
+          f"审稿失败 {progress['task_status'][TASK_REVIEW_FAILED]}")
+    if progress['quality_count']:
         print(
-            f"  审稿质量（最近{quality_count}章）：均分 {avg_total:.1f}/100  |  "
-            f"L1 {avg_l1:.1f}/45  L2 {avg_l2:.1f}/25  L3 {avg_l3:.1f}/30"
+            f"  审稿质量（最近{progress['quality_count']}章）：均分 {progress['avg_total']:.1f}/100  |  "
+            f"L1 {progress['avg_l1']:.1f}/45  L2 {progress['avg_l2']:.1f}/25  L3 {progress['avg_l3']:.1f}/30"
         )
-        print(f"  否决命中：{veto_hits}章  |  统计窗口：最近{review_window}章")
+        print(f"  否决命中：{progress['veto_hits']}章  |  统计窗口：最近{progress['review_window']}章")
     else:
-        print(f"  审稿质量：暂无数据（统计窗口：最近{review_window}章）")
+        print(f"  审稿质量：暂无数据（统计窗口：最近{progress['review_window']}章）")
     print("-" * 50)
     print(f"  本次会话：调用{stats['total_calls']}次  "
           f"共{total_tokens:,} token  "
           f"费用约 ¥{cost:.4f}")
     print("-" * 50)
 
-    if recent:
+    if progress['recent']:
         print("  最近章节：")
-        for r in reversed(recent):
+        for r in reversed(progress['recent']):
             icon = "✓" if r["status"] in (
                 CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED) else "○"
             print(f"    {icon} 第{r['chapter_num']}章  "
@@ -871,7 +894,10 @@ def _recover_review_failed(novel_name: str):
     print("0. 取消")
     action = input("请选择：").strip()
 
-    return recover_review_failed(novel_name, chapter_num, action)
+    try:
+        return recover_review_failed(novel_name, chapter_num, action)
+    except ValueError as error:
+        print(f"[错误] {error}")
 
 
 def recover_review_failed(novel_name, chapter_num, action):
@@ -907,8 +933,7 @@ def _finish_review_recovery(novel_name, chapter_num, action, target):
     if action == "1":
         content = target["content"] or ""
         if not content.strip():
-            print("[错误] 该章节正文为空，无法仅重试审稿")
-            return
+            raise ValueError("该章节正文为空，无法仅重试审稿")
         result = review_chapter(
             novel_name, chapter_num, content, target["plot_goal"] or ""
         )
@@ -976,8 +1001,7 @@ def _finish_review_recovery(novel_name, chapter_num, action, target):
     if action == "3":
         content = target["content"] or ""
         if not content.strip():
-            print("[错误] 该章节正文为空，无法强制通过")
-            return
+            raise ValueError("该章节正文为空，无法强制通过")
         mm = MemoryManager(novel_name)
         _force_approve_chapter(novel_name, chapter_num, content, mm)
         _update_task_status(novel_name, chapter_num, TASK_COMPLETED)

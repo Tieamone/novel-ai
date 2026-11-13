@@ -21,13 +21,13 @@ def _load_default_model(role: str, fallback: str) -> str:
     return fallback
 
 _author_model = _load_default_model("author", "qwen3.6-flash")
-_author_provider = "dashscope"
+_author_provider = "mimo" if _author_model.startswith("mimo-") else "dashscope"
 
 _reviewer_model = _load_default_model("reviewer", "qwen3.6-max-preview")
-_reviewer_provider = "dashscope"
+_reviewer_provider = "mimo" if _reviewer_model.startswith("mimo-") else "dashscope"
 
 _reader_reviewer_model = _load_default_model("reader_reviewer", "qwen3.6-flash")
-_reader_reviewer_provider = "dashscope"
+_reader_reviewer_provider = "mimo" if _reader_reviewer_model.startswith("mimo-") else "dashscope"
 
 _session_stats = {
     "total_calls": 0,
@@ -441,6 +441,11 @@ def get_reader_reviewer_model() -> str:
     return _reader_reviewer_model
 
 
+def get_model_provider(role: str) -> str:
+    return {"author": _author_provider, "reviewer": _reviewer_provider,
+            "reader_reviewer": _reader_reviewer_provider}[role]
+
+
 def set_author_model(model_name: str, provider: str = None):
     global _author_model, _author_provider
     old_model = _author_model
@@ -522,7 +527,8 @@ def call_api(system_prompt: str, user_message: str,
              provider: str = None,
              max_tokens: int = None,
              temperature: float = None,
-             retry: int = 3) -> str:
+             retry: int = 3,
+             *, timeout: float = None) -> str:
     check_cancelled()
     from core.config_loader import get as cfg
     if max_tokens is None:
@@ -540,9 +546,9 @@ def call_api(system_prompt: str, user_message: str,
             provider = "dashscope"
 
     if provider == "dashscope":
-        return _call_dashscope(system_prompt, user_message, model_name, max_tokens, temperature, retry)
+        return _call_dashscope(system_prompt, user_message, model_name, max_tokens, temperature, retry, timeout=timeout)
     elif provider == "mimo":
-        return _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature, retry)
+        return _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature, retry, timeout=timeout)
     else:
         raise ValueError(f"未知的provider: {provider}")
 
@@ -560,7 +566,7 @@ def _is_thinking_model(model_name: str) -> bool:
     return any(p.lower() in model_lower for p in thinking_patterns)
 
 
-def _call_dashscope(system_prompt, user_message, model_name, max_tokens, temperature, retry):
+def _call_dashscope(system_prompt, user_message, model_name, max_tokens, temperature, retry, *, timeout=None):
     """
     使用 OpenAI 兼容接口调用 DashScope。
     Bug修复：改用 while 循环 + 独立端点切换标志，
@@ -569,7 +575,7 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
     try:
         from openai import OpenAI
     except ImportError:
-        return _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, temperature, retry)
+        return _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, temperature, retry, timeout=timeout)
 
     api_key = _get_api_key("DASHSCOPE_API_KEY")
     if not api_key:
@@ -588,7 +594,8 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
     endpoint_switched = False  # 端点只切换一次，且不消耗 retry 次数
 
     def make_client(url):
-        return OpenAI(api_key=api_key, base_url=url)
+        options = {"timeout": timeout, "max_retries": 0} if timeout is not None else {}
+        return OpenAI(api_key=api_key, base_url=url, **options)
 
     client = make_client(base_url)
     attempt = 0
@@ -635,7 +642,7 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
                 "connection error", "connecterror", "connection refused",
                 "network", "timed out", "timeout", "connect timeout"
             ))
-            if is_conn_err and not endpoint_switched:
+            if is_conn_err and not endpoint_switched and timeout is None:
                 if "intl" in base_url or "-us." in base_url:
                     fallback = _DASHSCOPE_ENDPOINTS["beijing"]
                 else:
@@ -649,6 +656,8 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
 
             # 限速错误
             if any(kw in err_str for kw in ("429", "rate", "limit", "quota")):
+                if attempt + 1 >= retry:
+                    raise RuntimeError(f"DashScope API 限流或额度不足：{e}") from e
                 wait = 30 * (attempt + 1)
                 print(f"  [限速] DashScope API限速，等待{wait}秒后重试...")
                 time.sleep(wait)
@@ -671,7 +680,7 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
     raise RuntimeError(f"DashScope API连续失败{retry}次")
 
 
-def _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, temperature, retry):
+def _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, temperature, retry, *, timeout=None):
     """旧版 DashScope SDK 调用（兜底方案，openai 库未安装时使用）"""
     from dashscope import Generation
 
@@ -696,6 +705,8 @@ def _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, tem
                 temperature=temperature,
                 result_format="message",
             )
+            if timeout is not None:
+                call_kwargs["timeout"] = timeout
             if is_thinking:
                 try:
                     call_kwargs["enable_thinking"] = False
@@ -714,6 +725,8 @@ def _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, tem
                 _update_stats(model_name, input_tokens, output_tokens, cost)
                 return response.output.choices[0].message.content
             elif response.status_code == 429:
+                if attempt + 1 >= retry:
+                    raise RuntimeError(f"DashScope API 限流或额度不足：{response.message}")
                 wait = 30 * (attempt + 1)
                 print(f"  [限速] API限速，等待{wait}秒后重试...")
                 time.sleep(wait)
@@ -735,7 +748,7 @@ def _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, tem
     raise RuntimeError(f"API连续失败{retry}次")
 
 
-def _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature, retry):
+def _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature, retry, *, timeout=None):
     """
     调用小米 Mimo 模型（OpenAI 兼容接口）。
     端点: https://token-plan-cn.xiaomimimo.com/v1
@@ -761,7 +774,8 @@ def _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature,
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
-    client = OpenAI(api_key=api_key, base_url=_MIMO_BASE_URL)
+    options = {"timeout": timeout, "max_retries": 0} if timeout is not None else {}
+    client = OpenAI(api_key=api_key, base_url=_MIMO_BASE_URL, **options)
 
     for attempt in range(retry):
         check_cancelled()
@@ -795,6 +809,8 @@ def _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature,
             err_str = str(e).lower()
 
             if any(kw in err_str for kw in ("429", "rate", "limit", "quota")):
+                if attempt + 1 >= retry:
+                    raise RuntimeError(f"MiMo API 限流或额度不足：{e}") from e
                 wait = 30 * (attempt + 1)
                 print(f"  [限速] Mimo API限速，等待{wait}秒后重试...")
                 time.sleep(wait)
@@ -901,10 +917,10 @@ def select_model_interactive() -> dict:
 
         if reviewer_is_default:
             _reviewer_model = _INITIAL_REVIEWER
-            _reviewer_provider = "dashscope"
+            _reviewer_provider = "mimo" if _reviewer_model.startswith("mimo-") else "dashscope"
         if reader_is_default:
             _reader_reviewer_model = _INITIAL_READER
-            _reader_reviewer_provider = "dashscope"
+            _reader_reviewer_provider = "mimo" if _reader_reviewer_model.startswith("mimo-") else "dashscope"
 
         print(_console_safe(f"\n[OK] 作者模型已选择：{selected['name']}"))
         print(f"     模型代码：{selected['model']}")
@@ -919,8 +935,7 @@ def select_model_interactive() -> dict:
         print("     正在验证模型可用性...")
 
         try:
-            call_author_api(system_prompt="你是助手。", user_message="回复ok两个字",
-                            max_tokens=10, temperature=0.1, retry=1)
+            verify_model(selected["model"], selected["provider"])
             print("     [OK] 验证通过，模型响应正常\n")
         except Exception as e:
             print(f"     [ERROR] 验证失败：{e}")
@@ -990,12 +1005,19 @@ def _select_single_model(prompt_title: str, default: str, usage: str = None) -> 
 
         print(_console_safe(f"  正在验证 {selected['name']}..."))
         try:
-            call_api(system_prompt="你是助手。", user_message="回复ok",
-                     model_name=selected["model"], provider=selected["provider"],
-                     max_tokens=10, temperature=0.1, retry=1)
+            verify_model(selected["model"], selected["provider"])
             print(_console_safe(f"  [OK] {selected['name']} 验证通过"))
         except Exception as e:
             print(f"  [ERROR] 验证失败：{e}")
             continue
 
         return selected
+
+
+def verify_model(model_name: str, provider: str) -> str:
+    """CLI 和网页共用一次最小模型请求，必须收到正文回复。"""
+    reply = call_api("你是助手。", "只回复 OK。", model_name=model_name, provider=provider,
+                     max_tokens=10, temperature=0.1, retry=1, timeout=25)
+    if not reply or not reply.strip():
+        raise ValueError("服务商已返回响应，但没有正文")
+    return reply.strip()

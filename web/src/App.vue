@@ -28,9 +28,18 @@ const sendingAnswer = ref(false)
 const jobError = ref('')
 const models = ref(null)
 const modelForm = ref({})
+const modelBusy = ref(false)
+const modelJob = ref(null)
+const modelLog = ref([])
+const startingKind = ref('')
+const readAt = ref('')
 const styleForm = ref({ style: '1', custom: '' })
 const intentKey = ref('intent')
-const intentText = ref('')
+const intentDrafts = ref({})
+const intentText = computed({
+  get: () => intentDrafts.value[intentKey.value] ?? book.value?.intent[intentKey.value] ?? '',
+  set: value => { intentDrafts.value[intentKey.value] = value },
+})
 const checkpointNumber = ref(1)
 const checkpoint = ref(null)
 const checkpointLoaded = ref(null)
@@ -45,8 +54,11 @@ let timer
 let bookRequest = 0
 let chapterRequest = 0
 let checkpointRequest = 0
+let modelRequest = 0
 
 const activeJob = computed(() => ['running', 'waiting', 'stopping'].includes(job.value?.status))
+const verifying = computed(() => startingKind.value === 'models' ||
+  (job.value?.kind === 'models' && activeJob.value))
 const submittingAnswer = computed(() => sendingAnswer.value === job.value?.prompt?.id)
 const filteredChapters = computed(() => (book.value?.chapters || []).filter(row => {
   const word = query.value.trim().toLowerCase()
@@ -58,8 +70,7 @@ const filteredTasks = computed(() => (book.value?.tasks || []).filter(row => {
   return !word || [row.chapter_num, row.plot_goal, row.emotion_tag, row.status]
     .some(item => String(item ?? '').toLowerCase().includes(word))
 }))
-const approved = computed(() => (book.value?.chapters || []).filter(row => approval.includes(row.status)).length)
-const words = computed(() => (book.value?.chapters || []).reduce((total, row) => total + row.chars, 0))
+const approved = computed(() => book.value?.progress.approved || 0)
 const staleTasks = computed(() => (book.value?.tasks || []).filter(row => row.stale))
 const percent = computed(() => Math.min(100, Math.round(100 * approved.value / (book.value?.target || 1))))
 const chapterStatuses = computed(() => [...new Set((book.value?.chapters || []).map(row => row.status).filter(Boolean))])
@@ -68,13 +79,17 @@ const download = (name, novel) => '/api/download/' + encodeURIComponent(name) + 
 const statusText = value => labels[value] || value || '待处理'
 const size = value => Number(value || 0).toLocaleString('zh-CN')
 const money = value => '¥' + Number(value || 0).toFixed(4)
+const providerName = value => ({ dashscope: '阿里云百炼', mimo: '小米 MiMo' })[value] || value
+const verifyStatus = { passed: '服务商已回应', failed: '请求失败', skipped: '未发出请求' }
+const styleFields = value => value.startsWith('custom:')
+  ? { style: 'custom', custom: value.slice(7) } : { style: value, custom: '' }
 
 async function api(path, body) {
   const options = body === undefined ? {} : {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': token.value },
     body: JSON.stringify(body),
   }
-  const response = await fetch('/api' + path, options)
+  const response = await fetch('/api' + path, { ...options, cache: 'no-store' })
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {
     const error = Error(data.error || '无法连接工作台，请稍后重试')
@@ -104,10 +119,18 @@ async function loadBook() {
   try {
     const data = await api('/book?' + params(name))
     if (version !== bookRequest) return
+    const previous = book.value
+    if (!previous || JSON.stringify(styleForm.value) === JSON.stringify(styleFields(previous.style)) ||
+      JSON.stringify(styleForm.value) === JSON.stringify(styleFields(data.style))) {
+      styleForm.value = styleFields(data.style)
+    }
+    for (const key of Object.keys(data.intent)) {
+      if (intentDrafts.value[key] === previous?.intent[key] || intentDrafts.value[key] === data.intent[key]) {
+        delete intentDrafts.value[key]
+      }
+    }
     book.value = data
-    styleForm.value = data.style.startsWith('custom:')
-      ? { style: 'custom', custom: data.style.slice(7) } : { style: data.style, custom: '' }
-    intentText.value = data.intent[intentKey.value]
+    readAt.value = new Date().toLocaleTimeString('zh-CN')
     const current = data.chapters.find(row => row.chapter_num === chapter.value?.chapter_num)
     if (view.value === 'chapters') await openChapter((current || data.chapters.at(-1))?.chapter_num)
   } catch (error) {
@@ -129,10 +152,22 @@ async function openChapter(num) {
 }
 
 async function loadModels() {
+  const version = ++modelRequest
+  modelBusy.value = true
   try {
-    models.value = await api('/models')
-    modelForm.value = Object.fromEntries(Object.entries(models.value.roles).map(([key, role]) => [key, role.current]))
-  } catch (error) { sectionError.value = error.message }
+    const data = await api('/models')
+    if (version !== modelRequest) return
+    modelForm.value = Object.fromEntries(Object.entries(data.roles).map(([key, role]) => {
+      const draft = modelForm.value[key]
+      const dirty = draft && draft !== models.value?.roles[key]?.current
+      return [key, dirty && role.options.some(item => item.id === draft) ? draft : role.current]
+    }))
+    models.value = data
+  } catch (error) {
+    if (version === modelRequest && view.value === 'models') sectionError.value = error.message
+  } finally {
+    if (version === modelRequest) modelBusy.value = false
+  }
 }
 
 async function loadCheckpoint(num = checkpointNumber.value) {
@@ -152,28 +187,39 @@ async function loadCheckpoint(num = checkpointNumber.value) {
   }
 }
 
+function refreshBook() {
+  loadBook()
+  if (view.value === 'checkpoints') loadCheckpoint()
+}
+
 watch(selected, name => {
   ++bookRequest
   localStorage.setItem('novel-workbench-book', name)
   book.value = chapter.value = null
+  intentDrafts.value = {}
+  readAt.value = ''
   ++chapterRequest
   ++checkpointRequest
   busy.value = false
   checkpoint.value = null
   checkpointLoaded.value = null
   query.value = filter.value = ''
-  if (name) loadBook()
 })
-watch(view, page => {
+watch([view, selected], ([page]) => {
   query.value = filter.value = sectionError.value = ''
-  if (page === 'models') loadModels()
-  if (page === 'chapters' && !chapter.value && book.value?.chapters.length) {
-    openChapter(book.value.chapters.at(-1).chapter_num)
+  if (page === 'models') {
+    loadModels()
+  } else {
+    refreshBook()
   }
 })
-watch(intentKey, key => { intentText.value = book.value?.intent[key] || '' })
 
 function receive(next) {
+  if (next.kind === 'models') {
+    if (modelJob.value?.id !== next.id) modelLog.value = []
+    modelLog.value = [...modelLog.value, ...next.log].slice(-12)
+    modelJob.value = next
+  }
   if (next.id !== job.value?.id) {
     jobLog.value = []
     jobError.value = ''
@@ -189,6 +235,7 @@ function receive(next) {
 async function start(kind, fields = {}, target = selected.value) {
   if (starting.value || activeJob.value) return
   starting.value = true
+  startingKind.value = kind
   sectionError.value = notice.value = ''
   try {
     const next = await api('/jobs', { ...fields, kind, novel: target })
@@ -199,12 +246,19 @@ async function start(kind, fields = {}, target = selected.value) {
   } catch (error) {
     if (dialog.value) dialog.value.error = error.message
     else sectionError.value = error.message
-  } finally { starting.value = false }
+  } finally {
+    starting.value = false
+    startingKind.value = ''
+  }
 }
 
 async function finished() {
   const result = job.value.result
   notice.value = result?.message || ''
+  if (job.value.kind === 'models') {
+    if (view.value === 'models') await loadModels()
+    return
+  }
   try {
     await loadLibrary()
     if (result?.novel) {
@@ -213,7 +267,9 @@ async function finished() {
     }
     if (selected.value) {
       await loadBook()
-      if (result?.chapter && job.value.novel === selected.value) await openChapter(result.chapter)
+      if (view.value === 'chapters' && result?.chapter && job.value.novel === selected.value) {
+        await openChapter(result.chapter)
+      }
       if (view.value === 'checkpoints' && checkpointLoaded.value) await loadCheckpoint()
     }
     if (view.value === 'models') await loadModels()
@@ -344,34 +400,46 @@ onBeforeUnmount(() => window.clearTimeout(timer))
 
       <section class="workspace">
         <div v-if="sectionError" class="feedback error" role="alert">{{ sectionError }} <button @click="sectionError = ''">关闭</button></div>
-        <div v-else-if="notice" class="feedback" role="status">{{ notice }} <button @click="notice = ''">关闭</button></div>
+        <div v-else-if="notice && (view !== 'models' || job?.kind !== 'models')" class="feedback" role="status">{{ notice }} <button @click="notice = ''">关闭</button></div>
 
         <template v-if="view === 'models'">
-          <div class="heading"><div><p class="kicker">会话配置</p><h1>模型与费用</h1></div><button @click="loadModels">刷新</button></div>
+          <div class="heading"><div><p class="kicker">会话配置</p><h1>模型与费用</h1></div><button :disabled="modelBusy" @click="loadModels">{{ modelBusy ? '读取中…' : '刷新' }}</button></div>
           <div v-if="models" class="stack">
             <div class="metrics">
               <div><span>本次费用</span><strong>{{ money(models.usage.total_cost_yuan) }}</strong></div>
-              <div><span>调用次数</span><strong>{{ size(models.usage.total_calls) }}</strong></div>
+              <div><span>成功调用</span><strong>{{ size(models.usage.total_calls) }}</strong></div>
               <div><span>输入 / 输出 Token</span><strong>{{ size(models.usage.total_input_tokens) }} / {{ size(models.usage.total_output_tokens) }}</strong></div>
             </div>
             <form class="panel padded stack" @submit.prevent="start('models', modelForm)">
               <h2>角色模型</h2>
               <div class="field-grid">
                 <label v-for="(role, key) in models.roles" :key="key">{{ role.label }}
-                  <select v-model="modelForm[key]">
-                    <option v-if="!role.options.some(item => item.id === role.current)" :value="role.current">{{ role.current }}</option>
+                  <select v-model="modelForm[key]" :disabled="verifying || modelBusy">
                     <option v-for="option in role.options" :key="option.id" :value="option.id" :disabled="!option.configured && option.id !== role.current">
                       {{ option.name }}{{ option.configured ? '' : '（缺少密钥）' }}
                     </option>
                   </select>
                 </label>
               </div>
-              <div><button class="primary" :disabled="activeJob || starting">验证并保存</button></div>
+              <div><button class="primary" :disabled="activeJob || starting || modelBusy">{{ verifying ? '验证中…' : '验证并保存' }}</button></div>
+              <p v-if="verifying" class="muted" role="status">{{ modelLog.at(-1)?.text || '正在验证所选角色模型，等待服务商响应。' }}</p>
+              <p v-if="modelJob?.error" class="error" role="alert">{{ modelJob.error }}</p>
+              <div v-if="!verifying && modelJob?.result?.verification" class="stack">
+                <p role="status">{{ modelJob.result.message }}</p>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>服务商与模型</th><th>使用角色</th><th>验证结果</th><th>耗时</th><th>回复或原因</th></tr></thead>
+                  <tbody><tr v-for="item in modelJob.result.verification" :key="item.provider + '/' + item.model">
+                    <td>{{ providerName(item.provider) }} · {{ item.model }}</td><td>{{ item.roles.join('、') }}</td>
+                    <td><span class="badge" :class="{ good: item.status === 'passed' }">{{ verifyStatus[item.status] }}</span></td>
+                    <td>{{ item.elapsed_ms == null ? '—' : item.elapsed_ms + ' 毫秒' }}</td><td>{{ item.detail }}</td>
+                  </tr></tbody>
+                </table></div>
+              </div>
             </form>
             <div class="two-up">
               <div class="panel padded stack">
                 <h2>模型费用明细</h2>
-                <div class="table-wrap"><table><thead><tr><th>模型</th><th>调用</th><th>费用</th></tr></thead><tbody>
+                <div class="table-wrap"><table><thead><tr><th>模型</th><th>成功调用</th><th>费用</th></tr></thead><tbody>
                   <tr v-for="(stats, name) in models.usage.by_model" :key="name"><td>{{ name }}</td><td>{{ stats.calls }}</td><td>{{ money(stats.cost_yuan) }}</td></tr>
                 </tbody></table></div>
                 <p v-if="!Object.keys(models.usage.by_model || {}).length" class="muted">本次会话暂无模型调用。</p>
@@ -386,25 +454,40 @@ onBeforeUnmount(() => window.clearTimeout(timer))
               </div>
             </div>
           </div>
-          <p v-else class="empty">正在读取模型信息…</p>
+          <p v-else-if="modelBusy" class="empty">正在读取模型信息…</p>
         </template>
 
         <template v-else-if="book">
           <p v-if="book.legacy" class="feedback">旧版小说库已按只读方式打开。首次执行需要更新数据库的操作时，工作台会请你确认。</p>
           <div class="heading">
             <div><p class="kicker">{{ novels.find(item => item.name === selected)?.genre || '当前小说' }}</p><h1>{{ selected }}</h1></div>
-            <div class="actions" v-if="view === 'chapters'">
+            <div class="actions">
+              <span v-if="readAt" class="small muted" aria-live="polite">读取于 {{ readAt }}</span>
+              <button :disabled="busy" @click="refreshBook">{{ busy ? '读取中…' : '刷新' }}</button>
+              <template v-if="view === 'chapters'">
               <button :disabled="activeJob || starting" @click="form('generate', '批量生成章节', { count: 3, confirm: '' })">批量生成</button>
               <button class="primary" :disabled="activeJob || starting" @click="start('generate', { count: 1 })">＋ 生成下一章</button>
+              </template>
             </div>
           </div>
 
           <template v-if="view === 'chapters'">
             <div class="metrics">
               <div><span>审核通过 / 目标</span><strong>{{ approved }} <small>/ {{ book.target }}</small></strong><div class="progress"><i :style="{ width: percent + '%' }"></i></div></div>
-              <div><span>正文字数</span><strong>{{ size(words) }}</strong></div>
-              <div><span>待处理任务</span><strong>{{ book.tasks.filter(row => row.status === '待处理').length }}</strong></div>
+              <div><span>正文字数</span><strong>{{ size(book.progress.total_chars) }}</strong><span>草稿 {{ book.progress.draft }} 章</span></div>
+              <div><span>待处理任务</span><strong>{{ book.progress.task_status['待处理'] }}</strong><span>共 {{ book.progress.task_count }} 张任务卡</span></div>
             </div>
+            <details class="panel padded" style="margin-bottom: 1rem">
+              <summary>审稿趋势与任务状态</summary>
+              <p v-if="book.progress.quality_count">
+                最近 {{ book.progress.quality_count }} 章均分 {{ book.progress.avg_total.toFixed(1) }}/100 ·
+                L1 {{ book.progress.avg_l1.toFixed(1) }}/45 · L2 {{ book.progress.avg_l2.toFixed(1) }}/25 ·
+                L3 {{ book.progress.avg_l3.toFixed(1) }}/30 · 否决 {{ book.progress.veto_hits }} 章
+              </p>
+              <p v-else class="muted">最近 {{ book.progress.review_window }} 章暂无审稿评分。</p>
+              <p>进行中 {{ book.progress.task_status['进行中'] }} · 已完成 {{ book.progress.task_status['已完成'] }} ·
+                审稿失败 {{ book.progress.task_status['审稿失败'] }} · 未兑现伏笔 {{ book.progress.foreshadow_count }}</p>
+            </details>
             <div class="chapter-grid">
               <div class="panel chapter-list">
                 <div class="panel-head"><h2>章节目录</h2><span class="count">{{ book.chapters.length }}</span></div>
@@ -440,6 +523,7 @@ onBeforeUnmount(() => window.clearTimeout(timer))
                 </div>
                 <div class="paper-meta">
                   <span>{{ chapter.emotion_tag || '情绪未设置' }}</span><span>编辑评分 {{ chapter.review_score_total ?? '—' }}</span><span>读者评分 {{ chapter.reader_review_score ?? '—' }}</span>
+                  <span>重试 {{ chapter.retry_count || 0 }} 次</span>
                 </div>
                 <details v-if="chapter.plot_goal || chapter.summary || chapter.review_veto_items || chapter.reader_review_issues" class="chapter-details">
                   <summary>任务目标、摘要与审稿意见</summary>
@@ -458,7 +542,7 @@ onBeforeUnmount(() => window.clearTimeout(timer))
             <div class="panel-head"><h2>章节任务卡 <span class="count">{{ book.tasks.length }}</span></h2><input v-model="query" type="search" placeholder="搜索章节或情节" aria-label="搜索任务卡"></div>
             <div class="table-wrap"><table><thead><tr><th>章节</th><th>情节目标</th><th>情绪</th><th>状态</th><th>操作</th></tr></thead>
               <tbody><tr v-for="row in filteredTasks" :key="row.chapter_num">
-                <td>第{{ row.chapter_num }}章</td><td class="wide-cell">{{ row.plot_goal || '—' }}</td><td>{{ row.emotion_tag || '—' }}</td>
+                <td>第{{ row.chapter_num }}章</td><td class="wide-cell">{{ row.plot_goal || '—' }}<div v-if="row.rewrite_count" class="muted small">已重写 {{ row.rewrite_count }} 次</div></td><td>{{ row.emotion_tag || '—' }}</td>
                 <td><span class="badge">{{ statusText(row.status) }}</span></td>
                 <td><button :disabled="activeJob || row.status === '进行中'"
                   @click="form('task', '编辑第' + row.chapter_num + '章任务卡', { chapter: row.chapter_num, plot_goal: row.plot_goal || '', emotion_tag: row.emotion_tag || '铺垫', original: row.original_plot_goal })">编辑</button></td>

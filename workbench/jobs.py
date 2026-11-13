@@ -16,8 +16,9 @@ class Cancelled(BaseException):
 
 
 class Job:
-    def __init__(self, title, novel):
+    def __init__(self, kind, title, novel):
         self.id = uuid4().hex
+        self.kind = kind
         self.title = title
         self.novel = novel
         self.status = "running"
@@ -94,7 +95,7 @@ class Job:
     def snapshot(self, after=0):
         with self.changed:
             return {
-                "id": self.id, "title": self.title, "novel": self.novel,
+                "id": self.id, "kind": self.kind, "title": self.title, "novel": self.novel,
                 "status": self.status, "result": self.result, "error": self.error,
                 "prompt": self.prompt, "sequence": self.sequence,
                 "log": [row for row in self.log if row["id"] > after],
@@ -127,13 +128,13 @@ class Jobs:
         self.items = {}
         self.latest = None
 
-    def start(self, title, novel, action):
+    def start(self, kind, title, novel, action):
         with self.lock:
             if self.latest and self.latest.snapshot()["status"] in ACTIVE_STATES:
                 raise ValueError("已有操作正在执行，请先处理当前任务")
             if len(self.items) >= 12:
                 self.items.pop(next(iter(self.items)))
-            job = Job(title, novel)
+            job = Job(kind, title, novel)
             self.items[job.id] = self.latest = job
             Thread(target=job.run, args=(action,), daemon=True).start()
             return job.snapshot()

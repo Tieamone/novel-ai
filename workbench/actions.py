@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import os
+from time import perf_counter
 
 import main as cli
 from core import api_client, outline_manager, writer
@@ -23,7 +24,7 @@ TITLES = {
     "create": "新建小说", "import": "导入小说", "generate": "生成章节",
     "recover": "恢复审稿", "export": "导出章节", "delete_chapters": "删除章节",
     "delete_book": "删除小说", "task": "保存任务卡", "style": "保存写作风格",
-    "fingerprint": "生成文法指纹", "intent": "保存创作资料", "models": "设置模型",
+    "fingerprint": "生成文法指纹", "intent": "保存创作资料", "models": "验证角色模型",
     "foreshadow": "保存大纲伏笔", "delete_foreshadow": "删除大纲伏笔",
     "suggest": "生成伏笔建议", "reset": "重置任务", "rewrite": "重置正文",
     "clear_beats": "清除节拍缓存",
@@ -84,19 +85,33 @@ def string(data, key, maximum=1000000):
     return value
 
 
+def role_models(role, current):
+    options = {info["model"]: info for info in api_client.get_available_models(usage=role).values()}
+    if current not in options:
+        configured = next((info for info in api_client.get_available_models().values()
+                           if info["model"] == current), None)
+        provider = api_client.get_model_provider(role)
+        options[current] = configured or {
+            "model": current, "name": current, "provider": provider,
+            "env_key": "MIMO_API_KEY" if provider == "mimo" else "DASHSCOPE_API_KEY",
+        }
+    return options
+
+
 def models():
+    roles = {}
+    for role, (label, getter, _) in ROLES.items():
+        current = getter()
+        roles[role] = {
+            "label": label, "current": current,
+            "options": [
+                {"id": info["model"], "name": info["name"], "provider": info["provider"],
+                 "configured": bool(api_client._get_api_key(info["env_key"]))}
+                for info in role_models(role, current).values()
+            ],
+        }
     return {
-        "roles": {
-            key: {
-                "label": label, "current": getter(),
-                "options": [
-                    {"id": info["model"], "name": info["name"], "provider": info["provider"],
-                     "configured": len(os.getenv(info["env_key"], "")) > 10}
-                    for info in api_client.get_available_models(usage=key).values()
-                ],
-            }
-            for key, (label, getter, _) in ROLES.items()
-        },
+        "roles": roles,
         "usage": api_client.get_session_stats(),
         "failures": api_client.get_failure_stats(),
         "history": api_client.get_switch_history(),
@@ -105,21 +120,63 @@ def models():
 
 def set_models(data):
     changes = []
+    requests = {}
     for role, (label, getter, setter) in ROLES.items():
-        model = string(data, role, 160)
-        if not model or model == getter():
+        current = getter()
+        model = string(data, role, 160) or current
+        selected = role_models(role, current).get(model)
+        if not selected:
+            raise ValueError(f"{label}的模型不在可选列表中")
+        provider = selected["provider"]
+        entry = requests.setdefault((provider, model), {"roles": [], "env_key": selected["env_key"]})
+        entry["roles"].append(label)
+        if model != current or provider != api_client.get_model_provider(role):
+            changes.append((setter, model, provider))
+    results = []
+    for (provider, model), entry in requests.items():
+        check_cancelled()
+        record = {"provider": provider, "model": model, "roles": entry["roles"]}
+        role_names = "、".join(entry["roles"])
+        key = api_client._get_api_key(entry["env_key"])
+        if not key:
+            error = f"缺少 {entry['env_key']}，未发送请求"
+            say(f"{model}（{role_names}）：{error}")
+            results.append({**record, "status": "skipped", "detail": error})
             continue
-        selected = next((info for info in api_client.get_available_models(usage=role).values()
-                         if info["model"] == model), None)
-        if not selected or len(os.getenv(selected["env_key"], "")) <= 10:
-            raise ValueError(f"{label}不可用或缺少密钥")
-        say(f"正在验证{label}：{selected['name']}")
-        api_client.call_api("你是助手。", "回复ok", model_name=model,
-                            provider=selected["provider"], max_tokens=10, temperature=0.1, retry=1)
-        changes.append((setter, model, selected["provider"]))
-    for setter, model, provider in changes:
-        setter(model, provider)
-    return {"message": "会话模型已保存"}
+        say(f"正在请求 {provider} · {model}（{role_names}）")
+        start = perf_counter()
+        try:
+            reply = api_client.verify_model(model, provider)
+            check_cancelled()
+        except Exception as error:
+            category = api_client._format_api_error(error)["category"]
+            if isinstance(error, ValueError):
+                category = "服务商响应没有正文"
+            elapsed = round((perf_counter() - start) * 1000)
+            say(f"{model} 验证失败 · {category} · {elapsed} 毫秒")
+            results.append({**record, "status": "failed", "detail": category, "elapsed_ms": elapsed})
+        else:
+            elapsed = round((perf_counter() - start) * 1000)
+            # 只显示短回复，并剔除模型错误回显的配置凭证。
+            for env_name in ("DASHSCOPE_API_KEY", "MIMO_API_KEY", entry["env_key"]):
+                secret = api_client._get_api_key(env_name)
+                if secret:
+                    reply = reply.replace(secret, "已隐藏")
+            reply = " ".join(reply.split())[:80]
+            say(f"{model} 验证通过 · {elapsed} 毫秒")
+            results.append({**record, "status": "passed", "detail": reply, "elapsed_ms": elapsed})
+    check_cancelled()
+    passed = all(row["status"] == "passed" for row in results)
+    if passed:
+        for setter, model, provider in changes:
+            setter(model, provider)
+    if not passed:
+        message = "有模型未通过验证，本次会话配置未更新"
+    elif changes:
+        message = "模型验证通过，会话配置已更新"
+    else:
+        message = "当前模型验证通过"
+    return {"verification": results, "saved": passed and bool(changes), "message": message}
 
 
 def chapter_rows(novel, query, parameters=(), *, readonly=False):
@@ -246,7 +303,10 @@ def run(kind, novel, data):
         protect_exports(novel)
         chapter = data.get("chapter")
         paths = [export_chapter(novel, number(chapter))] if chapter is not None else export_all(novel)
-        return {"downloads": [Path(path).name for path in paths if path], "message": "导出操作已完成"}
+        downloads = [Path(path).name for path in paths if path]
+        if not downloads:
+            raise ValueError("没有可导出的章节正文")
+        return {"downloads": downloads, "message": f"已导出 {len(downloads)} 章"}
     if kind == "delete_book":
         if data.get("name_confirmation") != novel or data.get("confirm") != "YES":
             raise ValueError("请输入完整书名及 YES 确认删除")
@@ -273,7 +333,7 @@ def run(kind, novel, data):
         if len(reference.strip()) < 200:
             raise ValueError("参考文本至少需要 200 字")
         book_file(novel, "style_fingerprint.json")
-        save_fingerprint(novel, analyze_style(reference))
+        save_fingerprint(novel, analyze_style(reference, require_semantic=True))
     elif kind == "intent":
         field = string(data, "field", 20)
         if field not in INTENT_FILES:
@@ -290,7 +350,8 @@ def run(kind, novel, data):
         outline = book_file(novel, "master_outline.md")
         if not outline.is_file() or not outline.read_text(encoding="utf-8").strip():
             raise ValueError("请先为这本小说准备总大纲")
-        outline_manager.ai_suggest_outline_foreshadow(novel)
+        recorded = outline_manager.ai_suggest_outline_foreshadow(novel, strict=True)
+        return {"message": f"已录入 {recorded} 条伏笔" if recorded else "本次没有录入伏笔"}
     elif kind in ("reset", "rewrite", "clear_beats"):
         chapter = number(data.get("chapter"))
         if data.get("confirm") != "YES":
