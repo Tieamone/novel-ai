@@ -118,6 +118,7 @@ def create_app():
             intent[key] = path.read_text(encoding="utf-8") if path.is_file() else ""
         return jsonify(
             name=novel, target=cli._get_target_chapters(novel), chapters=chapters, tasks=tasks,
+            progress=cli.get_novel_progress(novel, readonly=True),
             foreshadow=outline,
             health=MemoryManager(novel, readonly=True).get_foreshadow_report(last_chapter)
             if last_chapter and actions.columns(novel, "foreshadowing") else None,
@@ -182,7 +183,7 @@ def create_app():
             actions.book_directory(novel)
         else:
             novel = None
-        return jsonify(jobs.start(actions.TITLES[kind], novel, lambda: actions.run(kind, novel, data))), 202
+        return jsonify(jobs.start(kind, actions.TITLES[kind], novel, lambda: actions.run(kind, novel, data))), 202
 
     def get_job(job_id):
         job = jobs.get(job_id)

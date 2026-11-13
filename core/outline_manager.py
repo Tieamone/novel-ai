@@ -224,7 +224,7 @@ def mark_outline_foreshadow_status(novel_name: str, fid: str,
 
 # ==================== AI 辅助生成 ====================
 
-def ai_suggest_outline_foreshadow(novel_name: str):
+def ai_suggest_outline_foreshadow(novel_name: str, *, strict=False):
     """AI 根据总大纲生成伏笔建议列表，供用户选择录入。"""
     # 1. 读取大纲
     outline_path = get_data_dir(novel_name) / "master_outline.md"
@@ -311,6 +311,8 @@ def ai_suggest_outline_foreshadow(novel_name: str):
         )
     except Exception as e:
         print(f"  [错误] API 调用失败：{e}")
+        if strict:
+            raise ValueError("模型调用失败，请查看任务记录后重试") from e
         return
 
     # 5. 清除思考块 + 解析 JSON
@@ -321,6 +323,8 @@ def ai_suggest_outline_foreshadow(novel_name: str):
         print("  [错误] AI 返回中未找到 JSON 数组")
         print(f"  原始返回：\n{raw_clean[:500]}")
         print("  请手动在菜单中录入伏笔（选项2）")
+        if strict:
+            raise ValueError("模型未返回可用的伏笔建议")
         return
 
     suggestions = _parse_json_robust(json_match.group())
@@ -328,11 +332,19 @@ def ai_suggest_outline_foreshadow(novel_name: str):
         print("  [错误] JSON 解析失败")
         print(f"  原始返回：\n{raw_clean[:500]}")
         print("  请手动在菜单中录入伏笔（选项2）")
+        if strict:
+            raise ValueError("模型返回的伏笔建议格式不正确")
         return
 
     if not isinstance(suggestions, list) or len(suggestions) == 0:
         print("  [提示] AI 未返回有效建议")
-        return
+        return 0
+    suggestions = [item for item in suggestions if isinstance(item, dict)
+                   and str(item.get("description") or "").strip()]
+    if not suggestions:
+        if strict:
+            raise ValueError("模型返回的伏笔建议缺少有效描述")
+        return 0
 
     try:
         from core.memory_manager import MemoryManager
@@ -398,6 +410,7 @@ def ai_suggest_outline_foreshadow(novel_name: str):
             )
             count += 1
         print(f"\n  [OK] 已录入 {count} 条伏笔")
+        return count
 
     elif mode == "b":
         count = 0
@@ -436,8 +449,10 @@ def ai_suggest_outline_foreshadow(novel_name: str):
             else:
                 print("    [跳过]")
         print(f"\n  [OK] 逐条确认完毕，共录入 {count} 条")
+        return count
     else:
         print("  已取消")
+        return 0
 
 
 def generate_outline_foreshadow(novel_name: str, target_chapters: int,
