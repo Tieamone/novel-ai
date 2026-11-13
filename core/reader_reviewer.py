@@ -1,5 +1,6 @@
 import json
 import re
+from core.interaction import say as print
 from core.api_client import call_reader_reviewer_api, increment_failure_counter, reset_failure_counter
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg

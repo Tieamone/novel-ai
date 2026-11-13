@@ -67,10 +67,11 @@ def _load_custom_models() -> Optional[List[Dict]]:
                 "category": item.get("category", category_info.get("category", "general")),
                 "description": item.get("description", ""),
                 "context_length": item.get("context_length", 32768),
+                "max_output_tokens": item.get("max_output_tokens"),
                 "input_price": item.get("input_price", category_info.get("input_price", DEFAULT_PRICING["input"])),
                 "output_price": item.get("output_price", category_info.get("output_price", DEFAULT_PRICING["output"])),
                 "has_free_quota": item.get("has_free_quota", True),
-                "provider": "dashscope",
+                "provider": item.get("provider", "dashscope"),
             })
         
         if models:
@@ -109,6 +110,7 @@ def _parse_model_info_from_api(model_data: Dict) -> Optional[Dict]:
         "category": category_info.get("category", "general") if category_info else "general",
         "description": "",
         "context_length": 32768,
+        "max_output_tokens": model_data.get("max_output_tokens"),
         "input_price": input_price,
         "output_price": output_price,
         "has_free_quota": has_free_quota,
@@ -216,15 +218,22 @@ def model_list_to_menu_format(models: List[Dict]) -> Dict[str, Dict]:
     menu = {}
     for idx, model in enumerate(models, 1):
         key = str(idx)
+        # 根据 provider 决定 env_key
+        provider = model.get("provider", "dashscope")
+        if provider == "mimo":
+            env_key = "MIMO_API_KEY"
+        else:
+            env_key = "DASHSCOPE_API_KEY"
         menu[key] = {
             "name": model["name"],
             "model": model["model"],
-            "provider": model["provider"],
+            "provider": provider,
             "input_price": model.get("input_price", DEFAULT_PRICING["input"]),
             "output_price": model.get("output_price", DEFAULT_PRICING["output"]),
             "free_tier": model.get("free_tier", False),
             "has_free_quota": model.get("has_free_quota", False),
-            "env_key": "DASHSCOPE_API_KEY",
+            "env_key": env_key,
             "context_length": model.get("context_length", 0),  # 保留，供 is_high_capacity_model 使用
+            "max_output_tokens": model.get("max_output_tokens"),
         }
     return menu

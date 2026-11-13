@@ -45,7 +45,7 @@ def is_transient_error(error) -> bool:
 
 
 @contextmanager
-def with_db_connection(novel_name: str) -> Generator[sqlite3.Connection, None, None]:
+def with_db_connection(novel_name: str, *, readonly=False) -> Generator[sqlite3.Connection, None, None]:
     """
     数据库连接上下文管理器
 
@@ -60,7 +60,7 @@ def with_db_connection(novel_name: str) -> Generator[sqlite3.Connection, None, N
     Yields:
         sqlite3.Connection: 数据库连接对象
     """
-    conn = get_connection(novel_name)
+    conn = get_connection(novel_name, readonly=True) if readonly else get_connection(novel_name)
     try:
         yield conn
     finally:

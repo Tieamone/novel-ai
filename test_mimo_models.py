@@ -25,7 +25,7 @@ def test_mimo_models():
         print("请在.env文件中设置: MIMO_API_KEY=你的Key")
         return False
 
-    print(f"[OK] MIMO_API_KEY: {api_key[:10]}...")
+    print("[OK] MIMO_API_KEY 已配置")
 
     # 测试模型列表
     models = [

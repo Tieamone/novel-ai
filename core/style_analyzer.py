@@ -5,6 +5,7 @@
 
 import json
 import re
+from core.interaction import say as print
 import math
 from collections import Counter
 from pathlib import Path

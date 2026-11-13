@@ -4,6 +4,7 @@ import re
 from core.db import ensure_database
 from core.utils import with_db_connection, DatabaseTransaction
 from core.config_loader import get_data_dir
+from core.interaction import ask as input, say as print
 
 
 def _fix_llm_json(raw: str) -> str:
@@ -254,7 +255,7 @@ def ai_suggest_outline_foreshadow(novel_name: str):
         with with_db_connection(novel_name) as conn:
             row = conn.execute(
                 "SELECT MAX(chapter_num) AS mc FROM chapters "
-                "WHERE status='approved'",
+                "WHERE status IN ('approved', '已审核', '强制通过')",
             ).fetchone()
             if row and row["mc"] is not None:
                 max_chapter = row["mc"]
@@ -373,7 +374,13 @@ def ai_suggest_outline_foreshadow(novel_name: str):
     print("    a. 全部录入")
     print("    b. 逐条确认（y录入/n跳过/e编辑后录入）")
     print("    c. 取消")
-    mode = input("  请选择：").strip().lower()
+    mode = input("  请选择：", options=(
+        ("a", "全部录入"), ("b", "逐条确认"), ("c", "取消"),
+    ), context="\n".join(
+        f"{index}. {item.get('description', '')}（{item.get('category', '')}，"
+        f"第{item.get('plant_chapter', '?')}章埋入，第{item.get('resolve_chapter', '?')}章兑现）"
+        for index, item in enumerate(suggestions, 1)
+    )).strip().lower()
 
     if mode == "a":
         count = 0
@@ -401,7 +408,9 @@ def ai_suggest_outline_foreshadow(novel_name: str):
             resolve = s.get("resolve_chapter", 0)
             imp = s.get("importance", 3)
             print(f"\n  [{i}] {desc}  ({cat}, 埋入:{plant}, 兑现:{resolve}, 重要度:{imp})")
-            sub = input("  y录入/n跳过/e编辑：").strip().lower()
+            sub = input("  y录入/n跳过/e编辑：", options=(
+                ("y", "录入"), ("n", "跳过"), ("e", "编辑后录入"),
+            )).strip().lower()
             if sub == "y":
                 add_outline_foreshadow(
                     novel_name, desc, cat, int(plant), int(resolve), int(imp),

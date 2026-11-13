@@ -2,18 +2,21 @@ import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime
+from core.interaction import say as print
 
 from core.db import get_connection, ensure_database
 from core.utils import with_db_connection, DatabaseTransaction
 
 
 class MemoryManager:
-    def __init__(self, novel_name: str):
+    def __init__(self, novel_name: str, *, readonly=False):
         self.novel_name = novel_name
+        self.readonly = readonly
         from core.config_loader import get_data_dir
         self.data_dir = get_data_dir(novel_name)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        ensure_database(novel_name)
+        if not readonly:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            ensure_database(novel_name)
 
     # ==================== 世界观 ====================
 
@@ -285,7 +288,7 @@ class MemoryManager:
         """
         import re
 
-        with with_db_connection(self.novel_name) as conn:
+        with with_db_connection(self.novel_name, readonly=self.readonly) as conn:
             # 当前未兑现伏笔
             active_rows = conn.execute(
                 "SELECT * FROM foreshadowing WHERE status='active'"

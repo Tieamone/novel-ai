@@ -1,6 +1,9 @@
 import json
 import re
+import statistics
+from collections import Counter
 from pathlib import Path
+from core.interaction import ask as input, say as print
 from core.api_client import call_author_api, call_reviewer_api, increment_failure_counter, reset_failure_counter, get_current_author_model, get_author_model
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg, get_data_dir
@@ -245,6 +248,16 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
         except Exception:
             pass
 
+    # 跨章质量警告注入（优化G：Anti-Slop L3 跨章级检测）
+    cross_quality_block = ""
+    if _novel_name:
+        try:
+            cross_warnings = _check_cross_chapter_quality(_novel_name, chapter_num)
+            if cross_warnings:
+                cross_quality_block = "\n=== 跨章质量警告 ===\n" + "\n".join([f"⚠ {w}" for w in cross_warnings]) + "\n"
+        except Exception:
+            pass
+
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
     hard_rules = _format_rule_block("硬约束（必须满足）", WRITER_HARD_CONSTRAINTS)
     forbidden_rules = _format_rule_block("禁止项（必须避免）", WRITER_FORBIDDEN_RULES)
@@ -299,6 +312,7 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
 {s_str}
 {intent_block}
 {fingerprint_block}
+{cross_quality_block}
 {transition_block}
 {hard_rules}
 
@@ -811,6 +825,74 @@ def _rule_based_ai_check(text: str) -> list:
     return detected
 
 
+def _check_cross_chapter_quality(novel_name: str, current_chapter: int) -> list:
+    """跨章质量统计，检测 L3 级别的模式问题（优化G：Anti-Slop L3 跨章级检测）
+
+    检测项：
+    1. 情绪曲线平坦：最近5章中超过3章情绪标签相同
+    2. 句式单调性：最近3章平均句长标准差低于阈值
+    3. 对话/叙述比例失衡：最近3章对话行占比持续低于20%或高于70%
+    """
+    warnings = []
+    try:
+        with with_db_connection(novel_name) as conn:
+            # 1. 情绪曲线平坦检测
+            emotion_rows = conn.execute(
+                "SELECT emotion_tag FROM chapters WHERE chapter_num < ? ORDER BY chapter_num DESC LIMIT 5",
+                (current_chapter,)
+            ).fetchall()
+            if len(emotion_rows) >= 3:
+                emotion_tags = [row["emotion_tag"] or "铺垫" for row in emotion_rows]
+                tag_counts = Counter(emotion_tags)
+                most_common_tag, most_common_count = tag_counts.most_common(1)[0]
+                if most_common_count >= 3:
+                    warnings.append(f"情绪曲线平坦：最近{len(emotion_tags)}章中有{most_common_count}章为'{most_common_tag}'，建议增加情绪起伏")
+
+            # 2. 句式单调性检测 + 3. 对话/叙述比例失衡检测（合并查询）
+            content_rows = conn.execute(
+                "SELECT content FROM chapters WHERE chapter_num < ? ORDER BY chapter_num DESC LIMIT 3",
+                (current_chapter,)
+            ).fetchall()
+            if len(content_rows) >= 2:
+                # 句式单调性检测
+                sentence_lengths = []
+                dialogue_ratios = []
+                for row in content_rows:
+                    content = row["content"] or ""
+                    if not content:
+                        continue
+                    # 按中文句号、问号、感叹号分句
+                    sentences = re.split(r'[。！？]', content)
+                    sentences = [s.strip() for s in sentences if s.strip()]
+                    if sentences:
+                        avg_len = statistics.mean([len(s) for s in sentences])
+                        sentence_lengths.append(avg_len)
+                    # 统计对话行占比
+                    lines = content.split('\n')
+                    total_lines = len([l for l in lines if l.strip()])
+                    if total_lines > 0:
+                        dialogue_lines = len([l for l in lines if '"' in l or '"' in l or '："' in l])
+                        dialogue_ratios.append(dialogue_lines / total_lines)
+
+                # 句式单调性判断
+                if len(sentence_lengths) >= 2:
+                    std_dev = statistics.stdev(sentence_lengths)
+                    if std_dev < 8:  # 阈值：句长标准差低于8视为单调
+                        warnings.append(f"句式单调：最近{len(sentence_lengths)}章平均句长标准差仅为{std_dev:.1f}，句式结构过于相似")
+
+                # 对话/叙述比例失衡判断
+                if len(dialogue_ratios) >= 2:
+                    avg_ratio = statistics.mean(dialogue_ratios)
+                    if avg_ratio < 0.2:
+                        warnings.append(f"对话偏少：最近{len(dialogue_ratios)}章对话行占比仅{avg_ratio:.0%}，建议增加对话推进剧情")
+                    elif avg_ratio > 0.7:
+                        warnings.append(f"对话偏多：最近{len(dialogue_ratios)}章对话行占比达{avg_ratio:.0%}，建议增加叙述描写丰富场景")
+
+    except Exception:
+        pass  # 检测失败不阻断写作
+    return warnings
+
+
 def _check_cross_chapter_frequency(novel_name: str, current_chapter: int) -> list:
     """检查最近3章的高频词重复（优化C：Anti-Slop L1 扩展）"""
     from collections import Counter
@@ -1188,6 +1270,16 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
         except Exception:
             pass
 
+    # 跨章质量警告注入（优化G：Anti-Slop L3 跨章级检测）
+    cross_quality_block = ""
+    if _novel_name:
+        try:
+            cross_warnings = _check_cross_chapter_quality(_novel_name, chapter_num)
+            if cross_warnings:
+                cross_quality_block = "\n=== 跨章质量警告 ===\n" + "\n".join([f"⚠ {w}" for w in cross_warnings]) + "\n"
+        except Exception:
+            pass
+
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
     half_min = word_min // 2
     half_max = word_max // 2
@@ -1244,6 +1336,7 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 {s_str}
 {intent_block}
 {fingerprint_block}
+{cross_quality_block}
 {transition_block}
 {hard_rules}
 
@@ -1738,7 +1831,9 @@ def select_style_interactive() -> str:
     for key, style in AUTHOR_STYLES.items():
         print(f"  {key}. {style['name']:<12} {style['desc']}")
     print()
-    choice = input("请输入编号（默认1）：").strip() or "1"
+    choice = input("请输入编号（默认1）：", options=tuple(
+        (key, item["name"]) for key, item in AUTHOR_STYLES.items()
+    )).strip() or "1"
     if choice not in AUTHOR_STYLES:
         choice = "1"
     selected = AUTHOR_STYLES[choice]

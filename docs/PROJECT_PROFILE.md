@@ -4,22 +4,24 @@
 
 | 属性         | 说明                                                         |
 | ------------ | ------------------------------------------------------------ |
-| 项目类型     | CLI 桌面应用（Python 3.11+，依赖版本见 requirements.txt）         |
+| 项目类型     | 本地 CLI 与浏览器工作台（依赖见 requirements.txt 和 requirements-web.txt） |
 | 总代码量     | ~10300+ 行（14 个核心模块 + 1 个工具脚本）                         |
 | 数据库       | SQLite WAL 模式，每部小说独立 `novel.db` 文件                |
 | AI 后端      | DashScope（阿里百炼）+ Mimo（小米）双 Provider，共 14 个可用模型 |
 | 核心模块数   | 14 个                                                        |
 | 数据库表数   | 11 张                                                        |
-| 主要入口     | `main.py`（2000+ 行 CLI 菜单系统）                           |
+| 主要入口     | `python main.py`（浏览器工作台），`python main.py --cli`（CLI） |
 | 配置管理     | `config.yaml`（YAML 格式，单例缓存加载）                     |
 
 ---
+
+浏览器工作台的安装、菜单映射和验证方式见 [工作台说明](WORKBENCH.md)。
 
 ## 2. 目录结构
 
 ```
 novel-ai/
-├── main.py                   # CLI 主入口，菜单系统，2000+ 行
+├── main.py                   # 浏览器与命令行入口，包含 CLI 菜单
 ├── config.yaml                # 全局配置文件
 ├── .env                       # 环境变量（API Key 等）
 ├── sensitive_words.txt        # 敏感词列表（导出时替换）
@@ -121,17 +123,17 @@ run_planner(novel_name, genre, keywords)                       # [core/planner.p
 **从 newbook.txt 导入流程**：
 
 ```
-main() → _import_from_text_file()                              # [main.py:L1607]
-  ↓ 解析 newbook.txt → {novel_name, genre, outline, characters_text, world_setting, ...}
+main() → _import_from_text_file()
+  ↓ 解析 newbook.txt → {novel_name, genre, outline, characters_text, world_setting, timeline, core_conflict, ...}
   ↓ init_database() → _write_novel_info()
-  ↓ 写入大纲、世界观、角色档案
+  ↓ 写入大纲、世界观（合并时间线/核心冲突）、角色档案
   ↓ get_style_choice() → style_key
   ↓ generate_outline_foreshadow(novel_name, target_chapters)   # [core/outline_manager.py:L375]
   │   ↓ 读取 master_outline.md → AI 生成 20-30 条伏笔建议
   │   ↓ review_outline_foreshadow() 审稿过滤
   │   ↓ 写入 outline_foreshadowing 表
   ↓ split_outline_to_tasks(..., full_batch=True)
-  ↓ → chapters_menu()
+  ↓ 外层统一写入风格/创作意图模板 → chapters_menu()
 ```
 
 ### 3.2 续写 / 自动生成流程
@@ -145,10 +147,11 @@ chapters_menu → generate_chapter_auto(novel_name)              # [main.py:L429
   ↓
   ├─ 从 chapter_tasks 找 MIN(chapter_num) WHERE status IN ('待处理')
   │   兜底：MAX(chapters.chapter_num) + 1
+  │   若 next_num 超过 target_chapters.txt → 停止并提示
   │
   ├─ get_next_chapter_goal(novel_name, next_num)              # [main.py:L375]
   │   ↓ 查 chapter_tasks → plot_goal, emotion_tag
-  │   ↓ 若任务卡用完 → extend_tasks() 自动扩展
+  │   ↓ 若任务卡用完且未达目标章数 → extend_tasks() 自动扩展
   │   ↓ 兜底：实时 AI 从大纲生成目标
   │
   ├─ _claim_task_for_writing(novel_name, next_num, ...)      # [main.py:L119]
@@ -332,7 +335,7 @@ _breakpoint_menu(novel_name)             # [main.py:L1285]
   │    清除节拍内存缓存 _cached_beat_plan = ""
   │
   ├─ 3. 查看章节写作历史
-  │    查询 writing_sessions 表
+  │    查询 writing_sessions 表（由 write_and_review 每次尝试写入）
   │
   ├─ 4. 重写指定章节（保留摘要）
   │    UPDATE chapters SET content=NULL, status='草稿'
@@ -354,7 +357,7 @@ _recover_review_failed(novel_name)       # [main.py:L727]
   │  2. 重写并重审
   │     write_and_review() → _save_chapter_memory() → export_chapter()
   │  3. 强制通过并导出
-  │     mm.update_chapter_status("强制通过") → export_chapter()
+  │     _force_approve_chapter() → 同步伏笔 → export_chapter()
 ```
 
 ---
@@ -462,7 +465,7 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `generate_characters()` | `(character_names, outline, world, mm, review_mode) -> list` | 人物档案生成 |
 | `get_style_choice()` | `() -> str` | 写作风格选择 |
 | `split_outline_to_tasks()` | `(outline, novel_name, review_mode, target_chapters, full_batch, start) -> int` | 大纲→任务卡拆分，返回 saved 数量 |
-| `extend_tasks()` | `(novel_name, from_chapter) -> None` | 任务卡用完后自动扩展 |
+| `extend_tasks()` | `(novel_name, from_chapter) -> None` | 任务卡用完后在目标章数内自动扩展 |
 | `rewrite_task_for_chapter()` | `(novel_name, chapter_num, veto_reasons, current_goal, current_emotion_tag) -> dict` | 冲突检测后重写任务卡 |
 
 **关键数据结构**：
