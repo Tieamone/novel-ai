@@ -1,5 +1,10 @@
 import json
 import re
+from datetime import datetime
+from core.interaction import ask as input, say as print, check_cancelled
+
+_SWITCH_CHOICES = (("y", "切换模型"), ("n", "保留当前模型"))
+_RETRY_CHOICES = (("1", "继续局部修订"), ("2", "完全重写"), ("3", "切换模型重新生成"))
 from core.api_client import call_reviewer_api, increment_failure_counter, reset_failure_counter, check_switch_needed
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg
@@ -712,6 +717,176 @@ def _increment_retry_safe(novel_name: str, chapter_num: int):
             """, (chapter_num,))
 
 
+def _start_writing_session(novel_name: str, chapter_num: int) -> int | None:
+    """记录一次写作/修订尝试开始，失败不影响主流程。"""
+    try:
+        with with_db_connection(novel_name) as conn:
+            with DatabaseTransaction(conn):
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(attempt), 0) + 1 as attempt "
+                    "FROM writing_sessions WHERE chapter_num=?",
+                    (chapter_num,),
+                ).fetchone()
+                attempt = row["attempt"] if row else 1
+                cur = conn.execute("""
+                    INSERT INTO writing_sessions
+                    (chapter_num, attempt, started_at)
+                    VALUES (?, ?, ?)
+                """, (chapter_num, attempt, datetime.now().isoformat(timespec="seconds")))
+                return cur.lastrowid
+    except Exception as e:
+        print(f"  [提示] 写作历史开始记录失败（不影响流程）：{e}")
+        return None
+
+
+def _finish_writing_session(novel_name: str, session_id: int | None,
+                            end_reason: str, content: str = "",
+                            review_score=None):
+    """记录一次写作/修订尝试结束，失败不影响主流程。"""
+    if not session_id:
+        return
+    try:
+        word_count = len(content or "")
+        with with_db_connection(novel_name) as conn:
+            with DatabaseTransaction(conn):
+                conn.execute("""
+                    UPDATE writing_sessions
+                    SET ended_at=?, end_reason=?, word_count=?, review_score=?
+                    WHERE id=?
+                """, (
+                    datetime.now().isoformat(timespec="seconds"),
+                    end_reason,
+                    word_count,
+                    review_score,
+                    session_id,
+                ))
+    except Exception as e:
+        print(f"  [提示] 写作历史结束记录失败（不影响流程）：{e}")
+
+
+def _force_approve_chapter(novel_name: str, chapter_num: int,
+                           content: str, mm: MemoryManager = None) -> str:
+    """强制通过并同步运行时伏笔与大纲伏笔状态。"""
+    if mm is None:
+        mm = MemoryManager(novel_name)
+    try:
+        _update_status_safe(novel_name, chapter_num, "强制通过")
+    except Exception as e:
+        print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
+        mm.update_chapter_status(chapter_num, "强制通过")
+    _auto_redeem_foreshadowing(mm, chapter_num, content)
+    _sync_outline_foreshadow(novel_name, chapter_num, content)
+    return content or ""
+
+
+def _find_unique_cut_paragraph(paragraphs: list[str], start_text: str) -> int | None:
+    start_text = (start_text or "").strip()
+    if not start_text:
+        return None
+    matches = [
+        i for i, para in enumerate(paragraphs)
+        if para.strip().startswith(start_text)
+    ]
+    if not matches:
+        matches = [
+            i for i, para in enumerate(paragraphs)
+            if start_text in para.strip()
+        ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _apply_cut_suggestions_to_text(content: str, cut_suggestions: list,
+                                   word_min: int,
+                                   selected_indexes: set[int] = None) -> tuple:
+    """按用户选择保守裁切段落；返回 (正文, 已应用, 已跳过)。"""
+    if selected_indexes is None:
+        selected_indexes = set(range(1, len(cut_suggestions) + 1))
+    paragraphs = (content or "").split("\n\n")
+    applied = []
+    skipped = []
+
+    for idx, item in enumerate(cut_suggestions or [], 1):
+        if idx not in selected_indexes:
+            continue
+        start_text = str(item.get("start", "") if isinstance(item, dict) else "").strip()
+        para_idx = _find_unique_cut_paragraph(paragraphs, start_text)
+        if para_idx is None:
+            skipped.append((idx, "未找到唯一匹配段落"))
+            continue
+
+        candidate = paragraphs[:para_idx] + paragraphs[para_idx + 1:]
+        new_text = "\n\n".join(candidate).strip()
+        if len(new_text) < word_min:
+            skipped.append((idx, f"裁切后低于最低字数 {word_min}"))
+            continue
+
+        removed = paragraphs[para_idx].strip()
+        paragraphs = candidate
+        applied.append((idx, removed[:40]))
+
+    return "\n\n".join(paragraphs).strip(), applied, skipped
+
+
+def _apply_cut_suggestions_interactive(novel_name: str, chapter_num: int,
+                                       content: str, cut_suggestions: list,
+                                       plot_goal: str,
+                                       emotion_tag: str) -> str:
+    """交互式应用责任编辑给出的精简建议。"""
+    if not cut_suggestions:
+        return content
+
+    print(f"\n  [精简建议] 发现 {len(cut_suggestions)} 处可裁切段落")
+    choice = input("  是否逐条查看并选择应用？(y/n，默认n)：", options=(
+        ("y", "查看建议"), ("n", "保留原文"),
+    )).strip().lower()
+    if choice != "y":
+        print("  [精简建议] 已跳过自动裁切")
+        return content
+
+    selected = set()
+    paragraphs = (content or "").split("\n\n")
+    for i, item in enumerate(cut_suggestions, 1):
+        start_text = str(item.get("start", "") if isinstance(item, dict) else "").strip()
+        reason = str(item.get("reason", "") if isinstance(item, dict) else "").strip()
+        para_idx = _find_unique_cut_paragraph(paragraphs, start_text)
+        preview = paragraphs[para_idx].strip()[:160] if para_idx is not None else "未找到唯一匹配段落"
+        print(f"\n  {i}. {start_text or '（无首句）'}")
+        if reason:
+            print(f"     理由：{reason}")
+        print(f"     段落预览：{preview}")
+        apply_one = input("     删除该段？(y/n，默认n)：", options=(
+            ("y", "删除该段"), ("n", "保留该段"),
+        )).strip().lower()
+        if apply_one == "y":
+            selected.add(i)
+
+    if not selected:
+        print("  [精简建议] 未选择任何裁切项")
+        return content
+
+    word_min = int(cfg("novel", "chapter_word_min", 3000) or 3000)
+    new_content, applied, skipped = _apply_cut_suggestions_to_text(
+        content, cut_suggestions, word_min, selected
+    )
+    for idx, reason in skipped:
+        print(f"  [精简建议] 第{idx}项跳过：{reason}")
+    if not applied:
+        print("  [精简建议] 没有可安全应用的裁切项")
+        return content
+
+    mm = MemoryManager(novel_name)
+    word_target = cfg("novel", "chapter_word_target", 3500)
+    mm.save_chapter(
+        chapter_num, f"第{chapter_num}章",
+        new_content, "草稿",
+        word_target=word_target,
+        plot_goal=plot_goal,
+        emotion_tag=emotion_tag,
+    )
+    print(f"  [精简建议] 已应用 {len(applied)} 项，当前字数：{len(new_content)}字")
+    return new_content
+
+
 
 _OUTLINE_STOPWORDS = frozenset([
     "一个", "这个", "那个", "没有", "不是", "就是", "也是", "还是", "但是",
@@ -879,6 +1054,7 @@ def write_and_review(novel_name: str, chapter_num: int,
 
     # 外层 while：正常流程只走一次；任务卡重写后最多再走一次
     while True:
+        check_cancelled()
         _rewrite_requested = False
 
         # ── 平台期检测：记录每轮评分，波动过小时提前终止 ──────
@@ -889,6 +1065,8 @@ def write_and_review(novel_name: str, chapter_num: int,
 
         for attempt in range(max_retry):
             print(f"\n  第{attempt+1}次写作尝试...")
+            _session_id = _start_writing_session(novel_name, chapter_num)
+            _attempt_content = ""
 
             try:
                 if _revise_mode and _original_content:
@@ -903,17 +1081,22 @@ def write_and_review(novel_name: str, chapter_num: int,
                                             retry_feedback=_retry_feedback)
                     if _original_content is None:
                         _original_content = content
+                _attempt_content = content or ""
                 reset_failure_counter("author")
             except Exception as e:
                 print(f"  [错误] 写作调用失败：{e}")
                 increment_failure_counter("author")
+                _finish_writing_session(
+                    novel_name, _session_id, "写作调用失败",
+                    _attempt_content, None,
+                )
                 if check_switch_needed("author"):
                     print(f"\n{'='*60}")
                     print(f"  [提示] 作者模型连续失败，建议切换模型")
                     print(f"{'='*60}")
                     from core.api_client import select_all_models_interactive, _select_single_model
                     print("\n是否切换作者模型？(y/n，默认y)")
-                    choice = input().strip().lower() or "y"
+                    choice = input(options=_SWITCH_CHOICES).strip().lower() or "y"
                     if choice == "y":
                         print("\n【选择新的作者模型】")
                         author_choice = _select_single_model("作者模型", default="1")
@@ -934,13 +1117,17 @@ def write_and_review(novel_name: str, chapter_num: int,
                 if review_retry_count < MAX_REVIEW_RETRIES:
                     print(f"\n  [重试审稿] 责任编辑返回异常（{issue_msg}），第{review_retry_count}/{MAX_REVIEW_RETRIES}次重试...")
                     increment_failure_counter("reviewer")
+                    _finish_writing_session(
+                        novel_name, _session_id, "责任编辑异常重试",
+                        content, result.get("score_total"),
+                    )
                     if check_switch_needed("reviewer"):
                         print(f"\n{'='*60}")
                         print(f"  [提示] 审稿模型连续异常，建议切换模型")
                         print(f"{'='*60}")
                         from core.api_client import select_all_models_interactive, _select_single_model
                         print("\n是否切换审稿模型？(y/n，默认y)")
-                        choice = input().strip().lower() or "y"
+                        choice = input(options=_SWITCH_CHOICES).strip().lower() or "y"
                         if choice == "y":
                             print("\n【选择新的审稿模型】")
                             reviewer_choice = _select_single_model("审稿模型", default="1")
@@ -955,6 +1142,10 @@ def write_and_review(novel_name: str, chapter_num: int,
                     except Exception as e:
                         print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
                         mm.update_chapter_status(chapter_num, "审稿失败")
+                    _finish_writing_session(
+                        novel_name, _session_id, "审稿失败",
+                        content, result.get("score_total"),
+                    )
                     return ""
 
             if not result.get("pass"):
@@ -1004,7 +1195,10 @@ def write_and_review(novel_name: str, chapter_num: int,
                     print("  2. 手动输入新的情节目标")
                     print("  3. 继续原任务卡重试（切换模型）")
                     print("  4. 强制通过当前版本")
-                    conflict_choice = input("\n  请选择（默认1）：").strip() or "1"
+                    conflict_choice = input("\n  请选择（默认1）：", options=(
+                        ("1", "基于大纲重写任务卡"), ("2", "手动输入新目标"),
+                        ("3", "沿用任务卡并切换模型"), ("4", "强制通过"),
+                    )).strip() or "1"
 
                     if conflict_choice == "1":
                         print("\n  [任务卡重写] 正在基于大纲生成新目标...")
@@ -1033,11 +1227,15 @@ def write_and_review(novel_name: str, chapter_num: int,
                         _rewrite_requested = True
                         print(f"  [OK] 新任务卡：{plot_goal}")
                         print(f"       情绪标签：{emotion_tag}")
+                        _finish_writing_session(
+                            novel_name, _session_id, "任务卡自动重写",
+                            content, result.get("score_total"),
+                        )
                         break  # 跳出 for 循环，外层 while 重新开始
 
                     elif conflict_choice == "2":
                         print("\n  请输入新的情节目标（40-80字，直接回车取消）：")
-                        manual_goal = input("  > ").strip()
+                        manual_goal = input("  > ", multiline=True).strip()
                         if manual_goal and len(manual_goal) >= 10:
                             plot_goal   = manual_goal
                             _original_plot_goal   = plot_goal
@@ -1070,6 +1268,10 @@ def write_and_review(novel_name: str, chapter_num: int,
                             except Exception as _e:
                                 print(f"  [警告] 任务卡更新失败（非致命）：{_e}")
                             print(f"  [OK] 已更新任务卡目标")
+                            _finish_writing_session(
+                                novel_name, _session_id, "任务卡手动重写",
+                                content, result.get("score_total"),
+                            )
                             break  # 跳出 for 循环，外层 while 重新开始
                         else:
                             print("  [提示] 输入无效，继续原任务卡重试")
@@ -1077,12 +1279,13 @@ def write_and_review(novel_name: str, chapter_num: int,
 
                     elif conflict_choice == "4":
                         print(f"  [强制通过] 保留当前版本")
-                        try:
-                            _update_status_safe(novel_name, chapter_num, "强制通过")
-                        except Exception as e:
-                            print(f"  [警告] 状态更新失败：{e}")
-                            mm.update_chapter_status(chapter_num, "强制通过")
-                        return content or ""
+                        _finish_writing_session(
+                            novel_name, _session_id, "强制通过（冲突菜单）",
+                            content, result.get("score_total"),
+                        )
+                        return _force_approve_chapter(
+                            novel_name, chapter_num, content, mm
+                        )
 
                     # choice == "3"：跳过冲突菜单，走正常重试逻辑（下方）
                 # ─────────────────────────────────────────────────────
@@ -1096,12 +1299,13 @@ def write_and_review(novel_name: str, chapter_num: int,
                     recent = _scores_history[-_plateau_window:]
                     if max(recent) - min(recent) < _plateau_threshold:
                         print(f"\n  [平台期] 最近{_plateau_window}轮评分 {recent}，波动<{_plateau_threshold}→停止重试")
-                        try:
-                            _update_status_safe(novel_name, chapter_num, "强制通过")
-                        except Exception as e:
-                            print(f"  [警告] 状态更新失败：{e}")
-                            mm.update_chapter_status(chapter_num, "强制通过")
-                        return content or ""
+                        _finish_writing_session(
+                            novel_name, _session_id, "强制通过（平台期）",
+                            content, result.get("score_total"),
+                        )
+                        return _force_approve_chapter(
+                            novel_name, chapter_num, content, mm
+                        )
                 # ─────────────────────────────────────────────────────
 
                 if attempt < max_retry - 1:
@@ -1121,7 +1325,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                         print("  1. 继续局部修改（默认）")
                         print("  2. 完全重写（原任务卡，不带修改意见）")
                         print("  3. 切换模型重新生成")
-                        retry_choice = input("\n  请选择：").strip() or "1"
+                        retry_choice = input("\n  请选择：", options=_RETRY_CHOICES).strip() or "1"
 
                         if retry_choice == "2":
                             _revise_mode = False
@@ -1145,6 +1349,10 @@ def write_and_review(novel_name: str, chapter_num: int,
                             print(f"\n  [OK] 已切换至 {model_choice['name']}")
                         # choice == "1"：继续局部修改，保持现有状态
 
+                    _finish_writing_session(
+                        novel_name, _session_id, "责任编辑不通过",
+                        content, result.get("score_total"),
+                    )
                     continue
                 else:
                     if result.get("review_error"):
@@ -1154,6 +1362,10 @@ def write_and_review(novel_name: str, chapter_num: int,
                         except Exception as e:
                             print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
                             mm.update_chapter_status(chapter_num, "审稿失败")
+                        _finish_writing_session(
+                            novel_name, _session_id, "审稿失败",
+                            content, result.get("score_total"),
+                        )
                         return ""
 
                     print(f"\n{'='*60}")
@@ -1163,7 +1375,7 @@ def write_and_review(novel_name: str, chapter_num: int,
 
                     from core.api_client import select_all_models_interactive, _select_single_model
                     print("\n是否切换模型？(y/n，默认y)")
-                    choice = input().strip().lower() or "y"
+                    choice = input(options=_SWITCH_CHOICES).strip().lower() or "y"
                     if choice == "y":
                         print("\n【选择新的写作/审稿模型】")
                         model_choice = _select_single_model("综合模型", default="1")
@@ -1176,22 +1388,23 @@ def write_and_review(novel_name: str, chapter_num: int,
                         print(f"  请在章节菜单选择「恢复审稿失败章节」重新生成第{chapter_num}章")
 
                     print(f"  [警告] 保留最后版本（强制通过）")
-                    try:
-                        _update_status_safe(novel_name, chapter_num, "强制通过")
-                    except Exception as e:
-                        print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
-                        mm.update_chapter_status(chapter_num, "强制通过")
-                    return content or ""
+                    _finish_writing_session(
+                        novel_name, _session_id, "强制通过（达到最大重试）",
+                        content, result.get("score_total"),
+                    )
+                    return _force_approve_chapter(
+                        novel_name, chapter_num, content, mm
+                    )
 
             # ── 责任编辑通过，进入读者视角 ───────────────────────────
-            # 展示精简建议（优化E）
+            # 交互式应用精简建议（优化E）
             cut = result.get("cut_suggestions", [])
             if cut:
-                print(f"\n  [精简建议] 发现 {len(cut)} 处可裁切段落：")
-                for i, item in enumerate(cut, 1):
-                    start_text = (item.get("start", "") or "")[:30]
-                    reason = item.get("reason", "")
-                    print(f"    {i}. {start_text}... — {reason}")
+                content = _apply_cut_suggestions_interactive(
+                    novel_name, chapter_num, content, cut,
+                    plot_goal, emotion_tag,
+                )
+                _original_content = content
 
             reader_result = reader_review_chapter(novel_name, chapter_num, content)
 
@@ -1212,6 +1425,10 @@ def write_and_review(novel_name: str, chapter_num: int,
                 # ── 同步大纲伏笔状态 ────────────────────────────
                 _sync_outline_foreshadow(novel_name, chapter_num, content)
 
+                _finish_writing_session(
+                    novel_name, _session_id, "审核通过（读者二审跳过）",
+                    content, result.get("score_total"),
+                )
                 return content
 
             if reader_result.get("pass"):
@@ -1229,6 +1446,10 @@ def write_and_review(novel_name: str, chapter_num: int,
                 # ── 同步大纲伏笔状态 ────────────────────────────
                 _sync_outline_foreshadow(novel_name, chapter_num, content)
 
+                _finish_writing_session(
+                    novel_name, _session_id, "审核通过",
+                    content, reader_result.get("score_total"),
+                )
                 return content
             else:
                 print(f"\n  [重写] 读者视角不通过（{reader_result.get('score_total', 0)}/100）")
@@ -1257,7 +1478,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                         print("  1. 继续局部修改（默认）")
                         print("  2. 完全重写（原任务卡，不带修改意见）")
                         print("  3. 切换模型重新生成")
-                        retry_choice = input("\n  请选择：").strip() or "1"
+                        retry_choice = input("\n  请选择：", options=_RETRY_CHOICES).strip() or "1"
 
                         if retry_choice == "2":
                             _revise_mode = False
@@ -1279,6 +1500,10 @@ def write_and_review(novel_name: str, chapter_num: int,
                             _original_content = None
                             _retry_feedback = ""
                             print(f"\n  [OK] 已切换至 {model_choice['name']}")
+                    _finish_writing_session(
+                        novel_name, _session_id, "读者视角不通过",
+                        content, reader_result.get("score_total"),
+                    )
                 else:
                     print(f"\n{'='*60}")
                     print(f"  [提示] 连续{max_retry}次未通过！")
@@ -1287,7 +1512,7 @@ def write_and_review(novel_name: str, chapter_num: int,
 
                     from core.api_client import select_all_models_interactive, _select_single_model
                     print("\n是否切换模型？(y/n，默认y)")
-                    choice = input().strip().lower() or "y"
+                    choice = input(options=_SWITCH_CHOICES).strip().lower() or "y"
                     if choice == "y":
                         print("\n【选择新的写作/审稿模型】")
                         model_choice = _select_single_model("综合模型", default="1")
@@ -1300,12 +1525,13 @@ def write_and_review(novel_name: str, chapter_num: int,
                         print(f"  请在章节菜单选择「恢复审稿失败章节」重新生成第{chapter_num}章")
 
                     print(f"  [警告] 保留最后版本（强制通过）")
-                    try:
-                        _update_status_safe(novel_name, chapter_num, "强制通过")
-                    except Exception as e:
-                        print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
-                        mm.update_chapter_status(chapter_num, "强制通过")
-                    return content or ""
+                    _finish_writing_session(
+                        novel_name, _session_id, "强制通过（读者视角未通过）",
+                        content, reader_result.get("score_total"),
+                    )
+                    return _force_approve_chapter(
+                        novel_name, chapter_num, content, mm
+                    )
 
         # for 循环结束后：若收到重写请求且未超次，继续 while
         if _rewrite_requested:

@@ -1,6 +1,7 @@
 import sqlite3
 import os
 from pathlib import Path
+from core.interaction import say as print
 
 _initialized_novels = set()
 _wal_configured_paths = set()
@@ -13,7 +14,13 @@ def get_db_path(novel_name: str) -> str:
     return str(data_dir / "novel.db")
 
 
-def get_connection(novel_name: str) -> sqlite3.Connection:
+def get_connection(novel_name: str, *, readonly=False) -> sqlite3.Connection:
+    if readonly:
+        from core.config_loader import get_data_dir
+        path = (get_data_dir(novel_name) / "novel.db").resolve().as_uri()
+        conn = sqlite3.connect(path + "?mode=ro", uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
     db_path = get_db_path(novel_name)
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row

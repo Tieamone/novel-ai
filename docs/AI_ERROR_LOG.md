@@ -2,6 +2,12 @@
 
 | 日期 | 错误简述 | 原因分析 | 解决方案 | 状态 |
 |------|----------|----------|----------|------|
+| 2026-05-31 | `newbook.txt` 导入完成后会进入章节菜单两次 | 导入分支内部调用了 `chapters_menu()`，外层新建流程结束后又统一调用一次 | 导入分支只负责准备数据，统一由外层写入风格/模板后进入一次章节菜单；同时抽出创作意图模板初始化函数 | ✅ 已修复 |
+| 2026-05-31 | 分批任务卡补齐统计错误，后续批次可能不补缺失任务卡 | `_supplement_tasks()` 需要本批已生成数量，但调用方传入了累计 saved 值 | 分批流程改为 `batch_total` 单独统计，本批补齐后再累加总数 | ✅ 已修复 |
+| 2026-05-31 | 达到目标章数后仍可能自动扩展任务卡 | `generate_chapter_auto()` 和 `extend_tasks()` 没有把 `target_chapters.txt` 作为硬上限 | 自动生成下一章前检查目标章数；扩展任务卡时若剩余章数小于等于0则停止并提示 | ✅ 已修复 |
+| 2026-05-31 | 断点管理“重写指定章节”查询不存在的 `word_count` 列 | `chapters` 表没有 `word_count` 字段，只有正文 `content` | 查询改为 `LENGTH(content) as word_count`，不修改数据库 schema | ✅ 已修复 |
+| 2026-05-31 | 强制通过章节未同步伏笔状态 | 正常审核通过会同步运行时伏笔和大纲伏笔，强制通过分支只改章节状态 | 增加强制通过 helper，所有强制通过路径统一更新状态并同步伏笔 | ✅ 已修复 |
+| 2026-05-31 | 写作历史表存在但没有写入记录 | `writing_sessions` 表只被断点菜单读取，没有写入调用 | `write_and_review()` 每次写作/修订尝试记录开始、结束原因、字数和评分 | ✅ 已修复 |
 | 2026-05-22 | 创建新小说时任务卡生成失败（返回0），无法正常拆分大纲 | 1. `split_outline_to_tasks()` 中 `max_tokens` 固定为 8000，AI 生成50章任务卡 JSON 约需 7500-11000 tokens，常被截断导致 JSON 不完整无法解析；2. 无截断恢复机制，截断后直接放弃；3. 无重试机制 | 1. `max_tokens` 改为动态计算 `max(8000, min(chapters*200, 16000))`，50章→10000 tokens；2. 新增 `_extract_tasks_json()` 统一提取函数，内置 4 种截断修复策略；3. 解析失败自动重试一次；4. 增加详细的诊断日志输出 | ✅ 已修复 |
 | 2026-05-22 | 任务卡分批生成导致剧情落差，且分批逻辑写死 50 章/批不灵活 | 1. `split_outline_to_tasks()` 分批时固定 50 章/批，`extend_tasks()` 也是固定 50 章；2. 没有利用模型实际 max_output_tokens 能力；3. 全量模式遇到大章数时直接 16000 cap 不够用且无提示 | 1. 新增 `_get_model_max_output()` / `_compute_batch_params()` 动态计算每批大小；2. 全量模式下模型不够时提示用户换模型或降级分批；3. `run_planner()` 默认全量生成（`full_batch=True`）；4. `extend_tasks()` 改为动态批次大小并告知用户扩展规模 | ✅ 已修复 |
 | 2026-05-14 | 导入流程缺失大纲伏笔生成，导入的小说无任何伏笔规划 | 交互式创建(`run_planner`)包含Step 1.6 `generate_outline_foreshadow()`，但导入流程(`main.py` mode="2")完全跳过了这一步，直接存大纲→世界观→角色→任务卡 | 在导入流程的 `split_outline_to_tasks()` 之前添加 `generate_outline_foreshadow(novel_name, target_chapters, review_mode=False)` 调用 | ✅ 已修复 |

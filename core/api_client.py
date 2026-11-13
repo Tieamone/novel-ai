@@ -1,8 +1,10 @@
 import os
 import sys
 import time
+from threading import Lock
 from dotenv import load_dotenv
 from core.config_loader import get_project_root
+from core.interaction import ask as input, say as print, check_cancelled
 
 load_dotenv(get_project_root() / ".env")
 
@@ -156,7 +158,10 @@ def get_current_author_max_tokens():
     """
     try:
         model_info = get_current_author_model()
-        max_tok = model_info.get("max_output_tokens") or model_info.get("max_tokens")
+        max_tok = (
+            model_info.get("max_output_tokens")
+            or model_info.get("max_tokens")
+        )
         if max_tok and isinstance(max_tok, (int, float)) and max_tok > 0:
             return int(max_tok)
     except Exception:
@@ -379,16 +384,25 @@ def _calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return round(cost, 6)
 
 
+_stats_lock = Lock()
+_model_stats = {}
+
+
 def _update_stats(model: str, input_tokens: int, output_tokens: int, cost: float):
-    _session_stats["total_calls"] += 1
-    _session_stats["total_input_tokens"] += input_tokens
-    _session_stats["total_output_tokens"] += output_tokens
-    _session_stats["total_cost_yuan"] += cost
-    _session_stats["model_used"] = model
+    with _stats_lock:
+        _session_stats["total_calls"] += 1
+        _session_stats["total_input_tokens"] += input_tokens
+        _session_stats["total_output_tokens"] += output_tokens
+        _session_stats["total_cost_yuan"] += cost
+        _session_stats["model_used"] = model
+        entry = _model_stats.setdefault(model, {"calls": 0, "cost_yuan": 0})
+        entry["calls"] += 1
+        entry["cost_yuan"] += cost
 
 
 def get_session_stats() -> dict:
-    return _session_stats.copy()
+    with _stats_lock:
+        return {**_session_stats, "by_model": {model: entry.copy() for model, entry in _model_stats.items()}}
 
 
 def print_session_stats():
@@ -509,6 +523,7 @@ def call_api(system_prompt: str, user_message: str,
              max_tokens: int = None,
              temperature: float = None,
              retry: int = 3) -> str:
+    check_cancelled()
     from core.config_loader import get as cfg
     if max_tokens is None:
         max_tokens = cfg("model", "max_tokens", 4096)
@@ -579,6 +594,7 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
     attempt = 0
 
     while attempt < retry:
+        check_cancelled()
         try:
             # Bug修复8: GLM系列不支持 enable_thinking 字段（会报400）
             # Qwen3.x 系列用 extra_body 关闭思考模式，节省token
@@ -670,6 +686,7 @@ def _call_dashscope_sdk(system_prompt, user_message, model_name, max_tokens, tem
     is_thinking = _is_thinking_model(model_name)
 
     for attempt in range(retry):
+        check_cancelled()
         try:
             call_kwargs = dict(
                 api_key=api_key,
@@ -747,6 +764,7 @@ def _call_mimo(system_prompt, user_message, model_name, max_tokens, temperature,
     client = OpenAI(api_key=api_key, base_url=_MIMO_BASE_URL)
 
     for attempt in range(retry):
+        check_cancelled()
         try:
             kwargs = dict(
                 model=model_name,
@@ -856,7 +874,8 @@ def select_model_interactive() -> dict:
                 break
 
         print()
-        choice = input(f"请选择作者模型（直接回车默认选{default_choice}，当前：{_author_model}）：").strip() or default_choice
+        choice = input(f"请选择作者模型（直接回车默认选{default_choice}，当前：{_author_model}）：",
+                       options=tuple((key, info["name"]) for key, info in models.items())).strip() or default_choice
 
         if choice not in models:
             print("[提示] 无效选择，使用默认模型")
@@ -891,6 +910,8 @@ def select_model_interactive() -> dict:
         print(f"     模型代码：{selected['model']}")
         if selected["provider"] == "dashscope":
             print(f"     API端点：{_get_dashscope_base_url()}")
+        elif selected["provider"] == "mimo":
+            print(f"     API端点：{_MIMO_BASE_URL}")
         print(f"     审核模型：{_reviewer_model}{'（默认）' if reviewer_is_default else '（已保留自定义）'}")
         print(f"     读者视角模型：{_reader_reviewer_model}{'（默认）' if reader_is_default else '（已保留自定义）'}")
         if selected.get("free_tier"):
@@ -953,7 +974,8 @@ def _select_single_model(prompt_title: str, default: str, usage: str = None) -> 
             print(_console_safe(f"      {price_str}"))
 
         print()
-        choice = input(f"请选择{prompt_title}（直接回车默认选{default}）：").strip() or default
+        choice = input(f"请选择{prompt_title}（直接回车默认选{default}）：",
+                       options=tuple((key, info["name"]) for key, info in models.items())).strip() or default
 
         if choice not in models:
             print("[提示] 无效选择，使用默认")

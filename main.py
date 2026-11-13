@@ -6,6 +6,16 @@ import signal
 import logging
 from pathlib import Path
 
+if __name__ == "__main__" and sys.platform == "win32" and sys.prefix == sys.base_prefix:
+    project_python = Path(__file__).resolve().parent / "venv" / "Scripts" / "python.exe"
+    if project_python.is_file():
+        from subprocess import call
+
+        try:
+            sys.exit(call([str(project_python), str(Path(__file__).resolve()), *sys.argv[1:]]))
+        except KeyboardInterrupt:
+            sys.exit(130)
+
 from core.memory_manager import MemoryManager
 from core.planner import run_planner, extend_tasks, get_style_choice, split_outline_to_tasks
 from core.reviewer import write_and_review
@@ -18,6 +28,7 @@ from core.config_loader import (
     get_project_root,
 )
 from core.outline_manager import manage_outline_foreshadow
+from core.interaction import ask as input, say as print, check_cancelled
 
 MAX_NOVEL_NAME_LEN = 64
 INVALID_NOVEL_NAME_CHARS = set('<>:"/\\|?*')
@@ -57,6 +68,18 @@ def _get_target_chapters(novel_name: str) -> int:
     return 100
 
 
+def _get_target_chapter_limit(novel_name: str) -> int:
+    """读取明确配置的目标章数；旧小说无配置时不作为硬上限。"""
+    path = _data_dir(novel_name) / "target_chapters.txt"
+    if not path.exists():
+        return 0
+    try:
+        target = int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0
+    return target if target > 0 else 0
+
+
 def _validate_novel_name(novel_name: str) -> str:
     if not novel_name:
         return "小说名称不能为空"
@@ -70,17 +93,17 @@ def _validate_novel_name(novel_name: str) -> str:
         return "小说名称包含非法字符：<>:\"/\\|?*"
     if novel_name.endswith(" ") or novel_name.endswith("."):
         return "小说名称不能以空格或句点结尾"
-    if novel_name.upper() in WINDOWS_RESERVED_NAMES:
+    if novel_name.split(".", 1)[0].rstrip(" ").upper() in WINDOWS_RESERVED_NAMES:
         return "小说名称是系统保留名，请更换"
     return ""
 
 
-def _list_novels() -> list:
+def _list_novels(accept=None, *, readonly=False) -> list:
     """
     扫描已有小说，兼容旧库（没有 novel_info 时显示友好提示）。
     返回 [(novel_name, genre)] 列表。
     """
-    data_base = Path(cfg("paths", "data_dir", "data"))
+    data_base = get_data_dir()
     if not data_base.exists():
         return []
 
@@ -89,9 +112,11 @@ def _list_novels() -> list:
         if not d.is_dir() or not (d / "novel.db").exists():
             continue
         name = d.name
+        if accept and not accept(name):
+            continue
         genre = "未记录"
         try:
-            with with_db_connection(name) as conn:
+            with with_db_connection(name, readonly=readonly) as conn:
                 row = conn.execute(
                     "SELECT genre FROM novel_info WHERE id=1"
                 ).fetchone()
@@ -102,6 +127,44 @@ def _list_novels() -> list:
         novels.append((name, genre))
 
     return novels
+
+
+def _ensure_author_intent_templates(novel_name: str):
+    """确保创作意图控制面文件存在。"""
+    dd = _data_dir(novel_name)
+    intent_path = dd / "author_intent.md"
+    if not intent_path.exists():
+        intent_path.write_text(
+            "# 创作意图\n\n"
+            "## 这本书想成为什么\n"
+            "（基调、主题、核心吸引力）\n\n"
+            "## 不想变成什么样\n"
+            "（避免的风格、雷区）\n",
+            encoding="utf-8"
+        )
+    focus_path = dd / "current_focus.md"
+    if not focus_path.exists():
+        focus_path.write_text(
+            "# 当前焦点\n\n"
+            "## 最近 1-3 章的重点\n"
+            "（当前弧线的核心冲突、需要推进的线索）\n",
+            encoding="utf-8"
+        )
+
+
+def _build_import_world_settings(import_data: dict) -> str:
+    """把导入模板中的世界观、时间线、核心冲突合并为写作可读设定。"""
+    parts = []
+    world = (import_data.get("world_setting") or "").strip()
+    timeline = (import_data.get("timeline") or "").strip()
+    core_conflict = (import_data.get("core_conflict") or "").strip()
+    if world:
+        parts.append(world)
+    if timeline:
+        parts.append(f"## 时间线\n{timeline}")
+    if core_conflict:
+        parts.append(f"## 核心冲突\n{core_conflict}")
+    return "\n\n".join(parts).strip()
 
 
 def _upsert_task_status(novel_name: str, chapter_num: int,
@@ -428,6 +491,7 @@ def get_next_chapter_goal(novel_name: str, chapter_num: int) -> tuple:
 
 def generate_chapter_auto(novel_name: str):
     global _current_novel_name, _current_chapter_num
+    check_cancelled()
     # Bug修复5: 改从 chapter_tasks 找最小的待处理章节，
     # 避免 MAX(chapters) + 1 在中间有空缺时跳号
     with with_db_connection(novel_name) as conn:
@@ -446,20 +510,24 @@ def generate_chapter_auto(novel_name: str):
             last_num = row["max_num"] if (row and row["max_num"]) else 0
             next_num = last_num + 1
 
-    # 记录当前写作章节，供 Ctrl+C 处理器使用
-    _current_novel_name = novel_name
-    _current_chapter_num = next_num
+    target_limit = _get_target_chapter_limit(novel_name)
+    if target_limit and next_num > target_limit:
+        print(f"\n[提示] 已达到目标章数：{target_limit}章")
+        print("如需继续加章，请先调整目标章数或手动扩展任务卡。")
+        return
 
     print(f"\n正在获取第{next_num}章任务...")
     plot_goal, emotion_tag = get_next_chapter_goal(novel_name, next_num)
     print(f"  情节目标：{plot_goal}")
     print(f"  情绪标签：{emotion_tag}")
+
     try:
         claimed, current_status = _claim_task_for_writing(
             novel_name, next_num, plot_goal, emotion_tag
         )
     except Exception as e:
         print(f"  [错误] 任务认领失败：{e}")
+        _current_chapter_num = None
         return
 
     if not claimed:
@@ -471,17 +539,39 @@ def generate_chapter_auto(novel_name: str):
             print("  [提示] 该章节任务处于审稿失败状态，请走恢复入口处理")
         else:
             print(f"  [提示] 该章节任务当前状态为 {current_status}，已跳过")
+        _current_chapter_num = None
         return
 
-    content = write_and_review(
-        novel_name=novel_name,
-        chapter_num=next_num,
-        plot_goal=plot_goal,
-        emotion_tag=emotion_tag,
+    # 只有成功认领的任务才登记，避免回滚其他进程的章节。
+    _current_novel_name, _current_chapter_num = novel_name, next_num
+    try:
+        return _finish_automatic_chapter(novel_name, next_num, plot_goal, emotion_tag)
+    except BaseException:
+        if _current_chapter_num is not None:
+            rollback_writing(novel_name, next_num)
+        raise
+    finally:
+        _current_novel_name = _current_chapter_num = None
+
+
+def _finish_automatic_chapter(novel_name, next_num, plot_goal, emotion_tag):
+    # 审核已通过但上次导出或记忆提取中断时，沿用已审正文完成收尾。
+    existing = MemoryManager(novel_name).load_chapter(next_num)
+    resuming = existing.get("content") and existing.get("status") in (
+        CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED,
     )
+    if resuming:
+        content = existing.get("content")
+    else:
+        content = write_and_review(
+            novel_name=novel_name,
+            chapter_num=next_num,
+            plot_goal=plot_goal,
+            emotion_tag=emotion_tag,
+        )
 
     # ★ 需求1：三次重写仍未通过时，提示切换模型重新生成
-    while content:
+    while content and not resuming:
         chapter_status = _get_chapter_status(novel_name, next_num)
         if chapter_status != CHAPTER_STATUS_FORCE_APPROVED:
             break  # approved 或其他状态，正常往下走
@@ -493,7 +583,9 @@ def generate_chapter_auto(novel_name: str):
         print(f"  1. 保留当前版本继续")
         print(f"  2. 切换模型重新生成本章")
         print('=' * 50)
-        switch = input("请选择（默认1）：").strip()
+        switch = input("请选择（默认1）：", options=(
+            ("1", "保留当前版本"), ("2", "切换模型重新生成"),
+        )).strip()
         if switch != "2":
             break
         from core.api_client import select_model_interactive
@@ -507,13 +599,11 @@ def generate_chapter_auto(novel_name: str):
         )
         # 循环回去检查新一轮结果
 
-    # 章节完成/中断后清除全局追踪
-    _current_chapter_num = None
-
     if content:
         chapter_status = _get_chapter_status(novel_name, next_num)
         if chapter_status in (CHAPTER_STATUS_APPROVED, CHAPTER_STATUS_FORCE_APPROVED):
-            _save_chapter_memory(novel_name, next_num, content, plot_goal)
+            if not resuming or not _has_chapter_summary(novel_name, next_num):
+                _save_chapter_memory(novel_name, next_num, content, plot_goal)
             export_path = export_chapter(novel_name, next_num)
             _update_task_status(novel_name, next_num, TASK_COMPLETED)
             from core.api_client import get_session_stats
@@ -537,6 +627,7 @@ def generate_chapter_auto(novel_name: str):
         else:
             _update_task_status(novel_name, next_num, TASK_PENDING)
             print("\n[中断] 本章未完成，任务状态已回退为 待处理。")
+    return next_num
 
 
 def _save_chapter_memory(novel_name: str, chapter_num: int,
@@ -780,7 +871,38 @@ def _recover_review_failed(novel_name: str):
     print("0. 取消")
     action = input("请选择：").strip()
 
-    from core.reviewer import review_chapter
+    return recover_review_failed(novel_name, chapter_num, action)
+
+
+def recover_review_failed(novel_name, chapter_num, action):
+    if action not in ("1", "2", "3"):
+        print("[提示] 已取消")
+        return
+    with with_db_connection(novel_name) as conn:
+        target = conn.execute(
+            "SELECT * FROM chapters WHERE chapter_num=? AND status=?",
+            (chapter_num, CHAPTER_STATUS_REVIEW_FAILED),
+        ).fetchone()
+        task = conn.execute(
+            "SELECT status FROM chapter_tasks WHERE chapter_num=?", (chapter_num,),
+        ).fetchone()
+    if target is None:
+        raise ValueError("该章节当前没有待恢复的审稿失败记录")
+    if task and task["status"] == TASK_IN_PROGRESS:
+        raise ValueError("该章节正在写作")
+    try:
+        return _finish_review_recovery(novel_name, chapter_num, action, target)
+    except BaseException:
+        rollback_writing(novel_name, chapter_num, recovering=True)
+        raise
+
+
+def _finish_review_recovery(novel_name, chapter_num, action, target):
+    from core.reviewer import (
+        review_chapter,
+        _apply_cut_suggestions_interactive,
+        _force_approve_chapter,
+    )
 
     if action == "1":
         content = target["content"] or ""
@@ -792,6 +914,12 @@ def _recover_review_failed(novel_name: str):
         )
         mm = MemoryManager(novel_name)
         if result.get("pass"):
+            content = _apply_cut_suggestions_interactive(
+                novel_name, chapter_num, content,
+                result.get("cut_suggestions", []),
+                target["plot_goal"] or "",
+                target["emotion_tag"] or "铺垫",
+            )
             from core.reader_reviewer import reader_review_chapter
             reader_result = reader_review_chapter(novel_name, chapter_num, content)
             if not reader_result.get("pass"):
@@ -851,7 +979,7 @@ def _recover_review_failed(novel_name: str):
             print("[错误] 该章节正文为空，无法强制通过")
             return
         mm = MemoryManager(novel_name)
-        mm.update_chapter_status(chapter_num, CHAPTER_STATUS_FORCE_APPROVED)
+        _force_approve_chapter(novel_name, chapter_num, content, mm)
         _update_task_status(novel_name, chapter_num, TASK_COMPLETED)
         if not _has_chapter_summary(novel_name, chapter_num):
             _save_chapter_memory(
@@ -860,9 +988,6 @@ def _recover_review_failed(novel_name: str):
         export_chapter(novel_name, chapter_num)
         print(f"[OK] 第{chapter_num}章已强制通过并导出")
         return
-
-    print("[提示] 已取消")
-
 
 def _change_style(novel_name: str):
     from core.writer import AUTHOR_STYLES
@@ -1014,23 +1139,33 @@ def _delete_chapter(novel_name: str):
         print("  ✅ 已取消删除")
         return
 
-    # 执行删除
-    mm = MemoryManager(novel_name)
-    mm.delete_chapter(chapter_num)
-
-    # 重置任务卡为 pending
-    _update_task_status(novel_name, chapter_num, TASK_PENDING)
-
-    # 删除导出文件（如果存在）
-    out_file = _output_dir(novel_name) / f"第{str(chapter_num).zfill(3)}章.txt"
-    if out_file.exists():
-        out_file.unlink()
-        print(f"  [OK] 已删除导出文件：{out_file.name}")
+    try:
+        delete_chapter(novel_name, chapter_num)
+    except ValueError as error:
+        print(f"[错误] {error}")
+        return
 
     print(f"\n[OK] 第{chapter_num}章已删除，任务卡已重置为 待处理。")
     print(f"  提示：直接选择「自动生成下一章」时会跳过此章（已有更新章节）。")
     print(f"  若需重新生成第{chapter_num}章，请先删除第{chapter_num}章之后的所有章节，")
     print(f"  或通过「恢复审稿失败」入口手动处理。")
+
+
+def delete_chapter(novel_name, chapter_num):
+    with with_db_connection(novel_name) as conn:
+        chapter = conn.execute(
+            "SELECT status FROM chapters WHERE chapter_num=?", (chapter_num,)
+        ).fetchone()
+        task = conn.execute(
+            "SELECT status FROM chapter_tasks WHERE chapter_num=?", (chapter_num,)
+        ).fetchone()
+    if not chapter:
+        raise ValueError(f"第{chapter_num}章不存在")
+    if chapter["status"] == "writing" or (task and task["status"] == TASK_IN_PROGRESS):
+        raise ValueError(f"第{chapter_num}章正在写作")
+    MemoryManager(novel_name).delete_chapter(chapter_num)
+    _update_task_status(novel_name, chapter_num, TASK_PENDING)
+    (_output_dir(novel_name) / f"第{chapter_num:03d}章.txt").unlink(missing_ok=True)
 
 
 def _delete_chapters_batch(novel_name: str):
@@ -1117,30 +1252,10 @@ def _delete_chapters_batch(novel_name: str):
             print("[取消] 已取消删除")
             return
         
-        # 执行批量删除
-        mm = MemoryManager(novel_name)
-        deleted_count = 0
-        deleted_files = []
-        
         for chapter_num in range(start_num, end_num + 1):
-            # 删除数据库记录
-            mm.delete_chapter(chapter_num)
-            
-            # 重置任务卡为 pending
-            _update_task_status(novel_name, chapter_num, TASK_PENDING)
-            
-            # 删除导出文件（如果存在）
-            out_file = _output_dir(novel_name) / f"第{str(chapter_num).zfill(3)}章.txt"
-            if out_file.exists():
-                out_file.unlink()
-                deleted_files.append(out_file.name)
-            
-            deleted_count += 1
-        
-        print(f"\n[OK] 已删除第{start_num}章到第{end_num}章，共{deleted_count}章")
-        print(f"  任务卡已重置为待处理")
-        if deleted_files:
-            print(f"  已删除导出文件：{len(deleted_files)}个")
+            delete_chapter(novel_name, chapter_num)
+        print(f"\n[OK] 已删除第{start_num}章到第{end_num}章，任务卡已重置为待处理")
+
         print(f"  提示：可直接选择「自动生成下一章」或「批量自动生成」重新生成这些章节。")
         
     except ValueError:
@@ -1187,17 +1302,40 @@ def _delete_novel(novel_name: str) -> bool:
         return False
 
     try:
-        if data_path.exists():
-            shutil.rmtree(data_path)
-            print(f"  [OK] 已删除数据目录：{data_path}")
-        if out_path.exists():
-            shutil.rmtree(out_path)
-            print(f"  [OK] 已删除导出目录：{out_path}")
+        delete_novel(novel_name)
         print(f"\n  《{novel_name}》已完全删除。")
         return True
     except Exception as e:
         print(f"  [错误] 删除失败：{e}")
         return False
+
+
+def delete_novel(novel_name):
+    error = _validate_novel_name(novel_name)
+    if error:
+        raise ValueError(error)
+    data_path = _data_dir(novel_name).resolve()
+    out_path = _output_dir(novel_name).resolve()
+    from core.config_loader import get_output_dir
+    if data_path.parent != get_data_dir().resolve() or out_path.parent != get_output_dir().resolve():
+        raise ValueError("小说目录超出项目数据或导出目录")
+    if data_path.name != novel_name or out_path.name != _output_dir(novel_name).name:
+        raise ValueError("小说目录指向了其他位置")
+    if not (data_path / "novel.db").is_file():
+        raise ValueError("小说数据库不存在")
+    with with_db_connection(novel_name) as conn:
+        task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chapter_tasks)")}
+        active = "status" in task_columns and conn.execute(
+            "SELECT 1 FROM chapter_tasks WHERE status=? LIMIT 1", (TASK_IN_PROGRESS,),
+        ).fetchone()
+    if active:
+        raise ValueError("小说有正在写作的任务，请先检查断点")
+    shutil.rmtree(data_path)
+    if out_path.is_dir():
+        shutil.rmtree(out_path)
+    from core.db import _initialized_novels, _wal_configured_paths
+    _initialized_novels.discard(novel_name)
+    _wal_configured_paths.discard(str(data_path / "novel.db"))
 
 
 def _edit_task_card(novel_name: str):
@@ -1243,39 +1381,38 @@ def _edit_task_card(novel_name: str):
     print(f"请输入新的情绪标签（{'/'.join(VALID_TAGS)}，直接回车保持不变）：")
     new_tag = input("  > ").strip()
 
-    if not new_goal and not new_tag:
-        print("  [提示] 未作任何修改")
+    try:
+        result = edit_task_card(novel_name, chapter_num, new_goal, new_tag)
+    except ValueError as error:
+        print(f"  [提示] {error}")
         return
-
-    if new_goal and len(new_goal) < 10:
-        print("  [警告] 情节目标过短（建议40-80字），已取消")
-        return
-
-    if new_tag and new_tag not in VALID_TAGS:
-        print(f"  [错误] 情绪标签无效，必须是：{'/'.join(VALID_TAGS)}")
-        return
-
-    final_goal = new_goal or row["plot_goal"]
-    final_tag  = new_tag  or row["emotion_tag"]
-
-    # 首次手动编辑时保存原始目标
-    original = row["original_plot_goal"] or row["plot_goal"]
-    rewrite_count = (row["rewrite_count"] or 0) + 1
-
-    with with_db_connection(novel_name) as conn:
-        conn.execute(
-            "UPDATE chapter_tasks "
-            "SET plot_goal=?, emotion_tag=?, "
-            "original_plot_goal=?, rewrite_count=?, "
-            "updated_at=datetime('now','localtime') "
-            "WHERE chapter_num=?",
-            (final_goal, final_tag, original, rewrite_count, chapter_num)
-        )
-        conn.commit()
-
     print(f"\n[OK] 第{chapter_num}章任务卡已更新：")
-    print(f"  情节目标：{final_goal}")
-    print(f"  情绪标签：{final_tag}")
+    print(f"  情节目标：{result['plot_goal']}")
+    print(f"  情绪标签：{result['emotion_tag']}")
+
+
+def edit_task_card(novel_name, chapter_num, new_goal, new_tag):
+    if new_goal and len(new_goal) < 10:
+        raise ValueError("情节目标至少需要10字，建议40-80字")
+    if new_tag and new_tag not in ("铺垫", "冲突", "爽点", "低谷", "反转"):
+        raise ValueError("情绪标签无效")
+    with with_db_connection(novel_name) as conn:
+        with DatabaseTransaction(conn):
+            row = conn.execute("SELECT * FROM chapter_tasks WHERE chapter_num=?",
+                               (chapter_num,)).fetchone()
+            if not row or row["status"] == TASK_IN_PROGRESS:
+                raise ValueError("任务卡不存在或正在写作")
+            final_goal = new_goal or row["plot_goal"]
+            final_tag = new_tag or row["emotion_tag"]
+            if final_goal != row["plot_goal"] or final_tag != row["emotion_tag"]:
+                conn.execute(
+                    "UPDATE chapter_tasks SET plot_goal=?, emotion_tag=?, "
+                    "original_plot_goal=COALESCE(NULLIF(original_plot_goal, ''), plot_goal), "
+                    "rewrite_count=COALESCE(rewrite_count, 0)+1, "
+                    "updated_at=datetime('now','localtime') WHERE chapter_num=?",
+                    (final_goal, final_tag, chapter_num),
+                )
+    return {"plot_goal": final_goal, "emotion_tag": final_tag}
 
 
 def show_foreshadow_report(novel_name: str):
@@ -1395,9 +1532,7 @@ def _breakpoint_menu(novel_name: str):
             if confirm.lower() != "yes":
                 print("  已取消")
                 continue
-            _update_task_status(novel_name, num, TASK_PENDING)
-            import core.writer as _writer_mod
-            _writer_mod._cached_beat_plan = ""
+            reset_writing_checkpoint(novel_name, num)
             print(f"  ✅ 第{num}章已重置为「待处理」，节拍内存缓存已清除")
 
         elif choice == "3":
@@ -1429,7 +1564,8 @@ def _breakpoint_menu(novel_name: str):
                 continue
             with with_db_connection(novel_name) as conn:
                 ch = conn.execute(
-                    "SELECT title, word_count FROM chapters WHERE chapter_num=?",
+                    "SELECT title, LENGTH(content) as word_count "
+                    "FROM chapters WHERE chapter_num=?",
                     (num,)
                 ).fetchone()
             if not ch:
@@ -1441,21 +1577,7 @@ def _breakpoint_menu(novel_name: str):
             if confirm.lower() != "yes":
                 print("  已取消")
                 continue
-            with with_db_connection(novel_name) as conn:
-                with DatabaseTransaction(conn):
-                    conn.execute(
-                        "UPDATE chapters SET content=NULL, status='草稿', "
-                        "review_score_total=NULL, review_score_l1=NULL, "
-                        "review_score_l2=NULL, review_score_l3=NULL, "
-                        "reader_review_score=NULL, reader_review_passed=NULL, "
-                        "updated_at=datetime('now','localtime') "
-                        "WHERE chapter_num=?", (num,)
-                    )
-                    conn.execute(
-                        "UPDATE chapter_tasks SET status=?, "
-                        "updated_at=datetime('now','localtime') "
-                        "WHERE chapter_num=?", (TASK_PENDING, num)
-                    )
+            rewrite_writing_checkpoint(novel_name, num)
             print(f"  ✅ 第{num}章已重置，摘要完整保留，可重新写作")
 
         elif choice == "5":
@@ -1478,15 +1600,42 @@ def _breakpoint_menu(novel_name: str):
             if confirm.lower() != "yes":
                 print("  已取消")
                 continue
-            with with_db_connection(novel_name) as conn:
-                with DatabaseTransaction(conn):
-                    conn.execute("DELETE FROM beats_cache WHERE chapter_num=?", (num,))
-            import core.writer as _writer_mod
-            _writer_mod._cached_beat_plan = ""
-            print(f"  ✅ 第{num}章节拍缓存已清除（DB + 内存）")
+            clear_writing_beats(novel_name, num)
+            print(f"  ✅ 第{num}章节拍缓存已清除")
 
         else:
             print("  ❌ 无效选项")
+
+
+def reset_writing_checkpoint(novel_name, num):
+    _update_task_status(novel_name, num, TASK_PENDING)
+    import core.writer as writer
+    writer._cached_beat_plan = ""
+
+
+def rewrite_writing_checkpoint(novel_name, num):
+    with with_db_connection(novel_name) as conn:
+        with DatabaseTransaction(conn):
+            conn.execute(
+                "UPDATE chapters SET content=NULL, status='草稿', "
+                "review_score_total=NULL, review_score_l1=NULL, "
+                "review_score_l2=NULL, review_score_l3=NULL, "
+                "reader_review_score=NULL, reader_review_passed=NULL, "
+                "updated_at=datetime('now','localtime') "
+                "WHERE chapter_num=?", (num,)
+            )
+            conn.execute(
+                "UPDATE chapter_tasks SET status=?, "
+                "updated_at=datetime('now','localtime') "
+                "WHERE chapter_num=?", (TASK_PENDING, num)
+            )
+
+def clear_writing_beats(novel_name, num):
+    with with_db_connection(novel_name) as conn:
+        with DatabaseTransaction(conn):
+            conn.execute("DELETE FROM beats_cache WHERE chapter_num=?", (num,))
+    import core.writer as writer
+    writer._cached_beat_plan = ""
 
 
 def chapters_menu(novel_name: str):
@@ -1670,23 +1819,23 @@ def _extract_section(content: str, section_header: str) -> str:
     return ""
 
 
-def _import_from_text_file():
+def _import_from_text_file(content=None):
     """从 newbook.txt 导入小说信息"""
-    from pathlib import Path
+    if content is None:
 
-    txt_path = get_project_root() / "newbook.txt"
-    if not txt_path.exists():
-        print("\n[错误] 未找到 newbook.txt")
-        print("  请先将文件放在项目根目录（d:\\novel-ai\\）")
-        print("  文件格式参考：newbook_template.txt（如不存在将自动创建）")
-        _create_newbook_template()
-        return None
+        txt_path = get_project_root() / "newbook.txt"
+        if not txt_path.exists():
+            print("\n[错误] 未找到 newbook.txt")
+            print("  请先将文件放在项目根目录（d:\\novel-ai\\）")
+            print("  文件格式参考：newbook_template.txt（如不存在将自动创建）")
+            _create_newbook_template()
+            return None
 
-    try:
-        content = txt_path.read_text(encoding="utf-8")
-    except Exception as e:
-        print(f"\n[错误] 读取文件失败：{e}")
-        return None
+        try:
+            content = txt_path.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"\n[错误] 读取文件失败：{e}")
+            return None
 
     print(f"\n{'=' * 50}")
     print(f"  正在解析 newbook.txt...")
@@ -1741,19 +1890,23 @@ def _import_from_text_file():
 
     if missing:
         print(f"\n  ⚠️  检测到缺少以下信息：{', '.join(missing)}")
-        supplement = input(f"  是否现在补充？（y/n，默认y）：").strip().lower() or "y"
+        supplement = input("  是否现在补充？（y/n，默认y）：", options=(
+            ("y", "补充资料"), ("n", "继续导入"),
+        )).strip().lower() or "y"
         if supplement == 'y':
             if "大纲" in missing:
-                outline = input("  请输入大纲内容（可粘贴）：\n").strip()
+                outline = input("  请输入大纲内容（可粘贴）：\n", multiline=True).strip()
             if "主要角色" in missing:
-                characters_text = input("  请输入主要角色信息：\n").strip()
+                characters_text = input("  请输入主要角色信息：\n", multiline=True).strip()
             if "时间线" in missing:
-                timeline = input("  请输入时间线信息：\n").strip()
+                timeline = input("  请输入时间线信息：\n", multiline=True).strip()
             if "核心冲突" in missing:
-                core_conflict = input("  请输入核心冲突：\n").strip()
+                core_conflict = input("  请输入核心冲突：\n", multiline=True).strip()
 
     print(f"\n{'─' * 40}")
-    confirm = input(f"  确认导入《{novel_name}》？（yes/NO）：").strip()
+    confirm = input(f"  确认导入《{novel_name}》？（yes/NO）：", options=(
+        ("yes", "确认导入"), ("no", "取消"),
+    )).strip()
     if confirm.lower() != 'yes':
         print("  已取消导入")
         return None
@@ -1887,28 +2040,40 @@ _current_novel_name: str = None
 _current_chapter_num: int = None
 
 
+def rollback_writing(novel_name, chapter_num, *, recovering=False):
+    try:
+        with with_db_connection(novel_name) as conn:
+            with DatabaseTransaction(conn):
+                chapter_status = conn.execute(
+                    "SELECT status FROM chapters WHERE chapter_num=?", (chapter_num,)
+                ).fetchone()
+                failed = recovering or (chapter_status and chapter_status[0] == CHAPTER_STATUS_REVIEW_FAILED)
+                task_status = TASK_REVIEW_FAILED if failed else TASK_PENDING
+                conn.execute(
+                    "UPDATE chapter_tasks SET status=?, updated_at=datetime('now','localtime') "
+                    "WHERE chapter_num=? AND status=?",
+                    (task_status, chapter_num, TASK_IN_PROGRESS),
+                )
+                conn.execute(
+                    "UPDATE chapters SET status=? WHERE chapter_num=? AND status IN ('writing', 'pending_review')",
+                    (CHAPTER_STATUS_REVIEW_FAILED if recovering else CHAPTER_STATUS_DRAFT, chapter_num),
+                )
+                conn.execute(
+                    "UPDATE writing_sessions SET ended_at=datetime('now','localtime'), end_reason='写作中断' "
+                    "WHERE chapter_num=? AND ended_at IS NULL",
+                    (chapter_num,),
+                )
+        print(f"[提示] 第{chapter_num}章写作状态已恢复，可从章节列表继续")
+    except Exception as e:
+        print(f"[警告] 状态恢复失败，请检查断点：{e}")
+
+
 def _register_sigint_handler():
-    """注册 Ctrl+C 处理器，保证章节状态正常回滚"""
+    """注册 Ctrl+C 处理器，保证章节状态正常回滚。"""
     def _handle_sigint(sig, frame):
         print("\n\n[中断] 检测到 Ctrl+C，正在回滚章节状态...")
         if _current_novel_name and _current_chapter_num:
-            try:
-                with with_db_connection(_current_novel_name) as conn:
-                    with DatabaseTransaction(conn):
-                        conn.execute(
-                            "UPDATE chapter_tasks SET status='待处理', "
-                            "updated_at=datetime('now','localtime') "
-                            "WHERE chapter_num=? AND status='进行中'",
-                            (_current_chapter_num,)
-                        )
-                        conn.execute(
-                            "UPDATE chapters SET status='草稿' "
-                            "WHERE chapter_num=? AND status='writing'",
-                            (_current_chapter_num,)
-                        )
-                print(f"[OK] 第{_current_chapter_num}章状态已回滚为【待处理】")
-            except Exception as e:
-                print(f"[警告] 状态回滚失败（可在章节菜单手动恢复）：{e}")
+            rollback_writing(_current_novel_name, _current_chapter_num)
         from core.api_client import print_session_stats, get_session_stats
         stats = get_session_stats()
         if stats["total_calls"] > 0:
@@ -1917,6 +2082,61 @@ def _register_sigint_handler():
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _handle_sigint)
+
+
+def create_novel(novel_name="", genre="", keywords="", import_data=None):
+    from core.db import init_database
+    if import_data is not None:
+        novel_name, genre = import_data["novel_name"], import_data["genre"]
+    error = _validate_novel_name(novel_name)
+    if error:
+        raise ValueError(error)
+    if _data_dir(novel_name).exists():
+        raise ValueError("同名小说目录已存在，请选择已有小说或换一个名称")
+    init_database(novel_name)
+    _write_novel_info(novel_name, genre)
+    if import_data is None:
+        _, style_key = run_planner(novel_name, genre, keywords)
+    else:
+        mm = MemoryManager(novel_name)
+
+        if import_data.get("outline"):
+            (mm.data_dir / "master_outline.md").write_text(
+                f"# 总大纲\n\n{import_data['outline']}", encoding="utf-8"
+            )
+            print(f"  [OK] 大纲已保存")
+
+        world_settings = _build_import_world_settings(import_data)
+        if world_settings:
+            mm.save_world_settings(world_settings)
+            print(f"  [OK] 世界观已保存")
+
+        if import_data.get("characters_text"):
+            _parse_and_save_characters(mm, import_data["characters_text"])
+
+        style_key = get_style_choice()
+
+        target_chapters = import_data.get("target_chapters", 100)
+        (mm.data_dir / "target_chapters.txt").write_text(
+            str(target_chapters), encoding="utf-8"
+        )
+
+        from core.outline_manager import generate_outline_foreshadow
+        generate_outline_foreshadow(novel_name, target_chapters, review_mode=False)
+
+        split_outline_to_tasks(
+            import_data.get("outline", ""), novel_name,
+            target_chapters=target_chapters,
+            full_batch=True,
+        )
+
+        print(f"\n{'=' * 50}")
+        print(f"✅ 导入完成！《{novel_name}》已就绪")
+        print(f"目标篇幅：{target_chapters}章 | 任务卡：{target_chapters}张")
+        print(f"{'=' * 50}\n")
+    (_data_dir(novel_name) / "style.txt").write_text(style_key, encoding="utf-8")
+    _ensure_author_intent_templates(novel_name)
+    return novel_name
 
 
 def main():
@@ -1946,110 +2166,20 @@ def main():
 
             mode = input("请选择（默认1）：").strip() or "1"
 
-            if mode == "2":
-                import_data = _import_from_text_file()
-                if not import_data:
-                    continue
+            try:
+                if mode == "2":
+                    import_data = _import_from_text_file()
+                    if not import_data:
+                        continue
+                    novel_name = create_novel(import_data=import_data)
+                else:
+                    novel_name, genre, keywords = setup_novel()
+                    novel_name = create_novel(novel_name, genre, keywords)
+            except ValueError as error:
+                print(f"[错误] {error}")
+                continue
 
-                novel_name = import_data["novel_name"]
-                genre = import_data["genre"]
-
-                from core.db import init_database
-                init_database(novel_name)
-                _write_novel_info(novel_name, genre)
-
-                mm = MemoryManager(novel_name)
-
-                if import_data.get("outline"):
-                    (mm.data_dir / "master_outline.md").write_text(
-                        f"# 总大纲\n\n{import_data['outline']}", encoding="utf-8"
-                    )
-                    print(f"  [OK] 大纲已保存")
-
-                if import_data.get("world_setting"):
-                    mm.save_world_settings(import_data["world_setting"])
-                    print(f"  [OK] 世界观已保存")
-
-                if import_data.get("characters_text"):
-                    _parse_and_save_characters(mm, import_data["characters_text"])
-
-                style_key = get_style_choice()
-                (mm.data_dir / "style.txt").write_text(style_key, encoding="utf-8")
-
-                # 生成创作意图模板（优化B）
-                _intent_path = mm.data_dir / "author_intent.md"
-                if not _intent_path.exists():
-                    _intent_path.write_text(
-                        "# 创作意图\n\n"
-                        "## 这本书想成为什么\n"
-                        "（基调、主题、核心吸引力）\n\n"
-                        "## 不想变成什么样\n"
-                        "（避免的风格、雷区）\n",
-                        encoding="utf-8"
-                    )
-                _focus_path = mm.data_dir / "current_focus.md"
-                if not _focus_path.exists():
-                    _focus_path.write_text(
-                        "# 当前焦点\n\n"
-                        "## 最近 1-3 章的重点\n"
-                        "（当前弧线的核心冲突、需要推进的线索）\n",
-                        encoding="utf-8"
-                    )
-
-                target_chapters = import_data.get("target_chapters", 100)
-                (mm.data_dir / "target_chapters.txt").write_text(
-                    str(target_chapters), encoding="utf-8"
-                )
-
-                from core.outline_manager import generate_outline_foreshadow
-                generate_outline_foreshadow(novel_name, target_chapters, review_mode=False)
-
-                split_outline_to_tasks(
-                    import_data.get("outline", ""), novel_name,
-                    target_chapters=target_chapters,
-                    full_batch=True,
-                )
-
-                print(f"\n{'=' * 50}")
-                print(f"✅ 导入完成！《{novel_name}》已就绪")
-                print(f"目标篇幅：{target_chapters}章 | 任务卡：{target_chapters}张")
-                print(f"{'=' * 50}\n")
-
-                chapters_menu(novel_name)
-            else:
-                novel_name, genre, keywords = setup_novel()
-
-                from core.db import init_database
-                init_database(novel_name)
-                _write_novel_info(novel_name, genre)
-
-                _, style_key = run_planner(novel_name, genre, keywords)
-
-            style_path = _data_dir(novel_name) / "style.txt"
-            style_path.write_text(style_key, encoding="utf-8")
-
-            # 生成创作意图模板（优化B）
-            dd = _data_dir(novel_name)
-            _intent_path = dd / "author_intent.md"
-            if not _intent_path.exists():
-                _intent_path.write_text(
-                    "# 创作意图\n\n"
-                    "## 这本书想成为什么\n"
-                    "（基调、主题、核心吸引力）\n\n"
-                    "## 不想变成什么样\n"
-                    "（避免的风格、雷区）\n",
-                    encoding="utf-8"
-                )
-            _focus_path = dd / "current_focus.md"
-            if not _focus_path.exists():
-                _focus_path.write_text(
-                    "# 当前焦点\n\n"
-                    "## 最近 1-3 章的重点\n"
-                    "（当前弧线的核心冲突、需要推进的线索）\n",
-                    encoding="utf-8"
-                )
-
-            print("\n策划完成！开始写章节。")
+            print("\n准备完成！开始写章节。")
             chapters_menu(novel_name)
 
         elif choice == "2":
@@ -2133,4 +2263,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--cli"]:
+        main()
+    else:
+        # 工作台也会导入 main，共用同一个模块实例。
+        sys.modules["main"] = sys.modules[__name__]
+        from run_web import main as run_workbench
+
+        run_workbench()

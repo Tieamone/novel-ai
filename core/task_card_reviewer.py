@@ -7,6 +7,7 @@
 
 from core.utils import extract_json_obj, to_int, with_db_connection
 from core.config_loader import get as cfg
+from core.interaction import say as print
 
 
 # ──────────────────────────────────────────────────────────────────

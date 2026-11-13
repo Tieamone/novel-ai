@@ -3,6 +3,7 @@ import json
 from core.api_client import call_author_api
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg
+from core.interaction import ask as input, say as print, read_block
 
 # ==================== 篇幅选项 ====================
 
@@ -449,16 +450,7 @@ def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
 # ==================== 交互工具 ====================
 
 def _read_block_input() -> str:
-    lines = []
-    while True:
-        try:
-            line = input()
-        except EOFError:
-            break
-        if line.strip().upper() == "END":
-            break
-        lines.append(line)
-    return "\n".join(lines).strip()
+    return read_block()
 
 
 def _choose_draft_review_mode() -> bool:
@@ -468,7 +460,9 @@ def _choose_draft_review_mode() -> bool:
     print("  1. 关闭（默认，直接采用AI结果）")
     print("  2. 开启（世界观/人物档案/任务卡先看草稿再确认）")
     print()
-    choice = input("请选择（默认1）：").strip() or "1"
+    choice = input("请选择（默认1）：", options=(
+        ("1", "直接采用 AI 结果"), ("2", "先审阅 AI 草稿"),
+    )).strip() or "1"
     enabled = (choice == "2")
     if enabled:
         print("  [OK] 已开启 AI草稿后人工编辑确认模式")
@@ -485,7 +479,8 @@ def _confirm_text_draft(step_name: str, draft_text: str) -> str:
     print()
     print("  1. 直接采用草稿（默认）")
     print("  2. 手动编辑后采用")
-    choice = input("请选择：").strip() or "1"
+    choice = input("请选择：", options=(("1", "采用草稿"), ("2", "编辑草稿")),
+                   context=preview).strip() or "1"
     if choice != "2":
         return draft_text
     print("\n  请粘贴修改后的完整内容。")
@@ -507,7 +502,9 @@ def _confirm_json_draft(step_name: str, draft_obj, preview_items: int = 3):
         total_items = len(draft_obj)
         if len(draft_obj) > preview_items:
             preview_obj = draft_obj[:preview_items]
+    draft_preview = ""
     try:
+        draft_preview = json.dumps(draft_obj, ensure_ascii=False, indent=2)
         print(json.dumps(preview_obj, ensure_ascii=False, indent=2))
     except Exception:
         print(str(preview_obj))
@@ -516,7 +513,8 @@ def _confirm_json_draft(step_name: str, draft_obj, preview_items: int = 3):
     print()
     print("  1. 直接采用草稿（默认）")
     print("  2. 手动编辑JSON后采用")
-    choice = input("请选择：").strip() or "1"
+    choice = input("请选择：", options=(("1", "采用草稿"), ("2", "编辑 JSON")),
+                   context=draft_preview).strip() or "1"
     if choice != "2":
         return draft_obj
 
@@ -550,7 +548,10 @@ def _choose_novel_length() -> int:
         chapters_str = f"约{v['chapters']}章" if v["chapters"] else "自定义"
         print(f"  {k}. {v['name']:<6} （{chapters_str}）  {v['desc']}")
     print()
-    choice = input("请选择（默认2）：").strip() or "2"
+    choice = input("请选择（默认2）：", options=tuple(
+        (key, f"{value['name']} · {value['chapters']}章" if value["chapters"] else value["name"])
+        for key, value in NOVEL_LENGTH_OPTIONS.items()
+    )).strip() or "2"
     if choice not in NOVEL_LENGTH_OPTIONS:
         choice = "2"
 
@@ -583,7 +584,9 @@ def get_outline_choice(genre: str, keywords: str, novel_name: str,
     print("  1. 由AI根据类型和关键词自动生成")
     print("  2. 我自己提供大纲（粘贴文本）")
     print()
-    choice = input("请选择（默认1）：").strip() or "1"
+    choice = input("请选择（默认1）：", options=(
+        ("1", "AI 生成大纲"), ("2", "粘贴自己的大纲"),
+    )).strip() or "1"
 
     if choice == "2":
         outline = _get_outline_from_user()
@@ -621,7 +624,9 @@ def get_characters_choice(outline: str) -> list:
     print("  1. AI从大纲中自动提取角色")
     print("  2. 我自己输入角色名字")
     print()
-    choice = input("请选择（默认1）：").strip() or "1"
+    choice = input("请选择（默认1）：", options=(
+        ("1", "从大纲提取角色"), ("2", "手动输入角色"),
+    )).strip() or "1"
 
     if choice == "2":
         return _manual_input_characters()
@@ -648,7 +653,8 @@ def get_characters_choice(outline: str) -> list:
     if names:
         print(f"  [OK] 从大纲提取到 {len(names)} 个角色：{' / '.join(names)}")
         confirm = input(
-            "  确认使用以上角色？(回车确认 / 输入n重新手动输入)："
+            "  确认使用以上角色？(回车确认 / 输入n重新手动输入)：",
+            options=(("y", "确认角色名单"), ("n", "手动输入")),
         ).strip()
         if confirm.lower() == "n":
             return _manual_input_characters()
@@ -810,7 +816,8 @@ def get_style_choice() -> str:
     print("  7. 自定义风格（自己描述写作风格）")
     print()
 
-    choice = input("请输入编号（默认1）：").strip() or "1"
+    options = tuple((key, item["name"]) for key, item in AUTHOR_STYLES.items())
+    choice = input("请输入编号（默认1）：", options=(*options, ("7", "自定义风格"))).strip() or "1"
 
     if choice == "7":
         print()
@@ -847,27 +854,29 @@ def _get_urgent_foreshadowing(mm: MemoryManager, current_chapter: int,
 # ==================== Step 6：任务卡 ====================
 
 def _get_model_max_output() -> int:
-    """获取当前作者模型的最大输出 tokens，用于计算每批任务卡数量。
-    取不到则回退到 16000。
+    """获取任务卡生成请求上限，用于计算每批任务卡数量。
+    低于 8000 时仍按现有最低请求额度 8000 处理；取不到则回退到 16000。
     """
     try:
         from core.api_client import get_current_author_max_tokens
         val = get_current_author_max_tokens()
         if val and val > 0:
-            return val
+            return max(8000, val)
     except Exception:
         pass
     return 16000
 
 
 def _compute_batch_params(chapter_count: int) -> tuple:
-    """根据模型能力和章节数计算 (每批章数, 每批 max_tokens, 总批次数)。
+    """根据任务卡请求上限和章节数计算 (每批章数, 每批 max_tokens, 总批次数)。
     - 每章约需 200 tokens
     - 每批 ≥ 10 章
     - 总批次数做向上取整
     """
     import math
     model_max = _get_model_max_output()
+    if chapter_count <= 0:
+        return 0, max(8000, model_max), 0
     per_batch = max(model_max // 200, 10)
     batch_max_tokens = max(8000, model_max)
     total_batches = math.ceil(chapter_count / per_batch)
@@ -906,14 +915,16 @@ def split_outline_to_tasks(outline: str, novel_name: str,
         model_max = _get_model_max_output()
         print(f"\n  {'='*55}")
         print(f"  [模型吞吐量不足]")
-        print(f"  当前模型最大输出: {model_max} tokens")
+        print(f"  当前任务卡请求上限: {model_max} tokens")
         print(f"  全量生成 {first_batch} 章约需: {first_batch * 200} tokens")
         print(f"  最大单批能力: {per_batch} 章/批")
         print(f"  {'='*55}")
         print(f"  1. 切换模型（选择吞吐量更大的模型）")
         print(f"  2. 改为分批生成（每批 {per_batch} 章，共 {total_batches} 批）")
         print(f"  3. 取消")
-        choice = input("\n  请选择（默认2）：").strip() or "2"
+        choice = input("\n  请选择（默认2）：", options=(
+            ("1", "切换模型"), ("2", f"分批生成（每批 {per_batch} 章）"), ("3", "跳过生成"),
+        )).strip() or "2"
 
         if choice == "1":
             from core.api_client import select_all_models_interactive, _select_single_model
@@ -939,7 +950,7 @@ def split_outline_to_tasks(outline: str, novel_name: str,
     if full_batch:
         print(f"\n  正在一次性生成全部{first_batch}章任务卡（全书目标：{full_target}章）...")
         batch_tokens = max(8000, min(first_batch * 200, batch_max_tokens))
-        print(f"  max_tokens={batch_tokens}，模型上限={_get_model_max_output()}")
+        print(f"  max_tokens={batch_tokens}，任务卡请求上限={_get_model_max_output()}")
         saved = _generate_single_batch(
             outline, novel_name, first_batch, full_target,
             start=start, max_tokens=batch_tokens,
@@ -965,13 +976,14 @@ def split_outline_to_tasks(outline: str, novel_name: str,
                 novel_name_for_fs=novel_name,
                 review_mode=review_mode,
             )
-            saved += batch_saved
+            batch_total = batch_saved
             if batch_saved < batch_count:
-                saved = _supplement_tasks(
+                batch_total = _supplement_tasks(
                     outline, novel_name, batch_count, full_target,
-                    saved + (batch_start - start),
+                    batch_saved,
                     batch_start=batch_start,
                 )
+            saved += batch_total
 
         if total_batches > 1:
             print(f"\n  [OK] 分批生成完成！总计 {saved} 个章节任务卡（{total_batches}批）")
@@ -1049,7 +1061,9 @@ def _generate_single_batch(outline: str, novel_name: str,
                         print(f"  [警告] 修正后审核仍未通过({review_result2.get('score_total', 0)}/40)")
                         print("  1. 接受当前任务卡（强制入库）")
                         print("  2. 丢弃本批任务卡")
-                        choice = input("  请选择（默认1）：").strip() or "1"
+                        choice = input("  请选择（默认1）：", options=(
+                            ("1", "接受当前任务卡"), ("2", "丢弃本批任务卡"),
+                        )).strip() or "1"
                         if choice == "2":
                             return 0
                     else:
@@ -1083,7 +1097,7 @@ def _generate_single_batch(outline: str, novel_name: str,
 def _supplement_tasks(outline: str, novel_name: str,
                       batch_count: int, full_target: int,
                       already_saved: int, batch_start: int = 1) -> int:
-    """补充缺失的任务卡（AI 返回数量不足时）。返回新的 total saved。"""
+    """补充缺失的任务卡（AI 返回数量不足时）。返回本批已保存数量。"""
     from core.utils import with_db_connection
 
     shortage = batch_count - already_saved
@@ -1147,7 +1161,7 @@ def _supplement_tasks(outline: str, novel_name: str,
                 """, (chapter_num, plot_goal, emotion_tag))
                 already_saved += 1
         conn.commit()
-    print(f"  [OK] 补充完成！总计 {already_saved} 个章节任务卡")
+    print(f"  [OK] 本批补充完成！本批共 {already_saved} 个章节任务卡")
     return already_saved
 
 
@@ -1174,13 +1188,16 @@ def extend_tasks(novel_name: str, from_chapter: int):
 
     # 计算剩余章节数
     remaining = (full_target - from_chapter + 1) if full_target > 0 else 50
+    if full_target > 0 and remaining <= 0:
+        print(f"  [提示] 已达到目标章数 {full_target} 章，不再自动扩展任务卡")
+        return
     # 根据模型能力决定这批扩展多少章
     per_batch, batch_max_tokens, _ = _compute_batch_params(remaining)
     batch_size = min(per_batch, remaining)
     end_chapter = from_chapter + batch_size - 1
 
     model_max = _get_model_max_output()
-    print(f"  [扩展] 任务卡不足，模型上限={model_max} tokens，本批扩展 {batch_size} 章"
+    print(f"  [扩展] 任务卡不足，任务卡请求上限={model_max} tokens，本批扩展 {batch_size} 章"
           f"（第{from_chapter}-{end_chapter}章）")
 
     if full_target > 0:

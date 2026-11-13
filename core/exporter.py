@@ -3,6 +3,7 @@ import time
 import re
 
 from pathlib import Path
+from core.interaction import say as print
 from core.memory_manager import MemoryManager
 from core.db import get_connection
 from core.config_loader import get_output_dir, get_project_root

@@ -38,7 +38,11 @@ Thumbs.db
 .env
 *.log
 *.db
+*.db-shm
+*.db-wal
+.codex/config.toml
 
 # Ignore generated outputs and sensitive local files
 output/
 sensitive_words.txt
+node_modules/
