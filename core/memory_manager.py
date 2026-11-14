@@ -262,10 +262,7 @@ class MemoryManager:
                 })
 
         hints.sort(key=lambda x: (x["priority"], -x["age"]))
-        urgent  = [h for h in hints if h["priority"] <= 2]
-        others  = [h for h in hints if h["priority"] >  2]
-        selected = urgent + others[:max(0, MAX_HINTS - len(urgent))]
-        return [h["hint"] for h in selected]
+        return [h["hint"] for h in hints[:MAX_HINTS]]
 
     _MACRO_KEYWORDS = (
         "暗示", "背后", "阴谋", "命运", "秘密", "真相", "警告",
@@ -391,7 +388,7 @@ class MemoryManager:
                  "| ID | 埋下章节 | 描述 | 预计兑现 | 状态 |",
                  "|---|---|---|---|---|"]
         for row in rows:
-            status = "✓已兑现" if row["status"] == "redeemed" else "未兑现"
+            status = {"redeemed": "✓已兑现", "archived": "已归档"}.get(row["status"], "未兑现")
             lines.append(
                 f"| {row['fid']} | 第{row['plant_chapter']}章 "
                 f"| {row['description']} "
@@ -400,6 +397,41 @@ class MemoryManager:
         self._write_md("foreshadowing.md", "\n".join(lines))
 
     # ==================== 摘要 ====================
+
+    def save_extracted_memory(self, chapter_num: int, data: dict):
+        summary = data["summary"].strip()
+        with with_db_connection(self.novel_name) as conn, DatabaseTransaction(conn):
+            for item in data.get("character_updates", []):
+                name = item.get("name")
+                location = item.get("location")
+                status = item.get("status")
+                if name and (location or status):
+                    conn.execute("""
+                        UPDATE characters SET current_location=COALESCE(NULLIF(?, ''), current_location),
+                            current_status=COALESCE(NULLIF(?, ''), current_status), updated_chapter=?
+                        WHERE name=? AND COALESCE(updated_chapter, 0) <= ?
+                    """, (location, status, chapter_num, name, chapter_num))
+            for item in data.get("relationship_updates", []):
+                a, b, relation = item.get("name"), item.get("with"), item.get("new_relationship")
+                if not (a and b and relation):
+                    continue
+                for name, other, value in ((a, b, relation), (b, a, _mirror_relationship(relation))):
+                    row = conn.execute(
+                        "SELECT relationships FROM characters WHERE name=? AND COALESCE(updated_chapter, 0) <= ?",
+                        (name, chapter_num),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    relationships = json.loads(row["relationships"] or "{}")
+                    relationships[other] = value
+                    conn.execute("UPDATE characters SET relationships=?, updated_chapter=? WHERE name=?",
+                                 (json.dumps(relationships, ensure_ascii=False), chapter_num, name))
+            conn.execute("INSERT OR REPLACE INTO summaries (chapter_num, summary) VALUES (?, ?)",
+                         (chapter_num, summary))
+            conn.execute("UPDATE chapters SET summary=? WHERE chapter_num=?", (summary, chapter_num))
+        self._refresh_summaries_md()
+        if data.get("character_updates") or data.get("relationship_updates"):
+            self._refresh_characters_md()
 
     def add_summary(self, chapter_num: int, summary: str):
         with with_db_connection(self.novel_name) as conn:
@@ -410,28 +442,27 @@ class MemoryManager:
                 """, (chapter_num, summary))
         self._refresh_summaries_md()
 
-    def load_recent_summaries(self, count: int = 5) -> list:
-        from core.config_loader import get as cfg
-        count = cfg("novel", "recent_summary_count", count)
-        with with_db_connection(self.novel_name) as conn:
+    @staticmethod
+    def _read_summaries(conn, before_chapter=None, count=None):
+        compressed = conn.execute(
+            "SELECT chapter_num, summary FROM summaries WHERE is_compressed=1 "
+            "AND (? IS NULL OR chapter_num < ?) AND (summary LIKE '[阶段摘要%' OR NOT EXISTS ("
+            "SELECT 1 FROM summaries AS newer WHERE newer.is_compressed=1 AND newer.chapter_num >= ?)) "
+            "ORDER BY chapter_num DESC LIMIT 1",
+            (before_chapter, before_chapter, before_chapter),
+        ).fetchone()
+        lower = compressed["chapter_num"] if compressed else 0
+        recent = conn.execute(
+            "SELECT chapter_num, summary FROM summaries WHERE is_compressed=0 "
+            "AND chapter_num > ? AND (? IS NULL OR chapter_num < ?) "
+            "ORDER BY chapter_num DESC LIMIT ?",
+            (lower, before_chapter, before_chapter, -1 if count is None else count),
+        ).fetchall()
+        return ([dict(compressed)] if compressed else []) + [dict(row) for row in reversed(recent)]
 
-            compressed = conn.execute("""
-                SELECT chapter_num, summary FROM summaries
-                WHERE is_compressed=1
-                ORDER BY chapter_num DESC LIMIT 1
-            """).fetchone()
-
-            recent = conn.execute("""
-                SELECT chapter_num, summary FROM summaries
-                WHERE is_compressed=0
-                ORDER BY chapter_num DESC LIMIT ?
-            """, (count,)).fetchall()
-
-        result = []
-        if compressed:
-            result.append(dict(compressed))
-        result.extend([dict(r) for r in reversed(recent)])
-        return result
+    def load_recent_summaries(self, count=None, *, before_chapter=None):
+        with with_db_connection(self.novel_name, readonly=self.readonly) as conn:
+            return self._read_summaries(conn, before_chapter, count)
 
     def compress_old_summaries(self):
         from core.api_client import call_api
@@ -598,6 +629,10 @@ class MemoryManager:
                         plot_goal=?,
                         emotion_tag=?,
                         word_target=?,
+                        review_score_total=NULL, review_score_l1=NULL, review_score_l2=NULL,
+                        review_score_l3=NULL, review_veto_items=NULL, review_failure_attribution=NULL,
+                        review_updated_at=NULL, reader_review_score=NULL, reader_review_passed=NULL,
+                        reader_review_issues=NULL,
                         updated_at=?
                     WHERE chapter_num=?
                 """, (
@@ -697,25 +732,46 @@ class MemoryManager:
             ).fetchone()
         return dict(row) if row else {}
 
-    def delete_chapter(self, chapter_num: int):
-        """
-        删除章节的数据库记录及其摘要，回滚本章兑现的伏笔。
-        任务卡重置（status→待处理）由调用方负责。
-        """
-        with with_db_connection(self.novel_name) as conn:
-            with DatabaseTransaction(conn):
-                # 回滚本章兑现的运行时伏笔
+    def delete_chapter(self, chapter_num: int) -> bool:
+        """移除正文与对应记忆，回滚可按章号定位的伏笔，并重置任务。"""
+        with with_db_connection(self.novel_name) as conn, DatabaseTransaction(conn):
+            chapter = conn.execute(
+                "SELECT status FROM chapters WHERE chapter_num=?", (chapter_num,)
+            ).fetchone()
+            if chapter and chapter["status"] in ("已审核", "approved"):
                 conn.execute(
-                    "UPDATE foreshadowing SET status='active', redeemed_chapter=NULL "
-                    "WHERE redeemed_chapter=?", (chapter_num,)
+                    "UPDATE outline_foreshadowing SET status='planned' "
+                    "WHERE novel_name=? AND plant_chapter=? AND status IN ('planted', 'resolved')",
+                    (self.novel_name, chapter_num),
                 )
                 conn.execute(
-                    "DELETE FROM chapters WHERE chapter_num=?", (chapter_num,)
+                    "UPDATE outline_foreshadowing SET status='planted' "
+                    "WHERE novel_name=? AND resolve_chapter=? AND plant_chapter < ? "
+                    "AND status='resolved' AND EXISTS ("
+                    "SELECT 1 FROM chapters WHERE chapter_num=plant_chapter AND status IN ('approved', '已审核'))",
+                    (self.novel_name, chapter_num, chapter_num),
                 )
-                conn.execute(
-                    "DELETE FROM summaries WHERE chapter_num=?", (chapter_num,)
-                )
+            conn.execute(
+                "UPDATE foreshadowing SET status='active', redeemed_chapter=NULL "
+                "WHERE status='redeemed' AND redeemed_chapter=?", (chapter_num,)
+            )
+            conn.execute("DELETE FROM chapters WHERE chapter_num=?", (chapter_num,))
+            conn.execute(
+                "DELETE FROM summaries WHERE chapter_num=? "
+                "AND (is_compressed=0 OR summary NOT LIKE '[阶段摘要%')",
+                (chapter_num,),
+            )
+            conn.execute(
+                "UPDATE chapter_tasks SET status='待处理', updated_at=datetime('now','localtime') "
+                "WHERE chapter_num=?", (chapter_num,)
+            )
+            later = conn.execute(
+                "SELECT 1 FROM chapters WHERE chapter_num>? AND LENGTH(TRIM(content))>0 LIMIT 1",
+                (chapter_num,),
+            ).fetchone()
         self._refresh_foreshadowing_md()
+        self._refresh_summaries_md()
+        return later is not None
 
     def load_context(self, chapter_num: int) -> dict:
         """
@@ -749,11 +805,8 @@ class MemoryManager:
         world_settings = ""
         characters = []
         active_foreshadowing = []
-        recent_summaries = []
-        from core.config_loader import get as cfg
-        summary_count = cfg("novel", "recent_summary_count", 5)
 
-        with with_db_connection(self.novel_name) as conn:
+        with with_db_connection(self.novel_name, readonly=self.readonly) as conn:
             # 世界观
             row = conn.execute(
                 "SELECT content FROM world_settings WHERE id=1"
@@ -769,29 +822,23 @@ class MemoryManager:
                     d["relationships"] = json.loads(d.get("relationships") or "{}")
                 except Exception:
                     d["relationships"] = {}
+                if (d.get("updated_chapter") or 0) >= chapter_num:
+                    d.update(current_location="", current_status="", relationships={})
                 characters.append(d)
 
             # 活跃伏笔
             f_rows = conn.execute(
-                "SELECT * FROM foreshadowing WHERE status='active'"
+                "SELECT * FROM foreshadowing WHERE plant_chapter < ? "
+                "AND (status='active' OR redeemed_chapter >= ?)", (chapter_num, chapter_num),
             ).fetchall()
             active_foreshadowing = [dict(r) for r in f_rows]
 
-            # 近期摘要（压缩版 + 最新N条非压缩）
-            compressed = conn.execute("""
-                SELECT chapter_num, summary FROM summaries
-                WHERE is_compressed=1
-                ORDER BY chapter_num DESC LIMIT 1
-            """).fetchone()
-            recent = conn.execute("""
-                SELECT chapter_num, summary FROM summaries
-                WHERE is_compressed=0
-                ORDER BY chapter_num DESC LIMIT ?
-            """, (summary_count,)).fetchall()
-
-            if compressed:
-                recent_summaries.append(dict(compressed))
-            recent_summaries.extend([dict(r) for r in reversed(recent)])
+            # 阶段摘要和当前章之前的全部未压缩摘要
+            recent_summaries = self._read_summaries(conn, chapter_num)
+            covers_target = conn.execute(
+                "SELECT 1 FROM summaries WHERE is_compressed=1 AND chapter_num >= ? LIMIT 1",
+                (chapter_num,),
+            ).fetchone() is not None
 
         # 伏笔提示（基于已加载的活跃伏笔，不再额外查 DB）
         foreshadow_hints = self._get_foreshadow_hints_from_list(
@@ -800,12 +847,14 @@ class MemoryManager:
 
         return {
             "novel_name":           self.novel_name,
+            "readonly":             self.readonly,
             "data_dir":             str(self.data_dir),
             "world_settings":       world_settings,
             "characters":           characters,
             "active_foreshadowing": active_foreshadowing,
             "foreshadow_hints":     foreshadow_hints,
             "recent_summaries":     recent_summaries,
+            "summary_history_incomplete": covers_target,
             "chapter_num":          chapter_num,
             "outline":              outline,
             "target_chapters":      target_chapters,
@@ -819,10 +868,10 @@ class MemoryManager:
         prev_num = chapter_num - 1
         if prev_num < 1:
             return ""
-        with with_db_connection(self.novel_name) as conn:
+        with with_db_connection(self.novel_name, readonly=self.readonly) as conn:
             row = conn.execute(
-                "SELECT content FROM chapters WHERE chapter_num=?",
-                (prev_num,)
+                "SELECT content FROM chapters WHERE chapter_num=? AND status IN (?, ?, ?)",
+                (prev_num, "已审核", "强制通过", "approved")
             ).fetchone()
         if not row or not row["content"]:
             return ""

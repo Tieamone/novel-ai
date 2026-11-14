@@ -4,10 +4,11 @@ import statistics
 from collections import Counter
 from pathlib import Path
 from core.interaction import ask as input, say as print
-from core.api_client import call_author_api, call_reviewer_api, increment_failure_counter, reset_failure_counter, get_current_author_model, get_author_model
+from core.api_client import call_author_api, increment_failure_counter, reset_failure_counter, get_current_author_model, get_author_model
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg, get_data_dir
-from core.utils import extract_json_obj, is_transient_error, with_db_connection
+from core.author_intent import build_intent_block
+from core.utils import is_transient_error, with_db_connection
 import sqlite3 as _sqlite3
 
 # 节拍规划缓存（跨重试复用，任务卡不变则节拍不变）
@@ -189,7 +190,7 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
     # ── 大纲伏笔强制任务 ──────────────────────────────────────
     try:
         from core.outline_manager import get_chapter_outline_tasks
-        outline_tasks = get_chapter_outline_tasks(ctx.get("novel_name", ""), chapter_num)
+        outline_tasks = get_chapter_outline_tasks(ctx.get("novel_name", ""), chapter_num, readonly=ctx.get("readonly", False))
         to_plant = outline_tasks.get("to_plant", [])
         to_resolve = outline_tasks.get("to_resolve", [])
         if to_plant or to_resolve:
@@ -213,26 +214,7 @@ def build_full_chapter_prompt(ctx, chapter_num, plot_goal, emotion_tag,
         [f"第{s['chapter_num']}章：{s['summary']}" for s in summaries]
     ) if summaries else "这是开篇第一章"
 
-    # 创作意图注入（优化B：输入治理控制面）
-    intent_block = ""
-    _data_dir = ctx.get("data_dir")
-    if _data_dir:
-        _intent_path = Path(_data_dir) / "author_intent.md"
-        if _intent_path.exists():
-            try:
-                _intent_text = _intent_path.read_text(encoding="utf-8").strip()
-                if _intent_text:
-                    intent_block += f"\n=== 创作意图（长期方向）===\n{_intent_text}\n"
-            except Exception:
-                pass
-        _focus_path = Path(_data_dir) / "current_focus.md"
-        if _focus_path.exists():
-            try:
-                _focus_text = _focus_path.read_text(encoding="utf-8").strip()
-                if _focus_text:
-                    intent_block += f"\n=== 当前焦点（近期重点）===\n{_focus_text}\n"
-            except Exception:
-                pass
+    intent_block = build_intent_block(ctx.get("data_dir"))
 
     # 文法指纹注入（优化D）
     fingerprint_block = ""
@@ -602,34 +584,6 @@ HUMAN_WRITING_TECHNIQUES = """
 
 # ==================== 自检系统 ====================
 
-SELF_CHECK_SYSTEM = """你是网文写作质检助手，专门识别AI写作痕迹和写作质量问题。
-
-请仅输出JSON（不要Markdown，不要解释）：
-{
-  "pass": true/false,
-  "issues": ["问题1（引用原文具体句子）", "问题2"],
-  "need_revision": true/false
-}
-
-判定标准（发现任一项即 pass=false，issues 里写明具体问题并引用原文）：
-
-【AI痕迹检查——最高优先级】
-A1. 情绪标签直陈：是否有"她感到/他知道/她不禁/他心中涌起/不由自主"等直接陈述感受的句子？（必须改为行为/生理/他人视角）
-A2. 高频烂俗动作：是否有"深吸一口气/握紧拳头/瞳孔收缩/喉咙发紧"等过度使用的套路动作？
-A3. 心理陈述结尾：是否有"她决定了/他知道该怎么做了/她下定决心"收束章节？
-A4. 模板收束句：是否有任何版本的"这才刚开始/路还很长/无论如何"？
-A5. 无铺垫顿悟：是否有"突然想起/蓦然意识到/恍然大悟"且前文无对应铺垫？
-A6. 对称句式滥用：是否有过多"虽然…但依然/一方面…另一方面/不仅是…还"的工整结构？
-A7. 句子等长：全文句子长度是否过于均匀，缺乏节奏变化（长短句交错才是真实写作）？
-
-【质量检查】
-Q1. 情节偏题：是否偏离本章任务卡目标？
-Q2. 人物OOC：角色行为是否与已知性格不符且无触发原因？
-Q3. 重复表达：是否有换个词说同一件事的冗余段落？
-Q4. 场景无细节：是否有连续3句以上的纯抽象描述，没有任何具体感官细节？
-Q5. 裸对话：是否有4行以上连续台词无任何动作/表情/环境间隔？
-Q6. 结尾无张力：结尾是否是一个总结性/说明性的句子，而不是一个具体画面或悬念？"""
-
 # ==================== 修订与续写系统 ====================
 
 NEGATIVE_EXAMPLES = """
@@ -871,7 +825,7 @@ def _check_cross_chapter_quality(novel_name: str, current_chapter: int) -> list:
                     lines = content.split('\n')
                     total_lines = len([l for l in lines if l.strip()])
                     if total_lines > 0:
-                        dialogue_lines = len([l for l in lines if '"' in l or '"' in l or '："' in l])
+                        dialogue_lines = len([l for l in lines if any(mark in l for mark in ('"', '“', '”', '「', '」'))])
                         dialogue_ratios.append(dialogue_lines / total_lines)
 
                 # 句式单调性判断
@@ -1072,11 +1026,8 @@ def _plan_chapter_beats(ctx: dict, chapter_num: int,
 
 # ==================== 自检与修订 ====================
 
-def _self_check_and_revise(system_prompt: str, chapter_num: int,
-                           plot_goal: str, emotion_tag: str,
-                           full_content: str, beat_plan: str,
-                           max_tokens: int) -> str:
-    """轻量去AI化 + 诊断报告（不再触发全量修订，避免过度打磨）。"""
+def _polish_chapter(full_content: str, max_tokens: int) -> str:
+    """去AI化打磨并输出本地规则诊断。"""
     # ── 专项去AI化处理（轻量 API 打磨，仅三类明确问题）─────────
     _deai_system = (
         "你是网文文字打磨师，专门处理三类问题：\n"
@@ -1108,42 +1059,6 @@ def _self_check_and_revise(system_prompt: str, chapter_num: int,
     if detected_issues:
         summary = "；".join([x[:40] for x in detected_issues[:3]])
         print(f"  [诊断] 规则检测到 {len(detected_issues)} 项AI痕迹：{summary}")
-
-    # ── AI 自检诊断（仅报告，不修订）─────────────────────────
-    print("  [诊断] 正在评估写作质量...")
-    try:
-        check_prompt = f"""请按规则检查本章质量。
-
-章节：第{chapter_num}章
-本章目标：{plot_goal}
-情绪标签：{emotion_tag}
-
-正文：
-{full_content[:3000]}
-"""
-        raw = call_reviewer_api(
-            system_prompt=SELF_CHECK_SYSTEM,
-            user_message=check_prompt,
-            temperature=cfg("temperature", "self_check", 0.20),
-            max_tokens=400,
-        )
-        result = extract_json_obj(raw)
-        if result:
-            passed = bool(result.get("pass"))
-            need_revision = bool(result.get("need_revision"))
-            issues = result.get("issues", [])
-            if isinstance(issues, str):
-                issues = [issues]
-            issues = [str(i).strip() for i in (issues or []) if str(i).strip()]
-
-            if passed and not need_revision:
-                print("  [诊断] ✅ 自检通过")
-            elif issues:
-                issue_summary = "；".join([x[:50] for x in issues[:2]])
-                print(f"  [诊断] 自检发现 {len(issues)} 项问题：{issue_summary}")
-                print(f"  [诊断] （问题已记录，将由责任编辑统一审核，不在此处修订）")
-    except Exception as e:
-        print(f"  [诊断] 跳过（{type(e).__name__}）")
 
     return full_content
 
@@ -1211,7 +1126,7 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
     # ── 大纲伏笔强制任务 ──────────────────────────────────────
     try:
         from core.outline_manager import get_chapter_outline_tasks
-        outline_tasks = get_chapter_outline_tasks(ctx.get("novel_name", ""), chapter_num)
+        outline_tasks = get_chapter_outline_tasks(ctx.get("novel_name", ""), chapter_num, readonly=ctx.get("readonly", False))
         to_plant = outline_tasks.get("to_plant", [])
         to_resolve = outline_tasks.get("to_resolve", [])
         if to_plant or to_resolve:
@@ -1235,26 +1150,7 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
         [f"第{s['chapter_num']}章：{s['summary']}" for s in summaries]
     ) if summaries else "这是开篇第一章"
 
-    # 创作意图注入（优化B：输入治理控制面）
-    intent_block = ""
-    _data_dir = ctx.get("data_dir")
-    if _data_dir:
-        _intent_path = Path(_data_dir) / "author_intent.md"
-        if _intent_path.exists():
-            try:
-                _intent_text = _intent_path.read_text(encoding="utf-8").strip()
-                if _intent_text:
-                    intent_block += f"\n=== 创作意图（长期方向）===\n{_intent_text}\n"
-            except Exception:
-                pass
-        _focus_path = Path(_data_dir) / "current_focus.md"
-        if _focus_path.exists():
-            try:
-                _focus_text = _focus_path.read_text(encoding="utf-8").strip()
-                if _focus_text:
-                    intent_block += f"\n=== 当前焦点（近期重点）===\n{_focus_text}\n"
-            except Exception:
-                pass
+    intent_block = build_intent_block(ctx.get("data_dir"))
 
     # 文法指纹注入（优化D）
     fingerprint_block = ""
@@ -1397,34 +1293,20 @@ def build_continue_prompt(chapter_num: int, plot_goal: str,
 
 {retry_block}"""
 
+def chapter_length_issue(content: str) -> str:
+    size = len(content.strip())
+    minimum = cfg("novel", "chapter_word_min", 3000)
+    maximum = cfg("novel", "chapter_word_max", 4000)
+    if not minimum <= size <= maximum:
+        return f"正文字数为 {size}，须在 {minimum}–{maximum} 字之间"
+    return ""
+
+
 def clean_content(text: str) -> str:
-    text = re.sub(r'^\s*【[^】]*】.*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*-{3,}\s*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
     text = re.sub(r'\*([^*\n]+)\*', r'\1', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
-
-    template_patterns = [
-        r'他[知感明白]道[，,][^。]{2,60}[。]?',
-        r'她[知感明白]道[，,][^。]{2,60}[。]?',
-        r'才刚开始',
-        r'这一切才刚开始',
-        r'这[一那]切.{0,3}开始[，。 ]?',
-        r'前[方之]的?路[还]?[很]?长[，。]',
-        r'无论前方有多少困难[，。]',
-        r'他[们]*必须勇敢地走下去[，。]',
-        r'她决定了[，。]',
-        r'她知道该怎么做了[，。]',
-        r'她感到很紧张',
-        r'他感到很紧张',
-        r'她心中涌起',
-        r'他心中涌起',
-        r'她知道[，,][^。]{2,50}[。]',
-    ]
-    for pattern in template_patterns:
-        filtered = re.sub(pattern, '', text, flags=re.MULTILINE)
-        if filtered != text:
-            text = filtered
 
     return text.strip()
 
@@ -1446,6 +1328,8 @@ def revise_chapter(novel_name: str, chapter_num: int,
     """基于审核反馈对原文进行局部修改，保留未被指出问题的段落。"""
     mm = MemoryManager(novel_name)
     ctx = mm.load_context(chapter_num)
+    if ctx["summary_history_incomplete"]:
+        print("  [提示] 本章已被阶段摘要覆盖，重写时可能缺少早期逐章记忆")
     ctx["novel_name"] = novel_name
 
     word_target = cfg("novel", "chapter_word_target", 3500)
@@ -1503,15 +1387,7 @@ def revise_chapter(novel_name: str, chapter_num: int,
         full_content = original_content
 
     # 去AI化
-    full_content = _self_check_and_revise(
-        system_prompt=system_prompt,
-        chapter_num=chapter_num,
-        plot_goal=plot_goal,
-        emotion_tag=emotion_tag,
-        full_content=full_content,
-        beat_plan=beat_plan,
-        max_tokens=max_tokens_cfg,
-    )
+    full_content = _polish_chapter(full_content, max_tokens_cfg)
     full_content = re.sub(r'\n{3,}', '\n\n', full_content)
 
     # 跨章词频检查（优化C）
@@ -1582,6 +1458,8 @@ def write_chapter(novel_name: str, chapter_num: int,
                   retry_feedback: str = "") -> str:
     mm = MemoryManager(novel_name)
     ctx = mm.load_context(chapter_num)
+    if ctx["summary_history_incomplete"]:
+        print("  [提示] 本章已被阶段摘要覆盖，重写时可能缺少早期逐章记忆")
     ctx["novel_name"] = novel_name
 
     word_target = cfg("novel", "chapter_word_target", 3500)
@@ -1760,15 +1638,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         print(f"  补写完成，当前总字数：{len(full_content)}字")
 
     # 自检与修订
-    full_content = _self_check_and_revise(
-        system_prompt=system_prompt,
-        chapter_num=chapter_num,
-        plot_goal=plot_goal,
-        emotion_tag=emotion_tag,
-        full_content=full_content,
-        beat_plan=beat_plan,
-        max_tokens=max_tokens_cfg,
-    )
+    full_content = _polish_chapter(full_content, max_tokens_cfg)
     full_content = re.sub(r'\n{3,}', '\n\n', full_content)
 
     # 跨章词频检查（优化C）

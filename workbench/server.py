@@ -170,9 +170,20 @@ def create_app():
         actions.existing_book(novel)
         if not re.fullmatch(r"第[0-9]+章\.txt", name):
             abort(404, "导出文件不存在")
-        directory = actions.export_directory(novel)
-        if (directory / name).resolve() != directory / name:
+        chapter = int(name[1:-5])
+        if not 1 <= chapter <= 1000000:
             abort(404, "导出文件不存在")
+        rows = actions.chapter_rows(novel, "SELECT status, content FROM chapters WHERE chapter_num=?",
+                                    (chapter,), readonly=True)
+        from core.exporter import EXPORTABLE_STATUSES, clean_for_export
+        if not rows or rows[0]["status"] not in EXPORTABLE_STATUSES:
+            abort(404, "章节尚未审核通过")
+        directory = actions.export_directory(novel)
+        path = directory / name
+        if path.resolve() != path or not path.is_file():
+            abort(404, "导出文件不存在")
+        if path.read_text(encoding="utf-8").replace("\r\n", "\n") != clean_for_export(rows[0]["content"] or "").replace("\r\n", "\n"):
+            abort(404, "导出文件与当前正文不一致，请重新导出")
         return send_from_directory(directory, name, as_attachment=True)
 
     @app.post("/api/jobs")

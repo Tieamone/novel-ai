@@ -29,7 +29,7 @@
   1. **项目概况**: 代码量 ~7500+ → ~10300+ 行，标注依赖版本见 requirements.txt
   2. **目录结构**: 更新所有模块行数标注，新增 newbook_template.txt、requirements.txt、pytest.ini、check_dashscope.py、tools/cleanup_foreshadow.py、core/__init__.py、data/custom_models.json
   3. **模块接口**: outline_manager.py (660+ → 839 行) 新增 review_outline_foreshadow()、CJK 宽度处理工具、交互式子函数；其他模块更新精确行数
-  4. **config.yaml 配置项**: 新增 novel.batch_size_small/medium/large、novel.batch_bridge_count 配置项说明
+  4. **config.yaml 配置项**: 曾新增分批配置说明。后续核实无消费代码，已移除这四个配置项
   5. **已完成功能**: 新增 6 项（单章/批量删除、导入伏笔生成、模型分类、依赖锁定、测试配置、伏笔清理工具）
   6. **待办事项**: P1 中移除"依赖版本锁定"（已完成）
 

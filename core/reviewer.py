@@ -112,7 +112,7 @@ FORESHADOW_REVIEWER_SYSTEM = """你是伏笔专项审核员，负责评估章节
    - 若本章无明显新增伏笔，给8-10分（没有不是问题）。
 
 2. **兑现完整度**（resolve）：应兑现的伏笔是否在本章得到实质呼应。
-   - 对照下方「应兑现伏笔」列表逐条检查。
+   - 对照候选中标为兑现的条目逐条检查。
    - 实质呼应 = 有具体情节推进，而非一笔带过或侧面提及。
    - 若无应兑现伏笔，给8-10分。
 
@@ -127,7 +127,7 @@ FORESHADOW_REVIEWER_SYSTEM = """你是伏笔专项审核员，负责评估章节
 说明要求：一句话概括本章伏笔处理情况。
 
 严格只输出JSON：
-{"embed":0-10,"resolve":0-10,"traceable":0-10,"overload_risk":0-10,"comment":"一句话说明"}"""
+{"embed":0-10,"resolve":0-10,"traceable":0-10,"overload_risk":0-10,"comment":"一句话说明","confirmed":[{"key":"候选编号","quote":"短小的正文原句"}]}"""
 
 
 def _normalize_issue_list(value) -> list:
@@ -269,23 +269,19 @@ def _normalize_review_result(raw_result: dict) -> dict:
         default=0, min_value=0, max_value=30
     )
 
-    total_raw = raw_result.get("score_total", raw_result.get("total_score"))
-    if total_raw is None:
-        legacy = raw_result.get("score")
-        if legacy is None:
-            score_total = score_l1 + score_l2 + score_l3
-        else:
-            score_total = to_int(legacy, default=0, min_value=0)
-            if score_total <= 10:
-                score_total *= 10
-    else:
-        score_total = to_int(total_raw, default=0, min_value=0, max_value=100)
-
-    expected_total = score_l1 + score_l2 + score_l3
-    if expected_total and abs(score_total - expected_total) > 20:
-        score_total = expected_total
-
-    model_pass = bool(raw_result.get("pass"))
+    score_total = score_l1 + score_l2 + score_l3
+    scores = (
+        raw_result.get("score_l1", raw_result.get("l1_score")),
+        raw_result.get("score_l2", raw_result.get("l2_score")),
+        raw_result.get("score_l3", raw_result.get("l3_score")),
+    )
+    if (type(raw_result.get("pass")) is not bool
+            or any(type(score) is not int or not 0 <= score <= limit
+                   for score, limit in zip(scores, (45, 25, 30)))
+            or raw_result.get("score_total", raw_result.get("total_score", score_total)) != score_total
+            or not isinstance(raw_result.get("veto_items", []), list)):
+        return _review_error_result("审稿结果字段或分数无效，请重试", "责任编辑返回格式异常")
+    model_pass = raw_result["pass"]
     veto_triggered = bool(veto_items)
     final_pass = model_pass and _rule_pass(score_total, score_l1, veto_items)
 
@@ -361,15 +357,13 @@ def _build_foreshadow_list(ctx: dict, chapter_num: int) -> dict:
     hints_raw = ctx.get("foreshadow_hints", [])
 
     to_resolve = []
-    for f in active:
+    for f in sorted(active, key=lambda row: (row.get("plant_chapter") or 1, row.get("fid") or "")):
         desc = (f.get("description") or "").strip()
         expected = (f.get("expected_redeem") or "待定").strip()
         if not desc:
             continue
         if expected == "待定":
             continue
-        planted_at = max(f.get("plant_chapter", 1) or 1, 1)
-        age = chapter_num - planted_at
         is_due = False
         range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected)
         if range_match:
@@ -394,6 +388,8 @@ def _build_foreshadow_list(ctx: dict, chapter_num: int) -> dict:
                 "fid": f.get("fid", ""),
                 "description": desc,
                 "handle_type": handle_type,
+                "source": "动态",
+                "action": "resolve",
             })
 
     active_hints = "\n".join(hints_raw[:15]) if hints_raw else ""
@@ -401,7 +397,7 @@ def _build_foreshadow_list(ctx: dict, chapter_num: int) -> dict:
         active_hints = active_hints[:1500] + "..."
 
     return {
-        "to_resolve": to_resolve,
+        "to_resolve": to_resolve[:8],
         "active_hints": active_hints,
         "total_active": len(active),
     }
@@ -417,21 +413,19 @@ def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
     active_hints = foreshadow_list.get("active_hints", "")
     total_active = foreshadow_list.get("total_active", 0)
 
-    if not to_resolve and not active_hints:
+    to_plant = foreshadow_list.get("to_plant", [])
+    if not to_resolve and not to_plant and not active_hints:
         return None
 
-    chapter_text = _truncate_for_review(chapter_text, max_len=5000)
-
-    resolve_block = ""
-    if to_resolve:
-        resolve_lines = []
-        for f in to_resolve:
-            resolve_lines.append(
-                f"- [{f['fid']}] {f['description']}（{f['handle_type']}）"
-            )
-        resolve_block = "\n".join(resolve_lines)
-    else:
-        resolve_block = "（本章无应兑现伏笔）"
+    # 超长正文仍可评分，但不能据截断片段确认状态。
+    review_text = _truncate_for_review(chapter_text, max_len=8000)
+    candidates = {
+        str(index): item for index, item in enumerate(to_plant + to_resolve, 1)
+    }
+    candidate_lines = "\n".join(
+        f"- [{key}] {item['handle_type']}（{item['source']} {item['fid']}）：{item['description']}"
+        for key, item in candidates.items()
+    )
 
     hints_block = active_hints if active_hints else "（暂无活跃伏笔）"
 
@@ -439,23 +433,24 @@ def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
 章节：第{chapter_num}章
 当前活跃伏笔总数：{total_active}
 
-=== 应兑现伏笔 ===
-{resolve_block}
+=== 本章埋入及兑现候选 ===
+{candidate_lines or "（无）"}
 
 === 当前活跃伏笔参考（用于判断哪些是旧伏笔）===
 {hints_block}
 
 === 待审正文 ===
-{chapter_text}
+{review_text}
 
-请逐项评分后输出JSON。"""
+逐项核对候选。confirmed 仅列正文中确实发生的埋入或兑现，引用短小的原文。
+否定、假设、计划、回忆或单纯提及不能证明已完成。无确认时返回空数组。"""
 
     try:
         raw = call_reviewer_api(
             system_prompt=FORESHADOW_REVIEWER_SYSTEM,
             user_message=prompt,
             temperature=0.2,
-            max_tokens=300,
+            max_tokens=max(300, 160 + 100 * len(candidates)),
         )
     except Exception:
         return None
@@ -471,7 +466,28 @@ def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
         except Exception:
             return 5
 
+    confirmed = []
+    entries = parsed.get("confirmed")
+    if isinstance(entries, list) and review_text == chapter_text:
+        seen, duplicates = set(), set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            key, quote = entry.get("key"), entry.get("quote")
+            if not isinstance(key, str) or key not in candidates:
+                continue
+            if key in seen:
+                duplicates.add(key)
+            seen.add(key)
+            if isinstance(quote, str) and quote.strip() and quote in chapter_text:
+                confirmed.append((key, candidates[key]))
+        confirmed = [
+            item for key, item in sorted(confirmed, key=lambda entry: int(entry[0]))
+            if key not in duplicates
+        ]
+
     return {
+        "confirmed": confirmed,
         "embed": _clamp(parsed.get("embed", 5)),
         "resolve": _clamp(parsed.get("resolve", 5)),
         "traceable": _clamp(parsed.get("traceable", 5)),
@@ -570,10 +586,7 @@ def build_review_prompt(ctx: dict, chapter_num: int,
     ) if foreshadow else "（暂无）"
 
     recent = ctx.get("recent_summaries", [])
-    recent_str = ""
-    if recent:
-        last = recent[-1]
-        recent_str = f"\n上一章概要：{last.get('summary', '')[:200]}"
+    recent_str = "\n".join(f"第{row['chapter_num']}章：{row['summary']}" for row in recent)
 
     return f"""=== 审稿任务 ===
 章节：第{chapter_num}章
@@ -597,6 +610,16 @@ def build_review_prompt(ctx: dict, chapter_num: int,
 def review_chapter(novel_name: str, chapter_num: int,
                    content: str, plot_goal: str) -> dict:
     mm = MemoryManager(novel_name)
+    from core.writer import chapter_length_issue
+    length_issue = chapter_length_issue(content)
+    if length_issue:
+        result = _normalize_review_result({
+            "pass": False, "score_l1": 0, "score_l2": 0, "score_l3": 0,
+            "l3_issues": [length_issue], "suggestions": length_issue,
+        })
+        _persist_review_result(mm, chapter_num, result)
+        print(f"  [责任编辑] {length_issue}")
+        return result
     ctx = mm.load_context(chapter_num)
 
     print(f"  [责任编辑] 正在审稿第{chapter_num}章...")
@@ -642,10 +665,21 @@ def review_chapter(novel_name: str, chapter_num: int,
     result = _normalize_review_result(parsed)
 
     # 伏笔专项评分（失败不中断主流程）
+    from core.outline_manager import get_chapter_outline_tasks
     foreshadow_list = _build_foreshadow_list(ctx, chapter_num)
+    outline_tasks = get_chapter_outline_tasks(novel_name, chapter_num)
+    foreshadow_list["to_resolve"].extend(
+        {**task, "source": "大纲", "action": "resolve", "handle_type": "大纲应兑现"}
+        for task in outline_tasks["to_resolve"]
+    )
+    foreshadow_list["to_plant"] = [
+        {**task, "source": "大纲", "action": "plant", "handle_type": "大纲应埋入"}
+        for task in outline_tasks["to_plant"]
+    ]
     fs_score = score_foreshadowing(content, foreshadow_list, chapter_num)
     if fs_score:
         result["foreshadow_score"] = fs_score
+        result["foreshadow_reviewed_content"] = content
         _apply_foreshadow_l2_judgment(result, fs_score, foreshadow_list)
 
     _persist_review_result(mm, chapter_num, result)
@@ -766,7 +800,7 @@ def _finish_writing_session(novel_name: str, session_id: int | None,
 
 def _force_approve_chapter(novel_name: str, chapter_num: int,
                            content: str, mm: MemoryManager = None) -> str:
-    """强制通过并同步运行时伏笔与大纲伏笔状态。"""
+    """标记为强制通过。"""
     if mm is None:
         mm = MemoryManager(novel_name)
     try:
@@ -774,8 +808,6 @@ def _force_approve_chapter(novel_name: str, chapter_num: int,
     except Exception as e:
         print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
         mm.update_chapter_status(chapter_num, "强制通过")
-    _auto_redeem_foreshadowing(mm, chapter_num, content)
-    _sync_outline_foreshadow(novel_name, chapter_num, content)
     return content or ""
 
 
@@ -899,111 +931,46 @@ _OUTLINE_STOPWORDS = frozenset([
     "你的", "我们", "你们", "这里", "那里", "里面", "外面", "上面", "下面",
 ])
 
-def _sync_outline_foreshadow(novel_name: str, chapter_num: int, content: str):
-    """审稿通过后同步大纲伏笔状态：埋入项标为 planted，兑现项检查关键词自动 resolved。"""
-    try:
-        from core.outline_manager import get_chapter_outline_tasks, mark_outline_foreshadow_status
-        import re
-        _split_re = re.compile(r'[，。、；：！？\s,.;:!?\\/\-—()\[\]【】""''\u3000]+')
-        tasks = get_chapter_outline_tasks(novel_name, chapter_num)
-        to_plant = tasks.get("to_plant", [])
-        to_resolve = tasks.get("to_resolve", [])
-        content_lower = (content or "").lower()
-        for t in to_plant:
-            mark_outline_foreshadow_status(novel_name, t["fid"], "planted")
-            print(f"  [大纲伏笔] {t['fid']} 状态: planned → planted (第{chapter_num}章埋入)")
-        for t in to_resolve:
-            desc = (t.get("description") or "").lower()
-            keywords = [w for w in _split_re.split(desc)
-                        if len(w) >= 2 and w not in _OUTLINE_STOPWORDS]
-            if not keywords:
-                continue
-            matched = sum(1 for kw in keywords if kw in content_lower)
-            if matched >= max(3, len(keywords) * 0.6):
-                mark_outline_foreshadow_status(novel_name, t["fid"], "resolved")
-                print(f"  [大纲伏笔] {t['fid']} 状态 → resolved (第{chapter_num}章兑现)")
+def commit_approved_chapter(novel_name, chapter_num, content, result):
+    """在同一事务提交已审正文状态和这一版正文的伏笔结论。"""
+    if not result.get("pass") or result.get("review_error"):
+        raise ValueError("无法提交未通过审核的正文")
+    confirmed = (
+        (result.get("foreshadow_score") or {}).get("confirmed", [])
+        if result.get("foreshadow_reviewed_content") == content else []
+    )
+    with with_db_connection(novel_name) as conn, DatabaseTransaction(conn):
+        updated = conn.execute(
+            "UPDATE chapters SET status='已审核', updated_at=datetime('now','localtime') "
+            "WHERE chapter_num=? AND content=?",
+            (chapter_num, content),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("章节正文已变化，请重新审核")
+        for item in confirmed:
+            fid = item["fid"]
+            if item["source"] == "动态":
+                conn.execute(
+                    "UPDATE foreshadowing SET status='redeemed', redeemed_chapter=? "
+                    "WHERE fid=? AND status='active' AND plant_chapter < ?",
+                    (chapter_num, fid, chapter_num),
+                )
+            elif item["action"] == "plant":
+                conn.execute(
+                    "UPDATE outline_foreshadowing SET status='planted' "
+                    "WHERE novel_name=? AND fid=? AND plant_chapter=? AND status='planned'",
+                    (novel_name, fid, chapter_num),
+                )
             else:
-                print(f"  [大纲伏笔] {t['fid']} 待兑现，关键词匹配不足({matched}/{len(keywords)})")
-    except Exception:
-        pass
+                conn.execute(
+                    "UPDATE outline_foreshadowing SET status='resolved' "
+                    "WHERE novel_name=? AND fid=? AND resolve_chapter=? AND status='planted'",
+                    (novel_name, fid, chapter_num),
+                )
 
 
-def _auto_redeem_foreshadowing(mm: MemoryManager, chapter_num: int, content: str):
-    """章节审核通过后，检查逾期伏笔（priority=0），若正文包含相关关键词则自动兑现。"""
-    if not content:
-        return
-
-    active = mm.load_active_foreshadowing()
-    if not active:
-        return
-
-    content_lower = content.lower()
-    _split_re = re.compile(r'[，。、；：！？\s,.;:!?\\/\-—()\[\]【】“”‘’]+')
-    redeemed_any = False
-    overdue_count = 0
-
-    for f in active:
-        desc = (f.get("description") or "").strip()
-        fid = f.get("fid", "")
-        if not desc or not fid:
-            continue
-
-        # 直接计算是否逾期/应兑现（不依赖 hints 字符串匹配）
-        expected = (f.get("expected_redeem") or "待定").strip()
-        is_overdue = False
-        if expected and expected != "待定":
-            range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected)
-            if range_match:
-                s, e = int(range_match.group(1)), int(range_match.group(2))
-                if chapter_num > e or s <= chapter_num <= e:
-                    is_overdue = True
-            else:
-                single = re.search(r'第?(\d+)', expected)
-                if single:
-                    t = int(single.group(1))
-                    if chapter_num > t or abs(t - chapter_num) <= 3:
-                        is_overdue = True
-        if not is_overdue:
-            continue
-        overdue_count += 1
-
-        # 从伏笔描述中提取关键词
-        raw_words = [w for w in _split_re.split(desc) if len(w) >= 2]
-        keywords = raw_words
-        if not keywords:
-            continue
-
-        matched = sum(1 for kw in keywords if kw in content_lower)
-        match_ratio = matched / len(keywords) if keywords else 0
-        if matched >= min(3, len(keywords)) and match_ratio >= 0.5:
-            try:
-                mm.redeem_foreshadowing(fid, chapter_num)
-                print(f"  [伏笔兑现] {fid}: {desc[:30]}... → 第{chapter_num}章自动兑现")
-                redeemed_any = True
-            except Exception as e:
-                print(f"  [警告] 伏笔 {fid} 自动兑现失败：{e}")
-
-            # 同步检查大纲伏笔表中描述相似的条目
-            try:
-                from core.outline_manager import list_outline_foreshadow, mark_outline_foreshadow_status
-                outline_items = list_outline_foreshadow(mm.novel_name)
-                desc_lower = desc.lower()
-                for item in outline_items:
-                    if item.get("status") == "resolved":
-                        continue
-                    item_desc = (item.get("description") or "").lower()
-                    item_words = [w for w in _split_re.split(item_desc) if len(w) >= 2]
-                    if not item_words:
-                        continue
-                    overlap = sum(1 for w in item_words if w in desc_lower or desc_lower in w)
-                    if overlap >= max(2, len(item_words) * 0.5):
-                        mark_outline_foreshadow_status(mm.novel_name, item["fid"], "resolved")
-                        print(f"  [大纲伏笔同步] {item['fid']} → resolved")
-            except Exception:
-                pass
-
-    if not redeemed_any and overdue_count > 0:
-        print(f"  [伏笔提示] 有 {overdue_count} 个逾期伏笔未在本章兑现，请关注后续章节")
+def force_on_review_exhausted():
+    return cfg("novel", "on_review_exhausted", "stop") == "force_and_flag"
 
 
 def write_and_review(novel_name: str, chapter_num: int,
@@ -1023,7 +990,7 @@ def write_and_review(novel_name: str, chapter_num: int,
     - 每章最多允许一次任务卡重写，防止无限循环
     """
     from core.writer import write_chapter, revise_chapter
-    from core.api_client import get_failure_stats, check_switch_needed, get_switch_history
+    from core.api_client import get_failure_stats, check_switch_needed
 
     if max_retry is None:
         max_retry = cfg("novel", "max_retry", 3)
@@ -1032,7 +999,14 @@ def write_and_review(novel_name: str, chapter_num: int,
     content = None
 
     MAX_REVIEW_RETRIES = 3
-    review_retry_count = 0
+    def failed(session_id, reason, score=None, *, allow_override=False):
+        if allow_override and force_on_review_exhausted():
+            print(f"  [强制通过] 第{chapter_num}章内容审核未通过，按配置继续")
+            _finish_writing_session(novel_name, session_id, "强制通过", content, score)
+            return _force_approve_chapter(novel_name, chapter_num, content, mm)
+        _update_status_safe(novel_name, chapter_num, "审稿失败")
+        _finish_writing_session(novel_name, session_id, reason, content, score)
+        return ""
 
     try:
         _update_status_safe(novel_name, chapter_num, "writing")
@@ -1047,9 +1021,8 @@ def write_and_review(novel_name: str, chapter_num: int,
     _task_rewrite_done = False        # 每章最多重写一次任务卡
     _rewrite_requested = False        # 内层 for 循环通知外层需要重试
     _retry_feedback = ""              # 重试反馈，独立于 plot_goal
-    _original_content = None          # 首次写入的原文（供局部修改使用）
+    _original_content = None          # 最近一版正文，供局部修改使用
     _revise_mode = False              # 是否进入局部修改模式
-    _rewrite_count = 0                # 已执行完全重写的次数
     # ─────────────────────────────────────────────────────────────
 
     # 外层 while：正常流程只走一次；任务卡重写后最多再走一次
@@ -1079,8 +1052,6 @@ def write_and_review(novel_name: str, chapter_num: int,
                     content = write_chapter(novel_name, chapter_num,
                                             plot_goal, emotion_tag,
                                             retry_feedback=_retry_feedback)
-                    if _original_content is None:
-                        _original_content = content
                 _attempt_content = content or ""
                 reset_failure_counter("author")
             except Exception as e:
@@ -1094,7 +1065,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                     print(f"\n{'='*60}")
                     print(f"  [提示] 作者模型连续失败，建议切换模型")
                     print(f"{'='*60}")
-                    from core.api_client import select_all_models_interactive, _select_single_model
+                    from core.api_client import _select_single_model
                     print("\n是否切换作者模型？(y/n，默认y)")
                     choice = input(options=_SWITCH_CHOICES).strip().lower() or "y"
                     if choice == "y":
@@ -1105,48 +1076,16 @@ def write_and_review(novel_name: str, chapter_num: int,
                         reset_failure_counter("author")
                 continue
 
-            result = review_chapter(novel_name, chapter_num,
-                                    content, plot_goal)
-
-            # 记录评分用于平台期检测
-            _scores_history.append(result.get("score_total", 0))
-
+            _original_content = content
+            result = review_chapter(novel_name, chapter_num, content, plot_goal)
+            for _ in range(MAX_REVIEW_RETRIES - 1):
+                if not result.get("review_error"):
+                    break
+                print("  [重试] 责任编辑返回异常，将重审同一稿件")
+                result = review_chapter(novel_name, chapter_num, content, plot_goal)
             if result.get("review_error"):
-                review_retry_count += 1
-                issue_msg = result.get('issue') or result.get('retry_hint', '未知错误')
-                if review_retry_count < MAX_REVIEW_RETRIES:
-                    print(f"\n  [重试审稿] 责任编辑返回异常（{issue_msg}），第{review_retry_count}/{MAX_REVIEW_RETRIES}次重试...")
-                    increment_failure_counter("reviewer")
-                    _finish_writing_session(
-                        novel_name, _session_id, "责任编辑异常重试",
-                        content, result.get("score_total"),
-                    )
-                    if check_switch_needed("reviewer"):
-                        print(f"\n{'='*60}")
-                        print(f"  [提示] 审稿模型连续异常，建议切换模型")
-                        print(f"{'='*60}")
-                        from core.api_client import select_all_models_interactive, _select_single_model
-                        print("\n是否切换审稿模型？(y/n，默认y)")
-                        choice = input(options=_SWITCH_CHOICES).strip().lower() or "y"
-                        if choice == "y":
-                            print("\n【选择新的审稿模型】")
-                            reviewer_choice = _select_single_model("审稿模型", default="1")
-                            from core.api_client import set_reviewer_model
-                            set_reviewer_model(reviewer_choice["model"], reviewer_choice["provider"])
-                            reset_failure_counter("reviewer")
-                    continue
-                else:
-                    print(f"\n  [错误] 审稿连续{MAX_REVIEW_RETRIES}次异常，已标记为审稿失败")
-                    try:
-                        _update_status_safe(novel_name, chapter_num, "审稿失败")
-                    except Exception as e:
-                        print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
-                        mm.update_chapter_status(chapter_num, "审稿失败")
-                    _finish_writing_session(
-                        novel_name, _session_id, "审稿失败",
-                        content, result.get("score_total"),
-                    )
-                    return ""
+                return failed(_session_id, "责任编辑服务异常")
+            _scores_history.append(result.get("score_total", 0))
 
             if not result.get("pass"):
                 print(f"\n  [重写] 责任编辑不通过（{result.get('score_total', 0)}/100），跳过读者视角评估")
@@ -1184,7 +1123,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                 # ─────────────────────────────────────────────────────
 
                 # ── 冲突菜单 ──────────────────────────────────────────
-                if _conflict_detected:
+                if _conflict_detected and not force_on_review_exhausted():
                     _veto_desc = "、".join(repeated_vetos)
                     print(f"\n{'='*60}")
                     print(f"  [冲突检测] 连续{attempt+1}次因相同原因失败：{_veto_desc}")
@@ -1238,7 +1177,8 @@ def write_and_review(novel_name: str, chapter_num: int,
                         manual_goal = input("  > ", multiline=True).strip()
                         if manual_goal and len(manual_goal) >= 10:
                             plot_goal   = manual_goal
-                            _original_plot_goal   = plot_goal
+                            previous_goal = _original_plot_goal
+                            _original_plot_goal = plot_goal
                             _veto_code_counter.clear()
                             _failure_layers.clear()
                             _retry_feedback = ""
@@ -1255,7 +1195,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                                         "FROM chapter_tasks WHERE chapter_num=?",
                                         (chapter_num,)
                                     ).fetchone()
-                                    _orig = (_row["original_plot_goal"] or _original_plot_goal) if _row else _original_plot_goal
+                                    _orig = (_row["original_plot_goal"] or previous_goal) if _row else previous_goal
                                     _rc   = ((_row["rewrite_count"] or 0) + 1) if _row else 1
                                     _conn.execute(
                                         "UPDATE chapter_tasks SET plot_goal=?, "
@@ -1299,13 +1239,8 @@ def write_and_review(novel_name: str, chapter_num: int,
                     recent = _scores_history[-_plateau_window:]
                     if max(recent) - min(recent) < _plateau_threshold:
                         print(f"\n  [平台期] 最近{_plateau_window}轮评分 {recent}，波动<{_plateau_threshold}→停止重试")
-                        _finish_writing_session(
-                            novel_name, _session_id, "强制通过（平台期）",
-                            content, result.get("score_total"),
-                        )
-                        return _force_approve_chapter(
-                            novel_name, chapter_num, content, mm
-                        )
+                        return failed(_session_id, "责任编辑评分进入平台期",
+                                      result.get("score_total"), allow_override=True)
                 # ─────────────────────────────────────────────────────
 
                 if attempt < max_retry - 1:
@@ -1317,7 +1252,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                         # 第1次失败：自动进入局部修改模式
                         _revise_mode = True
                         print(f"  [修改] 基于原文进行局部修改...")
-                    else:
+                    elif not force_on_review_exhausted():
                         # 已在修改模式，给用户选择
                         print(f"\n{'='*60}")
                         print(f"  局部修改仍未通过（{result.get('score_total', 0)}/100）")
@@ -1332,10 +1267,9 @@ def write_and_review(novel_name: str, chapter_num: int,
                             _retry_feedback = ""
                             plot_goal = _original_plot_goal
                             emotion_tag = _original_emotion_tag
-                            _rewrite_count += 1
                             print(f"  [重写] 使用原始任务卡完全重写...")
                         elif retry_choice == "3":
-                            from core.api_client import select_all_models_interactive, _select_single_model
+                            from core.api_client import _select_single_model
                             print("\n【选择新的作者模型】")
                             model_choice = _select_single_model("综合模型", default="1")
                             from core.api_client import set_author_model, set_reviewer_model
@@ -1355,96 +1289,34 @@ def write_and_review(novel_name: str, chapter_num: int,
                     )
                     continue
                 else:
-                    if result.get("review_error"):
-                        print(f"  [错误] 审稿连续{max_retry}次异常，停止")
-                        try:
-                            _update_status_safe(novel_name, chapter_num, "审稿失败")
-                        except Exception as e:
-                            print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
-                            mm.update_chapter_status(chapter_num, "审稿失败")
-                        _finish_writing_session(
-                            novel_name, _session_id, "审稿失败",
-                            content, result.get("score_total"),
-                        )
-                        return ""
-
-                    print(f"\n{'='*60}")
-                    print(f"  [提示] 连续{max_retry}次未通过！")
-                    print(f"  建议切换到更强的模型后重新生成此章节")
-                    print(f"{'='*60}")
-
-                    from core.api_client import select_all_models_interactive, _select_single_model
-                    print("\n是否切换模型？(y/n，默认y)")
-                    choice = input(options=_SWITCH_CHOICES).strip().lower() or "y"
-                    if choice == "y":
-                        print("\n【选择新的写作/审稿模型】")
-                        model_choice = _select_single_model("综合模型", default="1")
-                        from core.api_client import set_author_model, set_reviewer_model
-                        set_author_model(model_choice["model"], model_choice["provider"])
-                        set_reviewer_model(model_choice["model"], model_choice["provider"])
-                        reset_failure_counter("author")
-                        reset_failure_counter("reviewer")
-                        print(f"\n  [OK] 已切换至 {model_choice['name']}")
-                        print(f"  请在章节菜单选择「恢复审稿失败章节」重新生成第{chapter_num}章")
-
-                    print(f"  [警告] 保留最后版本（强制通过）")
-                    _finish_writing_session(
-                        novel_name, _session_id, "强制通过（达到最大重试）",
-                        content, result.get("score_total"),
-                    )
-                    return _force_approve_chapter(
-                        novel_name, chapter_num, content, mm
-                    )
+                    return failed(_session_id, "责任编辑未通过",
+                                  result.get("score_total"), allow_override=True)
 
             # ── 责任编辑通过，进入读者视角 ───────────────────────────
             # 交互式应用精简建议（优化E）
             cut = result.get("cut_suggestions", [])
-            if cut:
+            if cut and not force_on_review_exhausted():
+                before_cut = content
                 content = _apply_cut_suggestions_interactive(
                     novel_name, chapter_num, content, cut,
                     plot_goal, emotion_tag,
                 )
                 _original_content = content
+                if content != before_cut:
+                    result = review_chapter(novel_name, chapter_num, content, plot_goal)
+                    if not result.get("pass"):
+                        return failed(_session_id, "裁切后责任编辑未通过",
+                                      result.get("score_total"), allow_override=not result.get("review_error"))
 
             reader_result = reader_review_chapter(novel_name, chapter_num, content)
 
             if reader_result.get("review_error"):
-                print(f"\n  [警告] 读者视角评估异常，跳过二审，编辑审核通过即放行")
-                # 降级放行：跳过读者审稿，按责任编辑通过处理
-                print(f"\n  [OK] 第{chapter_num}章审核通过（读者二审因异常跳过）")
-                review_retry_count = 0
-                try:
-                    _update_status_safe(novel_name, chapter_num, "已审核")
-                except Exception as e:
-                    print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
-                    mm.update_chapter_status(chapter_num, "已审核")
-
-                # ── 自动兑现逾期伏笔 ────────────────────────────────
-                _auto_redeem_foreshadowing(mm, chapter_num, content)
-
-                # ── 同步大纲伏笔状态 ────────────────────────────
-                _sync_outline_foreshadow(novel_name, chapter_num, content)
-
-                _finish_writing_session(
-                    novel_name, _session_id, "审核通过（读者二审跳过）",
-                    content, result.get("score_total"),
-                )
-                return content
+                return failed(_session_id, "读者审稿服务异常")
 
             if reader_result.get("pass"):
-                print(f"\n  [OK] 第{chapter_num}章双重审核通过！")
-                review_retry_count = 0
-                try:
-                    _update_status_safe(novel_name, chapter_num, "已审核")
-                except Exception as e:
-                    print(f"  [警告] 状态更新失败：{e}，尝试直接写入...")
-                    mm.update_chapter_status(chapter_num, "已审核")
-
-                # ── 自动兑现逾期伏笔 ────────────────────────────────
-                _auto_redeem_foreshadowing(mm, chapter_num, content)
-
-                # ── 同步大纲伏笔状态 ────────────────────────────
-                _sync_outline_foreshadow(novel_name, chapter_num, content)
+                verdict = "责任编辑通过，读者审稿已按配置跳过" if reader_result.get("skipped") else "双重审核通过"
+                print(f"\n  [OK] 第{chapter_num}章{verdict}！")
+                commit_approved_chapter(novel_name, chapter_num, content, result)
 
                 _finish_writing_session(
                     novel_name, _session_id, "审核通过",
@@ -1471,7 +1343,7 @@ def write_and_review(novel_name: str, chapter_num: int,
                     if not _revise_mode:
                         _revise_mode = True
                         print(f"  [修改] 基于原文进行局部修改...")
-                    else:
+                    elif not force_on_review_exhausted():
                         print(f"\n{'='*60}")
                         print(f"  局部修改仍未通过（读者视角）")
                         print(f"{'='*60}")
@@ -1485,10 +1357,9 @@ def write_and_review(novel_name: str, chapter_num: int,
                             _retry_feedback = ""
                             plot_goal = _original_plot_goal
                             emotion_tag = _original_emotion_tag
-                            _rewrite_count += 1
                             print(f"  [重写] 使用原始任务卡完全重写...")
                         elif retry_choice == "3":
-                            from core.api_client import select_all_models_interactive, _select_single_model
+                            from core.api_client import _select_single_model
                             print("\n【选择新的作者模型】")
                             model_choice = _select_single_model("综合模型", default="1")
                             from core.api_client import set_author_model, set_reviewer_model
@@ -1505,33 +1376,8 @@ def write_and_review(novel_name: str, chapter_num: int,
                         content, reader_result.get("score_total"),
                     )
                 else:
-                    print(f"\n{'='*60}")
-                    print(f"  [提示] 连续{max_retry}次未通过！")
-                    print(f"  建议切换到更强的模型后重新生成此章节")
-                    print(f"{'='*60}")
-
-                    from core.api_client import select_all_models_interactive, _select_single_model
-                    print("\n是否切换模型？(y/n，默认y)")
-                    choice = input(options=_SWITCH_CHOICES).strip().lower() or "y"
-                    if choice == "y":
-                        print("\n【选择新的写作/审稿模型】")
-                        model_choice = _select_single_model("综合模型", default="1")
-                        from core.api_client import set_author_model, set_reviewer_model
-                        set_author_model(model_choice["model"], model_choice["provider"])
-                        set_reviewer_model(model_choice["model"], model_choice["provider"])
-                        reset_failure_counter("author")
-                        reset_failure_counter("reviewer")
-                        print(f"\n  [OK] 已切换至 {model_choice['name']}")
-                        print(f"  请在章节菜单选择「恢复审稿失败章节」重新生成第{chapter_num}章")
-
-                    print(f"  [警告] 保留最后版本（强制通过）")
-                    _finish_writing_session(
-                        novel_name, _session_id, "强制通过（读者视角未通过）",
-                        content, reader_result.get("score_total"),
-                    )
-                    return _force_approve_chapter(
-                        novel_name, chapter_num, content, mm
-                    )
+                    return failed(_session_id, "读者审稿未通过",
+                                  reader_result.get("score_total"), allow_override=True)
 
         # for 循环结束后：若收到重写请求且未超次，继续 while
         if _rewrite_requested:

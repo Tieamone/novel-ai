@@ -27,11 +27,10 @@ temperature:
   writing_second_half: 0.70  # 小模型后半段（略低，保持与前半段连贯）
   writing_supplement: 0.75   # 字数补写
 
-  # 修订类（自检修订、续写衔接）
-  revision: 0.70          # 自检修订（有问题时的润色）
+  # 修订类
+  revision: 0.70          # 正文修改和去 AI 化打磨
 
-  # 质检类（自检判断、JSON 结构化输出）
-  self_check: 0.20        # 自检质检（越低越稳定）
+  # 节拍规划
   beat_planner: 0.65      # 节拍规划
 
   # 策划类（大纲、世界观、角色生成）
@@ -46,8 +45,10 @@ novel:
   chapter_word_target: 3500
   chapter_word_min: 3000
   chapter_word_max: 4000
+  # 审稿内容不达标时的策略。force_and_flag 会将强制通过正文用于后续记忆。
+  on_review_exhausted: stop
   max_retry: 3
-  recent_summary_count: 5
+  recent_summary_count: 5  # 每次阶段压缩后保留的逐章摘要数
   compress_after_chapters: 20
   pre_split_chapters: 50
   failure_switch_threshold: 3
@@ -55,15 +56,10 @@ novel:
   # 任务卡质量审核
   task_card_review_enabled: true     # 是否启用任务卡审核
   task_card_review_pass_score: 28    # 审核通过线（满分40）
-  max_foreshadow_per_chapter: 2      # 每章伏笔埋入/兑现上限
-  foreshadow_injection_style: "guided"  # 伏笔注入语气: guided(引导式) / forced(强制式)
+  max_foreshadow_per_chapter: 2      # 策划任务卡的伏笔埋入/兑现上限
+  foreshadow_injection_style: "guided"  # 策划任务卡的伏笔注入语气: guided(引导式) / forced(强制式)
   plateau_threshold: 5       # 平台期检测：评分波动低于此值视为平台期
   plateau_window: 3          # 平台期检测：最近N轮评分
-  # 任务卡分批配置
-  batch_size_small: 10      # 小批次每批章数
-  batch_size_medium: 30     # 中批次每批章数
-  batch_size_large: 50      # 大批次每批章数
-  batch_bridge_count: 5     # 跨批次上下文桥接引入的任务卡数量
 
 paths:
   data_dir: data

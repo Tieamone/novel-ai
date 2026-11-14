@@ -5,7 +5,7 @@ const sections = [
   ['chapters', '章节与审稿', '▤'], ['tasks', '章节任务卡', '▦'], ['foreshadow', '伏笔管理', '◇'],
   ['writing', '创作资料', '✎'], ['checkpoints', '断点管理', '◷'], ['models', '模型与费用', '⚙'],
 ]
-const labels = { planned: '待埋入', planted: '已埋入', resolved: '已兑现', writing: '写作中', pending_review: '待重审', pending: '待处理', draft: '草稿' }
+const labels = { planned: '待埋入', planted: '已埋入', resolved: '已兑现', writing: '写作中', pending_review: '待重审', pending: '待处理', draft: '草稿', approved: '已审核', completed: '已完成', in_progress: '进行中' }
 const stateLabels = { running: '执行中', waiting: '等待确认', stopping: '正在停止', completed: '已结束', cancelled: '已停止', failed: '未完成' }
 const token = ref('')
 const novels = ref([])
@@ -49,7 +49,7 @@ const checkpointActions = [
   ['clear_beats', '清除节拍缓存', '清除该章节的已存节拍，下次写作会重新规划。'],
 ]
 const healthGroups = [['due_soon', '即将到期'], ['overdue', '严重超期'], ['macro', '宏观悬念']]
-const approval = ['已审核', '强制通过']
+const approval = ['已审核', '强制通过', 'approved']
 let timer
 let bookRequest = 0
 let chapterRequest = 0
@@ -582,6 +582,10 @@ onBeforeUnmount(() => window.clearTimeout(timer))
               <p v-if="!book.foreshadow.length" class="empty">暂无大纲伏笔。</p>
             </div>
             <div class="panel padded stack"><h2>伏笔健康度</h2>
+              <div class="actions">
+                <button :disabled="activeJob" @click="start('book_health')">只读体检</button>
+                <button :disabled="activeJob" @click="start('archive_legacy')">整理旧伏笔</button>
+              </div>
               <template v-if="book.health">
                 <p class="muted">未兑现 {{ book.health.total_active }} · 近期新增 {{ book.health.recent_added }} · 近期兑现 {{ book.health.recent_redeemed }} · 每章净增 {{ book.health.trend }}</p>
                 <div class="field-grid"><div v-for="[key, title] in healthGroups" :key="key">

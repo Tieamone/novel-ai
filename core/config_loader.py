@@ -106,6 +106,7 @@ def _get_defaults() -> dict:
             "chapter_word_target": 3000,
             "chapter_word_min": 2500,
             "chapter_word_max": 3500,
+            "on_review_exhausted": "stop",
             "max_retry": 3,
             "recent_summary_count": 5,
             "compress_after_chapters": 20,

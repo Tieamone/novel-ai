@@ -2,6 +2,7 @@ import json
 import re
 from core.interaction import say as print
 from core.api_client import call_reader_reviewer_api, increment_failure_counter, reset_failure_counter
+from core.exporter import EXPORTABLE_STATUSES
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg
 from core.utils import with_db_connection, DatabaseTransaction, \
@@ -119,32 +120,17 @@ def _normalize_review_result(raw_result: dict) -> dict:
     # style 字段（旧版兼容，不计入新总分）
     score_style = to_int(raw_result.get("score_style"), 0, 0, 25)
 
-    total_raw = raw_result.get("score_total")
-    if total_raw is None:
-        # 新版：四维求和（用字段存在性判断，避免 score_ai=0 时误判为旧版）
-        if "score_ai_authenticity" in raw_result:
-            score_total = score_ai + score_logic + score_consistency + score_readability
-        else:
-            # 旧版兼容
-            score_total = score_logic + score_consistency + score_style + score_readability
-    else:
-        score_total = to_int(total_raw, 0, 0, 100)
-
-    # 子项合计校验（偏差超过10分时以子项合计为准）
-    if "score_ai_authenticity" in raw_result:
-        expected = score_ai + score_logic + score_consistency + score_readability
-    else:
-        expected = score_logic + score_consistency + score_style + score_readability
-    if expected and abs(score_total - expected) > 10:
-        score_total = expected
-
-    # Bug修复12: 分数范围强制夹值
-    score_total = max(0, min(100, score_total))
-
+    fields = [raw_result.get("score_logic"), raw_result.get("score_consistency"),
+              raw_result.get("score_readability", raw_result.get("score_experience")),
+              raw_result.get("score_ai_authenticity", raw_result.get("score_style"))]
+    valid_scores = all(type(score) is int and 0 <= score <= 25 for score in fields)
+    score_total = sum(fields) if valid_scores else 0
+    valid = (valid_scores and type(raw_result.get("pass")) is bool
+             and type(raw_result.get("veto_triggered", False)) is bool
+             and raw_result.get("score_total", score_total) == score_total)
     pass_threshold = cfg("model", "reader_reviewer", "pass_threshold", 75)
-    model_pass = bool(raw_result.get("pass"))
-    veto_triggered = bool(raw_result.get("veto_triggered"))
-    final_pass = (not veto_triggered) and model_pass and (score_total >= pass_threshold)
+    veto_triggered = raw_result.get("veto_triggered") is True
+    final_pass = valid and not veto_triggered and raw_result["pass"] and score_total >= pass_threshold
 
     issues = raw_result.get("issues", [])
     if isinstance(issues, str):
@@ -161,6 +147,7 @@ def _normalize_review_result(raw_result: dict) -> dict:
 
     return {
         "pass": final_pass,
+        "review_error": not valid,
         "score_total": score_total,
         "score_ai_authenticity": score_ai,
         "score_logic": score_logic,
@@ -204,7 +191,7 @@ def reader_review_chapter(novel_name: str, chapter_num: int,
     prev_chapter_content = ""
     if chapter_num > 1:
         prev_chapter = mm.load_chapter(chapter_num - 1)
-        if prev_chapter and prev_chapter.get("content"):
+        if prev_chapter.get("status") in EXPORTABLE_STATUSES and prev_chapter.get("content"):
             prev_chapter_content = prev_chapter["content"]
 
     print(f"  [读者视角] 正在评估第{chapter_num}章...")

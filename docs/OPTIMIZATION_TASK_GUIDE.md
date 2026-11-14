@@ -27,7 +27,7 @@
 
 **问题**：当前 `write_and_review` 固定 3 轮重试，可能"越改越差还不自知"，浪费 token。
 
-**方案**：在重试循环中记录最近 N 轮评分，波动 < 阈值时提前终止→强制通过。
+**方案**：在重试循环中记录最近 N 轮评分，波动 < 阈值时停止重试，默认进入审稿失败。`force_and_flag` 只允许审核服务正常返回的内容不达标结果继续。默认重试和窗口都是 3，平台期检测不会提前节省轮次。
 
 **改动文件**：`core/reviewer.py` 的 `write_and_review` 函数
 
@@ -42,7 +42,7 @@
    if len(scores_history) >= 3:
        recent = scores_history[-3:]
        if max(recent) - min(recent) < PLATEAU_THRESHOLD:
-           print("[平台期] 停止重试→强制通过")
+           print("[平台期] 停止重试，等待作者决定")
            break
 4. config.yaml 中加 novel.plateau_threshold: 5 和 novel.plateau_window: 3
 ```
@@ -218,7 +218,7 @@
    if result.get("cut_suggestions"):
        print(f"[精简建议] 发现 {len(cut_suggestions)} 处可裁切段落，是否查看？(y/n)")
        if input == "y":
-           逐条展示，用户选择应用哪些；仅删除唯一匹配的完整段落
+           逐条展示，用户选择应用哪些；仅删除唯一匹配的完整段落，随后对同一版正文执行双审
 ```
 
 **验证方式**：写一章含冗余段落的文本，审稿后确认 `cut_suggestions` 被正确输出。

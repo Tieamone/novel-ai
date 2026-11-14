@@ -8,7 +8,7 @@ import main as cli
 from core import api_client, outline_manager, writer
 from core.config_loader import get_data_dir, get_output_dir
 from core.db import ensure_database
-from core.exporter import export_all, export_chapter, get_safe_output_dir
+from core.exporter import EXPORTABLE_STATUSES, export_all, export_chapter, get_safe_output_dir
 from core.interaction import ask, check_cancelled, say
 from core.style_analyzer import analyze_style, save_fingerprint
 from core.utils import with_db_connection
@@ -27,7 +27,8 @@ TITLES = {
     "fingerprint": "生成文法指纹", "intent": "保存创作资料", "models": "验证角色模型",
     "foreshadow": "保存大纲伏笔", "delete_foreshadow": "删除大纲伏笔",
     "suggest": "生成伏笔建议", "reset": "重置任务", "rewrite": "重置正文",
-    "clear_beats": "清除节拍缓存",
+    "clear_beats": "清除节拍缓存", "book_health": "旧书体检",
+    "archive_legacy": "旧伏笔归档",
 }
 
 
@@ -197,19 +198,26 @@ def requires_migration(novel):
 def generate(novel, count):
     protect_exports(novel)
     chapters = []
+    forced = []
     for index in range(count):
         check_cancelled()
         say(f"批次进度 {index + 1}/{count}")
         chapter = cli.generate_chapter_auto(novel)
         if chapter is None:
             break
-        if cli._get_chapter_status(novel, chapter) not in (
-            cli.CHAPTER_STATUS_APPROVED, cli.CHAPTER_STATUS_FORCE_APPROVED
-        ):
-            return {"chapter": chapter, "message": f"第{chapter}章待处理，请查看任务记录"}
+        status = cli._get_chapter_status(novel, chapter)
+        if status not in EXPORTABLE_STATUSES:
+            say(f"第{chapter}章待处理，请查看任务记录")
+            break
         chapters.append(chapter)
-    return {"chapter": chapters[-1] if chapters else None,
-            "message": f"已生成 {len(chapters)} 章" if chapters else "没有生成新章节，请查看任务记录"}
+        if status == cli.CHAPTER_STATUS_FORCE_APPROVED:
+            forced.append(chapter)
+    message = f"已生成 {len(chapters)} 章" if chapters else "没有生成新章节，请查看任务记录"
+    if forced:
+        message += f"。强制通过章节：{', '.join(map(str, forced))}"
+    if chapters:
+        message += "。可在创作意图中更新当前焦点。"
+    return {"chapter": chapters[-1] if chapters else None, "message": message, "forced": forced}
 
 
 def delete_chapters(novel, data):
@@ -261,7 +269,8 @@ def run(kind, novel, data):
     if kind == "create":
         book_directory(novel)
         name = cli.create_novel(novel, string(data, "genre", 100), string(data, "keywords", 3000))
-        return {"novel": name, "message": "小说策划已完成"}
+        remaining = cli.planning_shortfall(name)
+        return {"novel": name, "message": f"策划尚缺 {remaining} 张任务卡" if remaining else "小说策划已完成"}
     if kind == "import":
         content = string(data, "content")
         if not content:
@@ -273,9 +282,14 @@ def run(kind, novel, data):
         if parsed is None:
             return {"message": "未导入小说，请查看任务记录"}
         book_directory(parsed["novel_name"])
-        return {"novel": cli.create_novel(import_data=parsed), "message": "小说已导入"}
+        name = cli.create_novel(import_data=parsed)
+        remaining = cli.planning_shortfall(name)
+        return {"novel": name, "message": f"资料已导入，尚缺 {remaining} 张任务卡" if remaining else "小说已导入"}
 
     existing_book(novel)
+    if kind in ("book_health", "archive_legacy"):
+        from core.book_health import show_book_health
+        return {"message": show_book_health(novel, interactive=kind == "archive_legacy")}
     if kind != "delete_book" and requires_migration(novel):
         approved = ask("这本小说使用旧版数据库。继续操作会运行项目现有的兼容迁移。",
                        options=(("yes", "迁移并继续"), ("no", "取消操作")))

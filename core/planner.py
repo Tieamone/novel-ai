@@ -895,9 +895,6 @@ def split_outline_to_tasks(outline: str, novel_name: str,
                      换模型或降级为分批。
     full_batch=False: 分批生成，每批大小由模型能力动态决定。
     """
-    from core.utils import with_db_connection
-    import math
-
     if target_chapters > 0:
         if full_batch:
             first_batch = target_chapters
@@ -959,7 +956,7 @@ def split_outline_to_tasks(outline: str, novel_name: str,
         )
         if saved < first_batch:
             saved = _supplement_tasks(
-                outline, novel_name, first_batch, full_target, saved
+                outline, novel_name, first_batch, full_target, saved, batch_start=start
             )
     else:
         # 分批生成：把章节分成多批，每批用独立 API 调用
@@ -1002,14 +999,63 @@ def split_outline_to_tasks(outline: str, novel_name: str,
     return saved
 
 
+def _valid_batch_tasks(tasks, chapter_numbers):
+    valid = {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        number = task.get("chapter_num")
+        goal = task.get("plot_goal")
+        tag = task.get("emotion_tag", "铺垫")
+        if type(number) is int and number in chapter_numbers and isinstance(goal, str) and goal.strip():
+            valid.setdefault(number, {
+                "chapter_num": number, "plot_goal": goal.strip(),
+                "emotion_tag": tag if tag in ("铺垫", "冲突", "爽点", "低谷", "反转") else "铺垫",
+            })
+    return [valid[number] for number in sorted(valid)]
+
+
+def _save_task_batch(novel_name, tasks, outline, numbers, review_mode=False):
+    from core.utils import with_db_connection, DatabaseTransaction
+    tasks = _valid_batch_tasks(tasks or [], numbers)
+    if not tasks:
+        return 0
+    if cfg("novel", "task_card_review_enabled", True):
+        from core.task_card_reviewer import review_task_cards, revise_task_cards
+        try:
+            result = review_task_cards(novel_name, tasks, outline, min(numbers))
+            if not result.get("pass"):
+                tasks = _valid_batch_tasks(revise_task_cards(novel_name, tasks, result, outline), numbers)
+                result = review_task_cards(novel_name, tasks, outline, min(numbers)) if tasks else {}
+        except Exception as exc:
+            print(f"  [任务卡] 审核异常，本批待重新生成：{exc}")
+            return 0
+        if not result.get("pass"):
+            print("  [任务卡] 修正后仍未达标")
+            if not review_mode or input(
+                "是否明确接受未通过的任务卡？",
+                options=(("n", "保留缺口"), ("y", "强制入库")),
+            ).strip().lower() != "y":
+                return 0
+    with with_db_connection(novel_name) as conn, DatabaseTransaction(conn):
+        conn.executemany("""
+            INSERT INTO chapter_tasks (chapter_num, plot_goal, emotion_tag, status)
+            VALUES (:chapter_num, :plot_goal, :emotion_tag, '待处理')
+            ON CONFLICT(chapter_num) DO UPDATE SET
+                plot_goal=excluded.plot_goal, emotion_tag=excluded.emotion_tag
+            WHERE LENGTH(TRIM(COALESCE(chapter_tasks.plot_goal, ''))) = 0
+              AND chapter_tasks.status IN ('待处理', 'pending')
+        """, tasks)
+        return sum(1 for row in conn.execute("SELECT chapter_num FROM chapter_tasks WHERE LENGTH(TRIM(plot_goal)) > 0")
+                   if row["chapter_num"] in numbers)
+
+
 def _generate_single_batch(outline: str, novel_name: str,
                            batch_count: int, full_target: int,
                            start: int = 1, max_tokens: int = 8000,
                            novel_name_for_fs: str = "",
                            review_mode: bool = False) -> int:
     """单次 API 调用生成一批任务卡，返回保存数量。"""
-    from core.utils import with_db_connection
-
     prev_ending = ""
     urgent_fs = []
     if start > 1:
@@ -1040,58 +1086,7 @@ def _generate_single_batch(outline: str, novel_name: str,
         print("  [警告] 解析失败（已重试），跳过本批")
         return 0
 
-    # ── 任务卡质量审核 ──────────────────────────────────────
-    if cfg("novel", "task_card_review_enabled", True):
-        try:
-            from core.task_card_reviewer import review_task_cards, revise_task_cards
-            print(f"  [任务卡审核] 第{start}章-第{start + len(tasks) - 1}章 审核中...")
-            review_result = review_task_cards(novel_name, tasks, outline, start)
-
-            if review_result.get("pass"):
-                pass  # 审核通过，继续入库
-            else:
-                # 审核不通过，自动修正一次
-                print(f"  [修正] 审核未通过({review_result.get('score_total', 0)}/40)，自动修正中...")
-                tasks = revise_task_cards(novel_name, tasks, review_result, outline)
-                # 重新审核
-                review_result2 = review_task_cards(novel_name, tasks, outline, start)
-                if not review_result2.get("pass"):
-                    if review_mode:
-                        # 交互模式：让用户选择
-                        print(f"  [警告] 修正后审核仍未通过({review_result2.get('score_total', 0)}/40)")
-                        print("  1. 接受当前任务卡（强制入库）")
-                        print("  2. 丢弃本批任务卡")
-                        choice = input("  请选择（默认1）：", options=(
-                            ("1", "接受当前任务卡"), ("2", "丢弃本批任务卡"),
-                        )).strip() or "1"
-                        if choice == "2":
-                            return 0
-                    else:
-                        print(
-                            f"  [警告] 审核未通过({review_result2.get('score_total', 0)}/40)，"
-                            f"修正后仍未达标，继续入库"
-                        )
-        except Exception as e:
-            print(f"  [警告] 任务卡审核异常（非致命）：{e}，跳过审核直接入库")
-
-    valid_tags = ["铺垫", "冲突", "爽点", "低谷", "反转"]
-    with with_db_connection(novel_name) as conn:
-        saved = 0
-        for task in tasks:
-            chapter_num = task.get("chapter_num")
-            plot_goal = task.get("plot_goal", "").strip()
-            emotion_tag = task.get("emotion_tag", "铺垫").strip()
-            if emotion_tag not in valid_tags:
-                emotion_tag = "铺垫"
-            if chapter_num and plot_goal:
-                conn.execute("""
-                    INSERT OR REPLACE INTO chapter_tasks
-                    (chapter_num, plot_goal, emotion_tag, status)
-                    VALUES (?, ?, ?, '待处理')
-                """, (chapter_num, plot_goal, emotion_tag))
-                saved += 1
-        conn.commit()
-    return saved
+    return _save_task_batch(novel_name, tasks, outline, range(start, start + batch_count), review_mode)
 
 
 def _supplement_tasks(outline: str, novel_name: str,
@@ -1100,20 +1095,21 @@ def _supplement_tasks(outline: str, novel_name: str,
     """补充缺失的任务卡（AI 返回数量不足时）。返回本批已保存数量。"""
     from core.utils import with_db_connection
 
-    shortage = batch_count - already_saved
-    if shortage <= 0:
-        return already_saved
-
-    start_chapter = batch_start + already_saved
-    print(f"\n  [提示] 任务卡数量不足（{already_saved}/{batch_count}），正在补充{shortage}章...")
-
+    numbers = set(range(batch_start, batch_start + batch_count))
+    with with_db_connection(novel_name) as conn:
+        missing = numbers - {row["chapter_num"] for row in conn.execute("SELECT chapter_num FROM chapter_tasks WHERE LENGTH(TRIM(plot_goal)) > 0")}
+    if not missing:
+        return batch_count
+    shortage = len(missing)
+    start_chapter = min(missing)
+    print(f"  [任务卡] 补齐缺少的章号：{sorted(missing)}")
     _sup_max_tokens = max(8000, min(shortage * 200, 12000))
     supplement_raw = call_author_api(
         system_prompt="你是小说策划师，将大纲拆解为章节任务。只输出JSON，不要任何其他内容。",
         user_message=_build_task_split_prompt(
             shortage, full_target, outline, start=start_chapter,
             novel_name=novel_name,
-        ),
+        ) + f"\n仅生成以下章号的任务卡，每章一张：{sorted(missing)}",
         temperature=0.7,
         max_tokens=_sup_max_tokens,
     )
@@ -1127,49 +1123,16 @@ def _supplement_tasks(outline: str, novel_name: str,
         print(f"  [警告] AI 返回了空的补充任务卡列表，跳过")
         return already_saved
 
-    # ── 任务卡质量审核（补充路径，非交互式）──────────────
-    if cfg("novel", "task_card_review_enabled", True):
-        try:
-            from core.task_card_reviewer import review_task_cards, revise_task_cards
-            print(f"  [任务卡审核] 第{start_chapter}章-第{start_chapter + len(sup_tasks) - 1}章 审核中...")
-            review_result = review_task_cards(novel_name, sup_tasks, outline, start_chapter)
-            if not review_result.get("pass"):
-                print(f"  [修正] 审核未通过({review_result.get('score_total', 0)}/40)，自动修正中...")
-                sup_tasks = revise_task_cards(novel_name, sup_tasks, review_result, outline)
-                review_result2 = review_task_cards(novel_name, sup_tasks, outline, start_chapter)
-                if not review_result2.get("pass"):
-                    print(
-                        f"  [警告] 修正后仍不达标({review_result2.get('score_total', 0)}/40)，"
-                        f"继续入库"
-                    )
-        except Exception as e:
-            print(f"  [警告] 补充任务卡审核异常（非致命）：{e}，跳过审核直接入库")
-
-    valid_tags = ["铺垫", "冲突", "爽点", "低谷", "反转"]
+    _save_task_batch(novel_name, sup_tasks, outline, missing)
     with with_db_connection(novel_name) as conn:
-        for task in sup_tasks:
-            chapter_num = task.get("chapter_num")
-            plot_goal = task.get("plot_goal", "").strip()
-            emotion_tag = task.get("emotion_tag", "铺垫").strip()
-            if emotion_tag not in valid_tags:
-                emotion_tag = "铺垫"
-            if chapter_num and plot_goal:
-                conn.execute("""
-                    INSERT OR REPLACE INTO chapter_tasks
-                    (chapter_num, plot_goal, emotion_tag, status)
-                    VALUES (?, ?, ?, '待处理')
-                """, (chapter_num, plot_goal, emotion_tag))
-                already_saved += 1
-        conn.commit()
-    print(f"  [OK] 本批补充完成！本批共 {already_saved} 个章节任务卡")
-    return already_saved
+        return sum(1 for row in conn.execute("SELECT chapter_num FROM chapter_tasks WHERE LENGTH(TRIM(plot_goal)) > 0")
+                   if row["chapter_num"] in numbers)
 
 
 def extend_tasks(novel_name: str, from_chapter: int):
     """运行时扩展任务卡。根据模型能力动态决定扩展多少章。
     每次写作前自动触发：当 get_next_chapter_goal() 发现任务卡用完时调用。
     """
-    from core.utils import with_db_connection
     from core.config_loader import get as cfg, get_data_dir
 
     data_dir = get_data_dir(novel_name)
@@ -1232,43 +1195,8 @@ def extend_tasks(novel_name: str, from_chapter: int):
         print(f"  [警告] 扩展任务卡解析失败（已重试），跳过扩展")
         return
 
-    # ── 任务卡质量审核（运行时自动模式，不中断写作）──────
-    if cfg("novel", "task_card_review_enabled", True):
-        try:
-            from core.task_card_reviewer import review_task_cards, revise_task_cards
-            batch_end = from_chapter + len(tasks) - 1 if tasks else end_chapter
-            print(f"  [任务卡审核] 第{from_chapter}章-第{batch_end}章 审核中...")
-            review_result = review_task_cards(novel_name, tasks, outline, from_chapter)
-
-            if not review_result.get("pass"):
-                print(f"  [修正] 审核未通过({review_result.get('score_total', 0)}/40)，自动修正中...")
-                tasks = revise_task_cards(novel_name, tasks, review_result, outline)
-                # 重新审核
-                review_result2 = review_task_cards(novel_name, tasks, outline, from_chapter)
-                if not review_result2.get("pass"):
-                    print(
-                        f"  [警告] 修正后仍不达标({review_result2.get('score_total', 0)}/40)，"
-                        f"继续入库（不中断写作流程）"
-                    )
-        except Exception as e:
-            print(f"  [警告] 任务卡审核异常（非致命）：{e}，跳过审核直接入库")
-
-    valid_tags = ["铺垫", "冲突", "爽点", "低谷", "反转"]
-    with with_db_connection(novel_name) as conn:
-        for task in tasks:
-            chapter_num = task.get("chapter_num")
-            plot_goal = task.get("plot_goal", "").strip()
-            emotion_tag = task.get("emotion_tag", "铺垫").strip()
-            if emotion_tag not in valid_tags:
-                emotion_tag = "铺垫"
-            if chapter_num and plot_goal:
-                conn.execute("""
-                    INSERT OR IGNORE INTO chapter_tasks
-                    (chapter_num, plot_goal, emotion_tag, status)
-                    VALUES (?, ?, ?, '待处理')
-                """, (chapter_num, plot_goal, emotion_tag))
-        conn.commit()
-    print(f"  [OK] 任务卡已扩展至第{end_chapter}章")
+    saved = _save_task_batch(novel_name, tasks, outline, range(from_chapter, end_chapter + 1))
+    print(f"  [任务卡] 第{from_chapter}–{end_chapter}章已就绪 {saved}/{batch_size} 张")
 
 
 # ==================== 任务卡重写（冲突修复） ====================
@@ -1310,13 +1238,13 @@ def rewrite_task_for_chapter(novel_name: str, chapter_num: int,
         pass
     char_summary = "\n".join(char_lines) if char_lines else "（无人物档案）"
 
-    # 近期摘要（最近 3 章）
+    # 当前章之前的阶段摘要和未压缩摘要
     recent_text = "（无摘要）"
     try:
-        recent = mm.load_recent_summaries(3)
+        recent = mm.load_recent_summaries(before_chapter=chapter_num)
         if recent:
             recent_text = "\n".join(
-                f"第{s['chapter_num']}章：{(s['summary'] or '')[:120]}"
+                f"第{s['chapter_num']}章：{(s['summary'] or '')}"
                 for s in recent
             )
     except Exception:
@@ -1489,7 +1417,7 @@ def run_planner(novel_name: str, genre: str, keywords: str) -> tuple:
     style_key = get_style_choice()
 
     # Step 6：任务卡（默认全量生成，模型不够时自动提示换模型或分批）
-    split_outline_to_tasks(
+    saved = split_outline_to_tasks(
         outline, novel_name,
         review_mode=review_mode,
         target_chapters=target_chapters,
@@ -1497,7 +1425,10 @@ def run_planner(novel_name: str, genre: str, keywords: str) -> tuple:
     )
 
     print("\n" + "=" * 50)
-    print(f"策划完成！文件已保存到 data/{novel_name}/")
+    if saved == target_chapters:
+        print(f"策划完成！文件已保存到 data/{novel_name}/")
+    else:
+        print(f"策划尚缺 {target_chapters - saved} 张任务卡，已保留现有资料")
     print(f"目标篇幅：{target_chapters}章")
     print(f"\n【世界观预览】\n{world[:150]}...")
     print(f"\n【大纲预览】\n{outline[:150]}...")

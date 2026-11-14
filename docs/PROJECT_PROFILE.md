@@ -7,7 +7,7 @@
 | 项目类型     | 本地 CLI 与浏览器工作台（依赖见 requirements.txt 和 requirements-web.txt） |
 | 总代码量     | ~10300+ 行（14 个核心模块 + 1 个工具脚本）                         |
 | 数据库       | SQLite WAL 模式，每部小说独立 `novel.db` 文件                |
-| AI 后端      | DashScope（阿里百炼）+ Mimo（小米）双 Provider，共 14 个可用模型 |
+| AI 后端      | DashScope（阿里百炼）+ Mimo（小米）双 Provider，候选仅使用百炼 CLI 查询到的有额度文本模型 |
 | 核心模块数   | 14 个                                                        |
 | 数据库表数   | 11 张                                                        |
 | 主要入口     | `python main.py`（浏览器工作台），`python main.py --cli`（CLI） |
@@ -16,6 +16,8 @@
 ---
 
 浏览器工作台的安装、菜单映射和验证方式见 [工作台说明](WORKBENCH.md)。
+
+百炼免费额度已接入官方 CLI：启动和进入模型菜单时按上次成功同步时间检查 24 小时缓存，支持手动刷新，不自动切换当前模型。安装和行为说明见 [README](../README.md#百炼免费额度自动同步)。
 
 ## 2. 目录结构
 
@@ -145,8 +147,8 @@ main() → _import_from_text_file()
 ```
 chapters_menu → generate_chapter_auto(novel_name)              # [main.py:L429]
   ↓
-  ├─ 从 chapter_tasks 找 MIN(chapter_num) WHERE status IN ('待处理')
-  │   兜底：MAX(chapters.chapter_num) + 1
+  ├─ 从首章开始检查定稿及任务状态，选择最早未完成章
+  │   若该章进行中或审稿失败，先恢复该章
   │   若 next_num 超过 target_chapters.txt → 停止并提示
   │
   ├─ get_next_chapter_goal(novel_name, next_num)              # [main.py:L375]
@@ -170,9 +172,7 @@ chapters_menu → generate_chapter_auto(novel_name)              # [main.py:L429
   │   ├─ export_chapter(novel_name, next_num)                 # [core/exporter.py:L103]
   │   └─ _update_task_status(novel_name, next_num, "已完成")
   │
-  └─ if 连续3次重写未通过:
-      提示切换模型重新生成 → select_model_interactive()
-      重新调用 write_and_review()
+  └─ 若质检未通过或服务异常：保留草稿，使用审稿恢复入口继续
 ```
 
 **批量自动生成**（章节菜单选项 2）：
@@ -206,7 +206,7 @@ write_and_review(novel_name, chapter_num, plot_goal, emotion_tag)
   │        │   False → build_writer_prompt() → 前半段                │
   │        │         → build_continue_prompt() → 后半段              │
   │        │         → 字数补写 (supplement) 循环                     │
-  │        └─ _self_check_and_revise() → AI痕迹自检修订              │
+  │        └─ _polish_chapter() → 去 AI 化打磨和本地诊断              │
   │    ↓                                                              │
   │    review_chapter()           # [core/reviewer.py:L578] 责任编辑  │
   │      ├─ build_review_prompt() → REVIEWER_SYSTEM                 │
@@ -225,7 +225,7 @@ write_and_review(novel_name, chapter_num, plot_goal, emotion_tag)
   │          _revise_mode = True (首次失败自动进入修改模式)            │
   │          或 用户选：继续修改/完全重写/切换模型                     │
   │        else:                                                      │
-  │          提示切换模型 → 强制通过                                   │
+  │          默认保留审稿失败，或按配置标记强制通过                                   │
   │    ↓                                                              │
   │    if pass (责任编辑通过):                                        │
   │      reader_review_chapter()  # [core/reader_reviewer.py:L177]   │
@@ -233,7 +233,7 @@ write_and_review(novel_name, chapter_num, plot_goal, emotion_tag)
   │        ↓                                                          │
   │        if pass (双重通过):                                        │
   │          _update_status_safe → '已审核'                           │
-  │          _auto_redeem_foreshadowing()  # 自动兑现逾期伏笔         │
+| `commit_approved_chapter()` | 审核通过时以同一事务保存章节状态与逐项确认的伏笔 |
   │          _sync_outline_foreshadow()     # 同步大纲伏笔状态        │
   │          return content                                           │
   │        else:                                                      │
@@ -252,7 +252,7 @@ write_and_review(novel_name, chapter_num, plot_goal, emotion_tag)
 | `review_chapter()`               | [core/reviewer.py](file:///d:/novel-ai/core/reviewer.py) | L578     | 责任编辑审稿（L1/L2/L3三层评分）   |
 | `reader_review_chapter()`        | [core/reader_reviewer.py](file:///d:/novel-ai/core/reader_reviewer.py) | L177     | 读者视角审稿（真实感+逻辑+一致+流畅） |
 | `_sync_outline_foreshadow()`     | [core/reviewer.py](file:///d:/novel-ai/core/reviewer.py) | L717     | 审稿通过后同步大纲伏笔状态         |
-| `_auto_redeem_foreshadowing()`   | [core/reviewer.py](file:///d:/novel-ai/core/reviewer.py) | L745     | 审稿通过后关键词匹配自动兑现逾期伏笔 |
+| `commit_approved_chapter()` | 审核通过时以同一事务保存章节状态与逐项确认的伏笔 |
 | `score_foreshadowing()`          | [core/reviewer.py](file:///d:/novel-ai/core/reviewer.py) | L391     | 伏笔专项评分（embed/resolve/traceable/overload_risk） |
 | `rewrite_task_for_chapter()`     | [core/planner.py](file:///d:/novel-ai/core/planner.py) | L874     | 冲突检测后基于大纲重写任务卡       |
 
@@ -408,8 +408,8 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `build_writer_prompt()` | `(...)` | 构建小模型前半段 prompt |
 | `build_continue_prompt()` | `(...)` | 构建小模型后半段 prompt |
 | `_plan_chapter_beats()` | `(ctx, chapter_num, plot_goal, emotion_tag) -> str` | AI 节拍规划 |
-| `_self_check_and_revise()` | `(system_prompt, chapter_num, plot_goal, emotion_tag, full_content, beat_plan, max_tokens) -> str` | 自检 + 去AI化打磨 + 规则修订 |
-| `_rule_based_ai_check()` | `(text) -> list` | 规则检测 AI 痕迹（37条正则） |
+| `_polish_chapter()` | `(full_content, max_tokens) -> str` | 去 AI 化打磨和本地规则诊断 |
+| `_rule_based_ai_check()` | `(text) -> list` | 规则检测 AI 痕迹 |
 | `is_high_capacity_model()` | `() -> bool` | 判断当前模型是否走大模型策略 |
 
 **关键数据结构**：
@@ -420,7 +420,7 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `EMOTION_GUIDE` (dict, 5种) | 情绪标签指南：爽点/冲突/反转/低谷/铺垫 |
 | `WRITER_HARD_CONSTRAINTS` (list, 7条) | 写作硬约束规则 |
 | `WRITER_FORBIDDEN_RULES` (list, 11条) | 写作禁止项规则 |
-| `AI_PATTERNS` (list, 37条) | AI 痕迹正则检测规则 |
+| `AI_PATTERNS` (list) | AI 痕迹正则检测规则 |
 | `NEGATIVE_EXAMPLES` (str) | 反面教材示例文本 |
 | `HUMAN_WRITING_TECHNIQUES` (str) | 真实写作手法指引 |
 | `BEAT_PLANNER_SYSTEM` (str) | 节拍规划 system prompt |
@@ -436,7 +436,7 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `review_chapter()` | `(novel_name, chapter_num, content, plot_goal) -> dict` | 责任编辑审稿主函数 |
 | `score_foreshadowing()` | `(chapter_text, foreshadow_list, chapter_num=0) -> dict｜None` | 伏笔专项评分 |
 | `_sync_outline_foreshadow()` | `(novel_name, chapter_num, content) -> None` | 审稿通过后同步大纲伏笔状态 |
-| `_auto_redeem_foreshadowing()` | `(mm, chapter_num, content) -> None` | 关键词匹配自动兑现逾期伏笔 |
+| `commit_approved_chapter()` | 审核通过时以同一事务保存章节状态与逐项确认的伏笔 |
 | `_update_status_safe()` | `(novel_name, chapter_num, status) -> None` | 带重试的原子状态更新 |
 | `_increment_retry_safe()` | `(novel_name, chapter_num) -> None` | 带重试的重试计数递增 |
 | `_build_retry_feedback()` | `(result: dict) -> str` | 从审稿结果构建重试反馈 |
@@ -498,7 +498,7 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `get_foreshadow_hints()` | `(chapter_num) -> list` | 智能伏笔提示（优先级排序+分批） |
 | `get_foreshadow_report()` | `(current_chapter) -> dict` | 伏笔健康度报告 |
 | `add_summary()` | `(chapter_num, summary) -> None` | 添加章节摘要 |
-| `load_recent_summaries()` | `(count=5) -> list` | 加载近期摘要 |
+| `load_recent_summaries()` | `(count=None, *, before_chapter=None) -> list` | 加载可用阶段摘要与目标章之前的未压缩摘要 |
 | `compress_old_summaries()` | `() -> None` | 压缩旧摘要为阶段摘要 |
 | `save_chapter()` | `(chapter_num, title, content, status, ...) -> None` | 保存章节 |
 | `load_chapter()` | `(chapter_num) -> dict` | 加载章节 |
@@ -610,6 +610,13 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `DatabaseTransaction` | `class` | 事务管理器（BEGIN IMMEDIATE） |
 
 ---
+
+### 4.13 其他入口
+
+- `core/task_card_reviewer.py` 审核策划生成的任务卡。
+- `core/style_analyzer.py` 从样文生成文法指纹。
+- `core/book_health.py` 生成旧书只读体检，备份后归档用户选中的旧伏笔。
+- `workbench/` 将 CLI 核心操作接到 Flask 和 Vue 工作台。
 
 ## 5. 数据库表结构
 
@@ -793,8 +800,7 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `temperature.writing_first_half` | float | 0.90 | 小模型前半段 |
 | `temperature.writing_second_half` | float | 0.70 | 小模型后半段 |
 | `temperature.writing_supplement` | float | 0.75 | 字数补写 |
-| `temperature.revision` | float | 0.70 | 自检修订 |
-| `temperature.self_check` | float | 0.20 | 自检质检 |
+| `temperature.revision` | float | 0.70 | 正文修订和去 AI 化打磨 |
 | `temperature.beat_planner` | float | 0.65 | 节拍规划 |
 | `temperature.outline_gen` | float | 0.90 | 总大纲生成 |
 | `temperature.world_gen` | float | 0.85 | 世界观生成 |
@@ -811,7 +817,8 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `novel.chapter_word_min` | int | 3000 | 章节最小字数（低于触发补写） |
 | `novel.chapter_word_max` | int | 4000 | 章节最大字数（达到停止补写） |
 | `novel.max_retry` | int | 3 | 每章最多重试次数 |
-| `novel.recent_summary_count` | int | 5 | 加载最近摘要数量 |
+| `novel.on_review_exhausted` | str | stop | 内容未通过时停止，或标记强制通过后继续 |
+| `novel.recent_summary_count` | int | 5 | 每次压缩保留的逐章摘要数 |
 | `novel.compress_after_chapters` | int | 20 | 摘要超过此数触发压缩 |
 | `novel.pre_split_chapters` | int | 50 | 每批任务卡生成数量 |
 | `novel.failure_switch_threshold` | int | 3 | 连续失败达到此数触发模型切换提示 |
@@ -840,7 +847,7 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 - [x] 默认模型更换为 qwen3.6-flash（有免费额度）
 - [x] 大纲伏笔管理系统（规划→埋入→兑现 完整生命周期）
 - [x] 冲突检测 + 任务卡自动重写
-- [x] AI 痕迹规则检测（37条正则）+ 自检修订
+- [x] AI 痕迹规则检测与去 AI 化打磨
 - [x] 9 种预设写作风格 + 自定义风格
 - [x] 章节摘要自动压缩（阶段摘要合并）
 - [x] 伏笔健康度报告
@@ -848,11 +855,10 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 
 ### 待办事项
 - [ ] **P0 — 安全与稳定性**
-  - [ ] SQL 注入风险修复（动态 SQL 标识符白名单校验）
   - [ ] 裸 except 替换为精确异常处理
   - [ ] write_and_review() 函数拆分（~430行→多个子状态机）
   - [ ] api_client.py 职责拆分（API层/UI层/统计层分离）
-  - [ ] 核心路径单元测试
+  - [x] 核心路径离线回归（另有真实模型验收）
 - [ ] **P1 — 架构优化**
   - [ ] 引入 AppContext 依赖注入
   - [ ] Provider 抽象层（LLMProvider 接口）

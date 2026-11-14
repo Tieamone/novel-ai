@@ -74,10 +74,299 @@ class WorkbenchTests(unittest.TestCase):
     def seed_task(self, chapter=1, status="待处理"):
         cli._upsert_task_status(BOOK, chapter, GOAL, "铺垫", status)
 
+    def test_failed_draft_blocks_continuation_and_export(self):
+        self.seed_task(1, "审稿失败")
+        self.seed_task(2)
+        MemoryManager(BOOK).save_chapter(1, "草稿", CONTENT, "审稿失败")
+        with patch.object(reviewer, "call_reviewer_api") as review_call:
+            self.assertIsNone(cli.generate_chapter_auto(BOOK))
+            review_call.assert_not_called()
+        self.wait(self.submit("export", chapter=1), "failed")
+        self.wait(self.submit("export"), "failed")
+        self.assertFalse((self.root / "output" / BOOK / "第002章.txt").exists())
+
+    def test_editor_service_retry_uses_same_draft(self):
+        self.seed_task()
+        mm = MemoryManager(BOOK)
+        def write(novel, chapter, goal, tag, **kwargs):
+            mm.save_chapter(chapter, "正文", CONTENT, "草稿", goal, tag)
+            return CONTENT
+        with (
+            patch.object(writer, "write_chapter", side_effect=write) as write_call,
+            patch.object(reviewer, "call_reviewer_api", return_value="格式异常") as review_call,
+        ):
+            cli.generate_chapter_auto(BOOK)
+        self.assertEqual(write_call.call_count, 1)
+        self.assertEqual(review_call.call_count, 3)
+        self.assertEqual(mm.load_chapter(1)["status"], "审稿失败")
+
+    def test_reader_failure_does_not_approve_or_export(self):
+        self.seed_task()
+        def write(novel, chapter, goal, tag, **kwargs):
+            MemoryManager(novel).save_chapter(chapter, "正文", CONTENT, "草稿", goal, tag)
+            return CONTENT
+        with (
+            patch.object(writer, "write_chapter", side_effect=write),
+            patch.object(reviewer, "call_reviewer_api", return_value='{"pass":true,"score_l1":40,"score_l2":23,"score_l3":27}'),
+            patch.object(reader_reviewer, "call_reader_reviewer_api", side_effect=RuntimeError("二审异常")),
+        ):
+            cli.generate_chapter_auto(BOOK)
+        self.assertEqual(self.get("/api/chapter/1")["status"], "审稿失败")
+        self.assertFalse((self.root / "output" / BOOK / "第001章.txt").exists())
+
+    def test_invalid_memory_can_resume_without_rewriting(self):
+        self.seed_task()
+        mm = MemoryManager(BOOK)
+        mm.save_character("甲", {"role": "主角"})
+        mm.save_chapter(1, "正文", CONTENT, "已审核", GOAL)
+        with (
+            patch.object(api_client, "call_reviewer_api", side_effect=[
+                '{"summary":"摘要","character_updates":null}',
+                '{"summary":"修正摘要","character_updates":[{"name":"甲","location":"仓库"}]}',
+            ]),
+            patch.object(writer, "write_chapter") as write,
+        ):
+            self.wait(self.submit("generate"), "failed")
+            self.assertEqual(self.get("/api/book")["tasks"][0]["status"], "待处理")
+            self.assertIsNone(mm.load_chapter(1)["summary"])
+            self.completed("generate")
+            write.assert_not_called()
+        self.assertEqual(mm.load_characters()[0]["current_location"], "仓库")
+        self.assertEqual(self.get("/api/book")["tasks"][0]["status"], "已完成")
+
+    def test_task_cards_fill_actual_missing_chapter_numbers(self):
+        rows = [{"chapter_num": n, "plot_goal": GOAL} for n in (1, 1, 9)]
+        missing = [{"chapter_num": n, "plot_goal": GOAL} for n in (2, 3)]
+        with (
+            patch.object(planner, "call_author_api", side_effect=[json.dumps(rows), json.dumps(missing)]),
+            patch("core.task_card_reviewer.review_task_cards", return_value={"pass": True}),
+        ):
+            self.assertEqual(planner.split_outline_to_tasks("大纲", BOOK, target_chapters=3), 3)
+        self.assertEqual([row["chapter_num"] for row in self.get("/api/book")["tasks"]], [1, 2, 3])
+
+    def test_export_preserves_story_and_separates_names(self):
+        from core.exporter import export_chapter
+        paths = []
+        for novel in (BOOK, "_" + BOOK):
+            MemoryManager(novel).save_chapter(1, "正文", f"【系统任务更新：{novel}】", "已审核")
+            paths.append(Path(export_chapter(novel, 1)))
+        self.assertNotEqual(*paths)
+        self.assertIn(f"【系统任务更新：{BOOK}】", paths[0].read_text(encoding="utf-8"))
+        cli.rewrite_writing_checkpoint(BOOK, 1)
+        self.assertFalse(paths[0].exists())
+
+    def test_style_checks_preserve_facts_and_count_chinese_dialogue(self):
+        fact = "她知道，铜钥匙是父亲死前留给她的。"
+        self.assertEqual(writer.clean_content(fact), fact)
+        mm = MemoryManager(BOOK)
+        for number in range(1, 4):
+            mm.save_chapter(number, "正文", "“听见了吗？”\n“听见了。”\n他收好钥匙。", "已审核")
+        warnings = writer._check_cross_chapter_quality(BOOK, 4)
+        self.assertFalse(any("对话偏少" in warning for warning in warnings))
+
+    def test_unapproved_task_card_stays_out_of_database(self):
+        cards = [{"chapter_num": 1, "plot_goal": GOAL, "emotion_tag": "铺垫"}]
+        with (
+            patch.object(planner, "call_author_api", return_value=json.dumps(cards)),
+            patch("core.task_card_reviewer.review_task_cards", return_value={"pass": False, "score_total": 2}),
+            patch("core.task_card_reviewer.revise_task_cards", return_value=cards),
+        ):
+            self.assertEqual(planner._generate_single_batch("大纲", BOOK, 1, 1), 0)
+        self.assertEqual(self.get("/api/book")["tasks"], [])
+
+    def test_review_contract_rejects_invalid_scores_flags_and_length(self):
+        for review in (reviewer, reader_reviewer):
+            self.assertFalse(review._normalize_review_result({"pass": "false", "score_total": 100})["pass"])
+        result = reviewer.review_chapter(BOOK, 1, "短稿", GOAL)
+        self.assertFalse(result["pass"])
+        self.assertIn("字数", result["suggestions"])
+
+    def test_export_failure_leaves_recovery_pending(self):
+        self.seed_task(1, "审稿失败")
+        mm = MemoryManager(BOOK)
+        mm.save_chapter(1, "正文", CONTENT, "审稿失败", GOAL)
+        with patch.object(api_client, "call_reviewer_api", return_value='{"summary":"摘要"}'):
+            with patch.object(cli, "export_chapter", side_effect=OSError("写入失败")):
+                self.wait(self.submit("recover", chapter=1, method="3"), "failed")
+            self.assertEqual(self.get("/api/book")["tasks"][0]["status"], "待处理")
+            with patch.object(api_client, "call_reviewer_api") as memory_call:
+                self.completed("generate")
+                memory_call.assert_not_called()
+        self.assertEqual(self.get("/api/book")["tasks"][0]["status"], "已完成")
+        self.assertTrue((self.root / "output" / BOOK / "第001章.txt").is_file())
+
+    def test_summary_window_and_urgent_hint_limit(self):
+        mm = MemoryManager(BOOK)
+        with with_db_connection(BOOK) as conn, DatabaseTransaction(conn):
+            conn.execute("INSERT INTO summaries (chapter_num, summary, is_compressed) VALUES (80, '阶段', 1)")
+            conn.executemany(
+                "INSERT INTO summaries (chapter_num, summary) VALUES (?, '逐章')",
+                [(n,) for n in (75, *range(81, 96))],
+            )
+            conn.executemany(
+                "INSERT INTO foreshadowing (fid, plant_chapter, description, expected_redeem, status) "
+                "VALUES (?, 1, '过期线索', '第2章', 'active')",
+                [(f"F{n}",) for n in range(20)],
+            )
+        current = mm.load_context(94)
+        self.assertEqual([row["chapter_num"] for row in current["recent_summaries"]], list(range(80, 94)))
+        self.assertEqual(len(current["foreshadow_hints"]), 8)
+        history = mm.load_context(78)
+        self.assertEqual([row["chapter_num"] for row in history["recent_summaries"]], [75])
+        self.assertTrue(history["summary_history_incomplete"])
+
+    def test_foreshadow_evidence_and_rollback(self):
+        mm = MemoryManager(BOOK)
+        fid = outline_manager.add_outline_foreshadow(BOOK, "铜钥匙藏在仓库", "情节伏笔", 1, 2)
+        status = lambda: outline_manager.list_outline_foreshadow(BOOK)[0]["status"]
+        editor_ok = {"pass": True, "score_l1": 39, "score_l2": 24, "score_l3": 29}
+
+        def review(chapter, content, confirmed=None):
+            summary = {"embed": 9, "resolve": 9}
+            if confirmed is not None:
+                summary["confirmed"] = confirmed
+            with patch.object(reviewer, "call_reviewer_api",
+                              side_effect=[json.dumps(editor_ok), json.dumps(summary)]):
+                return reviewer.review_chapter(BOOK, chapter, content, GOAL)
+
+        planted = CONTENT + "铜钥匙藏在仓库。"
+        mm.save_chapter(1, "埋入", planted)
+        for invalid in (None, [{"key": "99", "quote": "铜钥匙藏在仓库"}],
+                        [{"key": "1", "quote": "不存在的证据"}]):
+            reviewer.commit_approved_chapter(BOOK, 1, planted, review(1, planted, invalid))
+            self.assertEqual(status(), "planned")
+        planting = review(1, planted, [{"key": "1", "quote": "铜钥匙藏在仓库"}])
+        mm.save_chapter(1, "裁切稿", CONTENT)
+        reviewer.commit_approved_chapter(BOOK, 1, CONTENT, planting)
+        self.assertEqual(status(), "planned")
+        mm.save_chapter(1, "埋入", planted)
+        reviewer.commit_approved_chapter(BOOK, 1, planted, planting)
+        self.assertEqual(status(), "planted")
+
+        denial = CONTENT + "铜钥匙并不能开门。"
+        mm.save_chapter(2, "未兑现", denial)
+        reviewer.commit_approved_chapter(BOOK, 2, denial, review(2, denial, []))
+        self.assertEqual(status(), "planted")
+
+        resolved = CONTENT + "铜钥匙转动，门应声而开。"
+        mm.save_chapter(2, "兑现", resolved)
+        verdict = review(2, resolved, [{"key": "1", "quote": "铜钥匙转动"}])
+        with with_db_connection(BOOK) as conn, DatabaseTransaction(conn):
+            conn.execute("""CREATE TRIGGER reject_resolve BEFORE UPDATE ON outline_foreshadowing
+                WHEN NEW.status='resolved' BEGIN SELECT RAISE(ABORT, '模拟事务异常'); END""")
+        import sqlite3
+        with self.assertRaises(sqlite3.IntegrityError):
+            reviewer.commit_approved_chapter(BOOK, 2, resolved, verdict)
+        self.assertEqual(mm.load_chapter(2)["status"], "草稿")
+        self.assertEqual(status(), "planted")
+        with with_db_connection(BOOK) as conn, DatabaseTransaction(conn):
+            conn.execute("DROP TRIGGER reject_resolve")
+        reviewer.commit_approved_chapter(BOOK, 2, resolved, verdict)
+        self.assertEqual(status(), "resolved")
+        cli.rewrite_writing_checkpoint(BOOK, 2)
+        self.assertEqual(status(), "planted")
+        cli.delete_chapter(BOOK, 1)
+        self.assertEqual(status(), "planned")
+        self.assertEqual(outline_manager.get_chapter_outline_tasks(BOOK, 1)["to_plant"][0]["fid"], fid)
+
+    def test_orphan_task_requires_explicit_confirmation(self):
+        mm = MemoryManager(BOOK)
+        self.seed_task(1, "进行中")
+        mm.save_chapter(1, "中断稿", CONTENT)
+        job = self.submit("generate")
+        prompt = self.wait(job, "waiting")["prompt"]
+        self.answer(job, prompt["id"], "n")
+        self.wait(job, "completed")
+        self.assertEqual(mm.load_chapter(1)["content"], CONTENT)
+        self.assertEqual(self.get("/api/book")["tasks"][0]["status"], "进行中")
+        with patch.object(cli, "write_and_review", return_value="") as write:
+            job = self.submit("generate")
+            prompt = self.wait(job, "waiting")["prompt"]
+            self.answer(job, prompt["id"], "y")
+            self.wait(job, "completed")
+            write.assert_called_once()
+        self.assertFalse(mm.load_chapter(1).get("content"))
+        self.assertEqual(self.get("/api/book")["tasks"][0]["status"], "待处理")
+
+    def test_context_after_two_compressions(self):
+        mm = MemoryManager(BOOK)
+        config_loader._config["novel"].update(compress_after_chapters=6, recent_summary_count=2)
+        with patch.object(api_client, "call_api", side_effect=["阶段一", "第二批", "合并阶段二"]):
+            for chapter in range(1, 13):
+                mm.add_summary(chapter, f"第{chapter}章摘要")
+                cli._trigger_compression(BOOK, mm)
+                if chapter in (7, 12):
+                    ctx = mm.load_context(chapter + 1)
+                    self.assertEqual(
+                        [row["chapter_num"] for row in ctx["recent_summaries"]],
+                        list(range(chapter - 2, chapter + 1)),
+                    )
+            self.assertIn("合并阶段二", mm.load_context(13)["recent_summaries"][0]["summary"])
+
+    def test_old_statuses_resume_before_chapter_advances(self):
+        mm = MemoryManager(BOOK)
+        mm.save_chapter(1, "旧版完成章", CONTENT, "approved")
+        self.seed_task(1, "completed")
+        mm.save_chapter(2, "旧版遗留章", CONTENT, "approved")
+        self.seed_task(2, "in_progress")
+        with (
+            patch.object(cli, "input", return_value="y"),
+            patch.object(api_client, "call_reviewer_api", return_value='{"summary":"旧书摘要"}'),
+            patch.object(cli, "write_and_review") as write,
+        ):
+            self.assertEqual(cli.generate_chapter_auto(BOOK), 2)
+            write.assert_not_called()
+        self.assertEqual(self.get("/api/book")["tasks"][1]["status"], "已完成")
+        self.assertTrue((self.root / "output" / BOOK / "第002章.txt").is_file())
+
+    def test_force_policy_distinguishes_content_from_service_failure(self):
+        config_loader._config["novel"].update(max_retry=1, on_review_exhausted="force_and_flag")
+        mm = MemoryManager(BOOK)
+        for chapter in (1, 2):
+            self.seed_task(chapter)
+        outline_manager.add_outline_foreshadow(BOOK, "仓库", "情节伏笔", 1, 2)
+
+        def write(novel, chapter, goal, tag, **kwargs):
+            mm.save_chapter(chapter, "正文", CONTENT, "草稿", goal, tag)
+            return CONTENT
+
+        def editor(novel, chapter, content, goal):
+            return {"pass": False, "score_total": 40, "review_error": chapter == 2}
+
+        with (
+            patch.object(writer, "write_chapter", side_effect=write),
+            patch.object(reviewer, "review_chapter", side_effect=editor),
+            patch.object(api_client, "call_reviewer_api", return_value='{"summary":"摘要"}'),
+        ):
+            result = self.completed("generate", count=2)
+        self.assertEqual(result["forced"], [1])
+        self.assertEqual(mm.load_chapter(1)["status"], "强制通过")
+        self.assertEqual(mm.load_chapter(2)["status"], "审稿失败")
+        self.assertEqual(outline_manager.list_outline_foreshadow(BOOK)[0]["status"], "planned")
+
+    def test_legacy_health_and_selected_archive(self):
+        from core.book_health import archive_selected, inspect_book
+        mm = MemoryManager(BOOK)
+        mm.add_foreshadowing("F1", 1, "旧伏笔一", "第3章")
+        mm.add_foreshadowing("F2", 1, "旧伏笔二", "第4章")
+        report = inspect_book(BOOK)
+        self.assertEqual([item["fid"] for item in report["legacy"]], ["F1", "F2"])
+        archive = archive_selected(BOOK, report["legacy"][:1])
+        self.assertTrue(archive.is_file())
+        self.assertEqual([item["fid"] for item in inspect_book(BOOK)["legacy"]], ["F2"])
+
+    def test_planning_failure_allows_same_name_retry(self):
+        with patch.object(cli, "run_planner", side_effect=RuntimeError("策划异常")):
+            with self.assertRaises(RuntimeError):
+                cli.create_novel("新书名")
+        with patch.object(cli, "run_planner", return_value=([], "1")), patch.object(cli, "input", return_value="y"):
+            self.assertEqual(cli.create_novel("新书名"), "新书名")
+        self.assertFalse((self.root / "data" / "新书名" / ".planning").exists())
+
     def test_generation_resume_stop_and_export(self):
         self.seed_task()
         editor_response = json.dumps({
-            "pass": True, "score_total": 94, "score_l1": 38, "score_l2": 28, "score_l3": 28,
+            "pass": True, "score_total": 91, "score_l1": 38, "score_l2": 25, "score_l3": 28,
             "cut_suggestions": [{"start": "灯塔上的窗户亮了一下。", "reason": "删去重复描写"}],
         }, ensure_ascii=False)
         reader_response = json.dumps({
@@ -88,7 +377,7 @@ class WorkbenchTests(unittest.TestCase):
             patch.object(writer, "_plan_chapter_beats", return_value="查看码头的航行记录"),
             patch.object(writer, "is_high_capacity_model", return_value=True),
             patch.object(writer, "call_author_api", return_value=CONTENT),
-            patch.object(writer, "_self_check_and_revise", side_effect=lambda **kwargs: kwargs["full_content"]),
+            patch.object(writer, "_polish_chapter", side_effect=lambda content, _: content),
             patch.object(reviewer, "call_reviewer_api", return_value=editor_response),
             patch.object(reader_reviewer, "call_reader_reviewer_api", return_value=reader_response),
             patch.object(api_client, "call_reviewer_api", return_value='{"summary":"找到了码头记录"}'),
@@ -126,7 +415,7 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(book["tasks"][0]["status"], "已完成")
         self.assertEqual(book["progress"]["approved"], 1)
         self.assertEqual(book["progress"]["quality_count"], 1)
-        self.assertEqual(book["progress"]["avg_total"], 94)
+        self.assertEqual(book["progress"]["avg_total"], 91)
         self.assertEqual(book["progress"]["task_status"]["已完成"], 1)
         self.assertEqual(self.completed("export")["downloads"], ["第001章.txt"])
         response = self.client.get("/api/download/第001章.txt", query_string={"novel": BOOK})
@@ -169,16 +458,17 @@ class WorkbenchTests(unittest.TestCase):
             conn.execute("UPDATE chapter_tasks SET updated_at='2000-01-01' WHERE chapter_num=2")
         self.assertEqual(self.get("/api/book")["tasks"][1]["stale"], 1)
         self.assertIn("检查码头", self.get("/api/checkpoint/1")["cache"]["preview"])
-        self.completed("recover", chapter=1, method="3")
+        with patch.object(api_client, "call_reviewer_api", return_value='{"summary":"停在码头"}'):
+            self.completed("recover", chapter=1, method="3")
         self.assertEqual(self.get("/api/chapter/1")["status"], "强制通过")
         self.completed("reset", chapter=2, confirm="YES")
         self.completed("clear_beats", chapter=1, confirm="YES")
         self.assertIsNone(self.get("/api/checkpoint/1")["cache"])
         self.completed("rewrite", chapter=1, confirm="YES")
-        self.assertIsNone(self.get("/api/chapter/1")["content"])
+        self.assertFalse(mm.load_chapter(1).get("content"))
         with with_db_connection(BOOK) as conn:
-            self.assertEqual(conn.execute("SELECT summary FROM summaries WHERE chapter_num=1").fetchone()[0], "停在码头")
-        self.completed("delete_chapters", first=1, last=2, confirm="YES")
+            self.assertIsNone(conn.execute("SELECT summary FROM summaries WHERE chapter_num=1").fetchone())
+        self.completed("delete_chapters", first=2, last=2, confirm="YES")
         self.assertEqual(self.get("/api/book")["chapters"], [])
         self.completed("delete_book", name_confirmation=BOOK, confirm="YES")
         self.assertEqual(self.get("/api/bootstrap")["novels"], [])
@@ -190,9 +480,9 @@ class WorkbenchTests(unittest.TestCase):
             patch.object(writer, "_plan_chapter_beats", return_value="查看码头的航行记录"),
             patch.object(writer, "is_high_capacity_model", return_value=True),
             patch.object(writer, "call_author_api", return_value=CONTENT),
-            patch.object(writer, "_self_check_and_revise", side_effect=lambda **kwargs: kwargs["full_content"]),
-            patch.object(reviewer, "call_reviewer_api", return_value='{"pass":true,"score_l1":39,"score_l2":29,"score_l3":29}'),
-            patch.object(reader_reviewer, "call_reader_reviewer_api", return_value='{"pass":true,"score_total":93}'),
+            patch.object(writer, "_polish_chapter", side_effect=lambda content, _: content),
+            patch.object(reviewer, "call_reviewer_api", return_value='{"pass":true,"score_l1":39,"score_l2":24,"score_l3":29}'),
+            patch.object(reader_reviewer, "call_reader_reviewer_api", return_value='{"pass":true,"score_total":93,"score_ai_authenticity":24,"score_logic":23,"score_consistency":23,"score_readability":23}'),
             patch.object(api_client, "call_reviewer_api", return_value='{"summary":"码头的记录"}'),
         ):
             result = self.completed("generate", count=2)
