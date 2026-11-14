@@ -104,7 +104,12 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
   "suggestions": "失败时给出具体可执行的修订建议（指出需要改哪段、怎么改）；通过写质量合格"
 }"""
 
-FORESHADOW_REVIEWER_SYSTEM = """你是伏笔专项审核员，负责评估章节对伏笔的处理质量。
+FORESHADOW_REVIEWER_SYSTEM = """你是伏笔专项审核员。先执行逐项证据检查，再给本章评分。候选描述是待证实的主张，不能当成正文事实。
+
+逐项证据检查：
+- 埋入候选：先找出描述中的区分性特征，逐个检查本章是否实际描写。仅出现同一物品或人物，缺少关键特征，填 unconfirmed。
+- 例：候选“带三道刻痕的铜环被发现”，正文“他捡起铜环”或“如果铜环有刻痕，他就会留着它”，都填 unconfirmed。“他捡起一只带三道刻痕的铜环”才填 confirmed。
+- 兑现候选：本章必须实际揭示线索所指的结果。明确否定、假设、计划、回忆或只提及一律填 unconfirmed。
 
 评分维度（每项0-10分）：
 1. **埋入自然度**（embed）：本章新增的伏笔/悬念是否自然融入情节，不突兀。
@@ -126,8 +131,15 @@ FORESHADOW_REVIEWER_SYSTEM = """你是伏笔专项审核员，负责评估章节
 
 说明要求：一句话概括本章伏笔处理情况。
 
+先逐项判断状态，再评分。每个候选编号在 decisions 中出现一次，编号原样抄写。
+- confirmed：本章具体动作或明确事实完成该候选。埋入要求线索实际出现，兑现要求线索所指事件或信息得到实质回答。
+- unconfirmed：没发生、仍待解释、只是转述、假设、计划，或正文明确否定该候选。
+- 例：候选“戒指能启动电梯”，正文“她按下戒指，电梯门立即打开。”确认。
+  正文“她按下戒指，电梯毫无反应。”不确认。正文说“戒指不是开关”也不确认。
+- 同一段可以同时支持多个候选，独立判定。仅确认项必须引用正文中直接证明判断的完整短句，逐字照抄。
+
 严格只输出JSON：
-{"embed":0-10,"resolve":0-10,"traceable":0-10,"overload_risk":0-10,"comment":"一句话说明","confirmed":[{"key":"候选编号","quote":"短小的正文原句"}]}"""
+{"embed":9,"resolve":9,"traceable":9,"overload_risk":9,"comment":"一句话说明","decisions":[{"key":"候选1","verdict":"confirmed","quote":"支持判断的原句"},{"key":"候选2","verdict":"unconfirmed","quote":""}]}"""
 
 
 def _normalize_issue_list(value) -> list:
@@ -420,10 +432,10 @@ def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
     # 超长正文仍可评分，但不能据截断片段确认状态。
     review_text = _truncate_for_review(chapter_text, max_len=8000)
     candidates = {
-        str(index): item for index, item in enumerate(to_plant + to_resolve, 1)
+        f"候选{index}": item for index, item in enumerate(to_plant + to_resolve, 1)
     }
     candidate_lines = "\n".join(
-        f"- [{key}] {item['handle_type']}（{item['source']} {item['fid']}）：{item['description']}"
+        f"- [{key}] {'埋入' if item['action'] == 'plant' else '兑现'}：{item['description']}"
         for key, item in candidates.items()
     )
 
@@ -442,15 +454,14 @@ def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
 === 待审正文 ===
 {review_text}
 
-逐项核对候选。confirmed 仅列正文中确实发生的埋入或兑现，引用短小的原文。
-否定、假设、计划、回忆或单纯提及不能证明已完成。无确认时返回空数组。"""
+逐项检查正文是否实际呈现候选描述中的关键细节。缺任何关键细节，填 unconfirmed。"""
 
     try:
         raw = call_reviewer_api(
             system_prompt=FORESHADOW_REVIEWER_SYSTEM,
             user_message=prompt,
             temperature=0.2,
-            max_tokens=max(300, 160 + 100 * len(candidates)),
+            max_tokens=max(400, 180 + 150 * len(candidates)),
         )
     except Exception:
         return None
@@ -467,7 +478,7 @@ def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
             return 5
 
     confirmed = []
-    entries = parsed.get("confirmed")
+    entries = parsed.get("decisions")
     if isinstance(entries, list) and review_text == chapter_text:
         seen, duplicates = set(), set()
         for entry in entries:
@@ -479,10 +490,11 @@ def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
             if key in seen:
                 duplicates.add(key)
             seen.add(key)
-            if isinstance(quote, str) and quote.strip() and quote in chapter_text:
+            if (entry.get("verdict") == "confirmed" and isinstance(quote, str)
+                    and quote.strip() and quote in chapter_text):
                 confirmed.append((key, candidates[key]))
         confirmed = [
-            item for key, item in sorted(confirmed, key=lambda entry: int(entry[0]))
+            item for key, item in sorted(confirmed, key=lambda entry: int(entry[0][2:]))
             if key not in duplicates
         ]
 

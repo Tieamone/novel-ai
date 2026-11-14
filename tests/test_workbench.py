@@ -224,18 +224,18 @@ class WorkbenchTests(unittest.TestCase):
         def review(chapter, content, confirmed=None):
             summary = {"embed": 9, "resolve": 9}
             if confirmed is not None:
-                summary["confirmed"] = confirmed
+                summary["decisions"] = confirmed
             with patch.object(reviewer, "call_reviewer_api",
                               side_effect=[json.dumps(editor_ok), json.dumps(summary)]):
                 return reviewer.review_chapter(BOOK, chapter, content, GOAL)
 
         planted = CONTENT + "铜钥匙藏在仓库。"
         mm.save_chapter(1, "埋入", planted)
-        for invalid in (None, [{"key": "99", "quote": "铜钥匙藏在仓库"}],
-                        [{"key": "1", "quote": "不存在的证据"}]):
+        for invalid in (None, [{"key": "候选99", "verdict": "confirmed", "quote": "铜钥匙藏在仓库"}],
+                        [{"key": "候选1", "verdict": "confirmed", "quote": "不存在的证据"}]):
             reviewer.commit_approved_chapter(BOOK, 1, planted, review(1, planted, invalid))
             self.assertEqual(status(), "planned")
-        planting = review(1, planted, [{"key": "1", "quote": "铜钥匙藏在仓库"}])
+        planting = review(1, planted, [{"key": "候选1", "verdict": "confirmed", "quote": "铜钥匙藏在仓库"}])
         mm.save_chapter(1, "裁切稿", CONTENT)
         reviewer.commit_approved_chapter(BOOK, 1, CONTENT, planting)
         self.assertEqual(status(), "planned")
@@ -245,12 +245,12 @@ class WorkbenchTests(unittest.TestCase):
 
         denial = CONTENT + "铜钥匙并不能开门。"
         mm.save_chapter(2, "未兑现", denial)
-        reviewer.commit_approved_chapter(BOOK, 2, denial, review(2, denial, []))
+        reviewer.commit_approved_chapter(BOOK, 2, denial, review(2, denial, [{"key": "候选1", "verdict": "unconfirmed", "quote": "铜钥匙并不能开门。"}]))
         self.assertEqual(status(), "planted")
 
         resolved = CONTENT + "铜钥匙转动，门应声而开。"
         mm.save_chapter(2, "兑现", resolved)
-        verdict = review(2, resolved, [{"key": "1", "quote": "铜钥匙转动"}])
+        verdict = review(2, resolved, [{"key": "候选1", "verdict": "confirmed", "quote": "铜钥匙转动"}])
         with with_db_connection(BOOK) as conn, DatabaseTransaction(conn):
             conn.execute("""CREATE TRIGGER reject_resolve BEFORE UPDATE ON outline_foreshadowing
                 WHEN NEW.status='resolved' BEGIN SELECT RAISE(ABORT, '模拟事务异常'); END""")
@@ -318,6 +318,16 @@ class WorkbenchTests(unittest.TestCase):
             write.assert_not_called()
         self.assertEqual(self.get("/api/book")["tasks"][1]["status"], "已完成")
         self.assertTrue((self.root / "output" / BOOK / "第002章.txt").is_file())
+
+    def test_overlong_single_paragraph_is_revised_without_truncating_ending(self):
+        original = "雨落在旧码头。" * 160 + "她转动铜牌，门开了。"
+        revised = "雨落在旧码头。" * 100 + "她转动铜牌，门开了。"
+        with patch.object(writer, "call_author_api", return_value=revised) as shorten:
+            self.assertEqual(writer._fit_chapter_length(original, 600, 900), revised)
+            self.assertIn("她转动铜牌，门开了。", shorten.call_args.kwargs["user_message"])
+        for invalid in ("过短", revised + "命运的最后裁决即将到来。"):
+            with patch.object(writer, "call_author_api", return_value=invalid):
+                self.assertEqual(writer._fit_chapter_length(original, 600, 900), original)
 
     def test_force_policy_distinguishes_content_from_service_failure(self):
         config_loader._config["novel"].update(max_retry=1, on_review_exhausted="force_and_flag")

@@ -1257,9 +1257,8 @@ def build_continue_prompt(chapter_num: int, plot_goal: str,
                           retry_feedback: str = "") -> str:
     last_part = first_half[-600:] if len(first_half) > 600 else first_half
     emotion_guide = EMOTION_GUIDE.get(emotion_tag, EMOTION_GUIDE["铺垫"])
-    word_target = cfg("novel", "chapter_word_target", 3500)
-    half_min = word_min // 2
-    half_max = word_max // 2
+    half_min = max(1, word_min - len(first_half) - 2)
+    half_max = max(half_min, word_max - len(first_half) - 2)
     hard_rules = _format_rule_block("硬约束（必须满足）", WRITER_HARD_CONSTRAINTS)
     forbidden_rules = _format_rule_block("禁止项（必须避免）", WRITER_FORBIDDEN_RULES)
 
@@ -1292,6 +1291,29 @@ def build_continue_prompt(chapter_num: int, plot_goal: str,
 {NEGATIVE_EXAMPLES}
 
 {retry_block}"""
+
+def _fit_chapter_length(content: str, minimum: int, maximum: int) -> str:
+    """超长时尝试精简全文，保留结尾和伏笔，最终仍由正常审核把关。"""
+    if len(content) <= maximum:
+        return content
+
+    target = (minimum + maximum) // 2
+    closing = re.split(r"(?<=[。！？!?])(?=[^。！？!?])", content.strip())[-1].strip()
+    shorter = clean_content(call_author_api(
+        system_prompt=(
+            "你是小说编辑。通过删除或缩短冗余内容精简全文，保留事实、关键线索和主角行动。"
+            "不得增加新内容，最后一句原样保留。只输出完整正文。"
+        ),
+        user_message=f"将以下正文精简到约 {target} 字，总字符数（含标点和换行）必须在 {minimum}–{maximum} 之间。\n\n{content}",
+        temperature=0.25,
+        max_tokens=min(int(maximum * 1.4), 7000),
+    ))
+    if minimum <= len(shorter) <= maximum and shorter.endswith(closing):
+        print(f"  [精简] 超长正文从 {len(content)} 字调整为 {len(shorter)} 字")
+        return shorter
+    print("  [精简] 未得到符合字数范围的版本，保留原稿供审稿判断")
+    return content
+
 
 def chapter_length_issue(content: str) -> str:
     size = len(content.strip())
@@ -1423,22 +1445,8 @@ def revise_chapter(novel_name: str, chapter_num: int,
         full_content = re.sub(r'\n{3,}', '\n\n', full_content)
         print(f"  补写完成，当前总字数：{len(full_content)}字")
 
+    full_content = _fit_chapter_length(full_content, word_min, word_max)
     total = len(full_content)
-    hard_limit = int(word_max * 1.2)
-    if total > hard_limit:
-        original_total = total
-        paragraphs = full_content.split('\n\n')
-        truncated = []
-        current_len = 0
-        for para in paragraphs:
-            if current_len + len(para) > hard_limit:
-                break
-            truncated.append(para)
-            current_len += len(para)
-        if truncated:
-            full_content = '\n\n'.join(truncated)
-            total = len(full_content)
-            print(f"  [裁剪] 字数{original_total}超过硬上限{hard_limit}，已裁剪至{total}字")
 
     print(f"  [OK] 第{chapter_num}章修改完成，总字数：{total}字")
     mm.save_chapter(
@@ -1648,23 +1656,8 @@ def write_chapter(novel_name: str, chapter_num: int,
         for w in cross_warnings:
             print(f"    ⚠ {w}")
 
+    full_content = _fit_chapter_length(full_content, word_min, word_max)
     total = len(full_content)
-
-    hard_limit = int(word_max * 1.2)
-    if total > hard_limit:
-        original_total = total
-        paragraphs = full_content.split('\n\n')
-        truncated = []
-        current_len = 0
-        for para in paragraphs:
-            if current_len + len(para) > hard_limit:
-                break
-            truncated.append(para)
-            current_len += len(para)
-        if truncated:
-            full_content = '\n\n'.join(truncated)
-            total = len(full_content)
-            print(f"  [裁剪] 字数{original_total}超过硬上限{hard_limit}，已裁剪至{total}字")
 
     print(f"  [OK] 第{chapter_num}章完成，总字数：{total}字（目标：{word_min}-{word_max}）")
 
