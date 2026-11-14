@@ -33,6 +33,8 @@ def main():
         parser.exit(2, "缺少网页依赖，请用项目 Python 执行 python -m pip install -r requirements-web.txt。\n")
     if not (STATIC / "index.html").is_file():
         parser.exit(2, "缺少网页构建文件，请先进入 web 目录执行 npm ci 和 npm run build。\n")
+    from core.model_quota import sync_quota
+    sync_quota()
     app = create_app()
     try:
         server = create_server(app, host="127.0.0.1", port=args.port, threads=4)

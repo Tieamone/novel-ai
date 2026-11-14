@@ -86,19 +86,13 @@ def string(data, key, maximum=1000000):
 
 
 def role_models(role, current):
-    options = {info["model"]: info for info in api_client.get_available_models(usage=role).values()}
-    if current not in options:
-        configured = next((info for info in api_client.get_available_models().values()
-                           if info["model"] == current), None)
-        provider = api_client.get_model_provider(role)
-        options[current] = configured or {
-            "model": current, "name": current, "provider": provider,
-            "env_key": "MIMO_API_KEY" if provider == "mimo" else "DASHSCOPE_API_KEY",
-        }
-    return options
+    return {info["model"]: info for info in api_client.get_available_models(usage=role).values()}
 
 
-def models():
+
+def models(refresh=False):
+    from core.model_quota import sync_quota, quota_status, quota_label
+    sync_quota(force=refresh)
     roles = {}
     for role, (label, getter, _) in ROLES.items():
         current = getter()
@@ -106,12 +100,15 @@ def models():
             "label": label, "current": current,
             "options": [
                 {"id": info["model"], "name": info["name"], "provider": info["provider"],
-                 "configured": bool(api_client._get_api_key(info["env_key"]))}
+                 "configured": bool(api_client._get_api_key(info["env_key"])),
+                 "quota_label": quota_label(info) if info["provider"] == "dashscope" else "",
+                 "quota": info.get("quota"), "quota_status": info.get("quota_status", "未知")}
                 for info in role_models(role, current).values()
             ],
         }
     return {
         "roles": roles,
+        "quota_sync": quota_status(),
         "usage": api_client.get_session_stats(),
         "failures": api_client.get_failure_stats(),
         "history": api_client.get_switch_history(),

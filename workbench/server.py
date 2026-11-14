@@ -155,6 +155,10 @@ def create_app():
     def model_options():
         return jsonify(actions.models())
 
+    @app.post("/api/models/refresh")
+    def refresh_models():
+        return jsonify(actions.models(refresh=True))
+
     @app.get("/api/template")
     def download_template():
         return send_from_directory(cli.get_project_root(), "newbook_template.txt", as_attachment=True)

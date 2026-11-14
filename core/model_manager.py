@@ -6,15 +6,6 @@ from core.config_loader import get_project_root
 load_dotenv(get_project_root() / ".env")
 
 # 模型分类和优先级
-# ==================== 模块级缓存（防止重复发现） ====================
-_discover_cache: list = None
-
-
-def _invalidate_discover_cache():
-    global _discover_cache
-    _discover_cache = None
-
-
 MODEL_CATEGORIES = {
     "qwen-turbo": {"category": "cost_effective", "priority": 1, "display_name": "qwen-turbo（高性价比）"},
     "qwen-plus": {"category": "balanced", "priority": 2, "display_name": "qwen-plus（平衡推荐）"},
@@ -70,7 +61,7 @@ def _load_custom_models() -> Optional[List[Dict]]:
                 "max_output_tokens": item.get("max_output_tokens"),
                 "input_price": item.get("input_price", category_info.get("input_price", DEFAULT_PRICING["input"])),
                 "output_price": item.get("output_price", category_info.get("output_price", DEFAULT_PRICING["output"])),
-                "has_free_quota": item.get("has_free_quota", True),
+                "has_free_quota": item.get("has_free_quota", False) if item.get("provider") == "mimo" else False,
                 "provider": item.get("provider", "dashscope"),
             })
         
@@ -101,8 +92,8 @@ def _parse_model_info_from_api(model_data: Dict) -> Optional[Dict]:
     input_price = DEFAULT_PRICING["input"]
     output_price = DEFAULT_PRICING["output"]
 
-    # 假设所有从 API 获取的模型都可能有免费额度
-    has_free_quota = True
+    # 免费状态必须由账号额度快照确认
+    has_free_quota = False
 
     return {
         "model": model_id,
@@ -129,7 +120,7 @@ def _get_default_qwen_models() -> List[Dict]:
             "context_length": 32768,
             "input_price": 0.0008,
             "output_price": 0.002,
-            "has_free_quota": True,
+            "has_free_quota": False,
             "provider": "dashscope",
         },
         {
@@ -140,7 +131,7 @@ def _get_default_qwen_models() -> List[Dict]:
             "context_length": 32768,
             "input_price": 0.0003,
             "output_price": 0.0006,
-            "has_free_quota": True,
+            "has_free_quota": False,
             "provider": "dashscope",
         },
         {
@@ -170,23 +161,13 @@ def _get_default_qwen_models() -> List[Dict]:
 
 def discover_all_models(refresh: bool = False) -> list:
     """
-    发现所有可用模型（通义千问），结果模块级缓存，避免重复打印日志。
-    优先读取 data/custom_models.json，其次用内置默认列表。
+    合并本地模型配置和额度快照；显式刷新时调用百炼 CLI。
     """
-    global _discover_cache
-    if _discover_cache is not None and not refresh:
-        return _discover_cache
+    from core.model_quota import merge_quota, sync_quota
+    if refresh:
+        sync_quota(force=True)
+    return merge_quota(_load_custom_models() or _get_default_qwen_models())
 
-    # 通义千问：优先 custom_models.json，否则用内置默认列表
-    custom = _load_custom_models()
-    if custom:
-        print(f"[模型发现] 从配置文件加载了 {len(custom)} 个自定义模型")
-        qwen_models = custom
-    else:
-        qwen_models = _get_default_qwen_models()
-
-    _discover_cache = qwen_models
-    return _discover_cache
 
 
 def get_models_for_usage(usage: str, top_k: int = 5) -> List[Dict]:
@@ -235,5 +216,7 @@ def model_list_to_menu_format(models: List[Dict]) -> Dict[str, Dict]:
             "env_key": env_key,
             "context_length": model.get("context_length", 0),  # 保留，供 is_high_capacity_model 使用
             "max_output_tokens": model.get("max_output_tokens"),
+            "quota": model.get("quota"),
+            "quota_status": model.get("quota_status", "未知"),
         }
     return menu

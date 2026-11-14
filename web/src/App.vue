@@ -113,6 +113,7 @@ async function loadLibrary() {
 async function loadBook() {
   const name = selected.value
   const version = ++bookRequest
+  const chapterVersion = chapterRequest
   if (!name) { book.value = null; return }
   busy.value = true
   sectionError.value = ''
@@ -132,7 +133,7 @@ async function loadBook() {
     book.value = data
     readAt.value = new Date().toLocaleTimeString('zh-CN')
     const current = data.chapters.find(row => row.chapter_num === chapter.value?.chapter_num)
-    if (view.value === 'chapters') await openChapter((current || data.chapters.at(-1))?.chapter_num)
+    if (view.value === 'chapters' && chapterVersion === chapterRequest) await openChapter((current || data.chapters.at(-1))?.chapter_num)
   } catch (error) {
     if (version === bookRequest) sectionError.value = error.message
   } finally {
@@ -142,6 +143,8 @@ async function loadBook() {
 
 async function openChapter(num) {
   const version = ++chapterRequest
+  chapter.value = null
+  sectionError.value = ''
   if (!num) { chapter.value = null; return }
   try {
     const data = await api('/chapter/' + num + '?' + params(selected.value))
@@ -151,16 +154,18 @@ async function openChapter(num) {
   }
 }
 
-async function loadModels() {
+async function loadModels(force = false) {
   const version = ++modelRequest
   modelBusy.value = true
+  sectionError.value = ''
   try {
-    const data = await api('/models')
+    const data = force === true ? await api('/models/refresh', {}) : await api('/models')
     if (version !== modelRequest) return
     modelForm.value = Object.fromEntries(Object.entries(data.roles).map(([key, role]) => {
       const draft = modelForm.value[key]
       const dirty = draft && draft !== models.value?.roles[key]?.current
-      return [key, dirty && role.options.some(item => item.id === draft) ? draft : role.current]
+      const selectedModel = dirty ? draft : role.current
+      return [key, role.options.some(item => item.id === selectedModel) ? selectedModel : '']
     }))
     models.value = data
   } catch (error) {
@@ -173,12 +178,13 @@ async function loadModels() {
 async function loadCheckpoint(num = checkpointNumber.value) {
   const version = ++checkpointRequest
   checkpointNumber.value = num
+  sectionError.value = ''
   checkpoint.value = null
   checkpointLoaded.value = null
   if (!num || !selected.value) return
   try {
     const data = await api('/checkpoint/' + num + '?' + params(selected.value))
-    if (version === checkpointRequest) {
+    if (version === checkpointRequest && checkpointNumber.value === num) {
       checkpoint.value = data
       checkpointLoaded.value = num
     }
@@ -197,6 +203,9 @@ watch(selected, name => {
   localStorage.setItem('novel-workbench-book', name)
   book.value = chapter.value = null
   intentDrafts.value = {}
+  styleForm.value = { style: '1', custom: '' }
+  dialog.value = null
+  notice.value = ''
   readAt.value = ''
   ++chapterRequest
   ++checkpointRequest
@@ -207,6 +216,8 @@ watch(selected, name => {
 })
 watch([view, selected], ([page]) => {
   query.value = filter.value = sectionError.value = ''
+  notice.value = ''
+  dialog.value = null
   if (page === 'models') {
     loadModels()
   } else {
@@ -237,15 +248,16 @@ async function start(kind, fields = {}, target = selected.value) {
   starting.value = true
   startingKind.value = kind
   sectionError.value = notice.value = ''
+  const submittedDialog = dialog.value
   try {
     const next = await api('/jobs', { ...fields, kind, novel: target })
-    dialog.value = null
+    if (dialog.value === submittedDialog) dialog.value = null
     receive(next)
     jobOpen.value = true
     if (!activeJob.value) await finished()
   } catch (error) {
-    if (dialog.value) dialog.value.error = error.message
-    else sectionError.value = error.message
+    if (submittedDialog && dialog.value === submittedDialog) submittedDialog.error = error.message
+    else if (selected.value === target) sectionError.value = error.message
   } finally {
     starting.value = false
     startingKind.value = ''
@@ -318,7 +330,7 @@ async function stop() {
 }
 
 function form(kind, title, fields = {}) {
-  dialog.value = { kind, title, fields, error: '' }
+  dialog.value = { kind, title, fields, novel: selected.value, error: '' }
 }
 
 function editForeshadow(row = {}) {
@@ -348,8 +360,8 @@ async function readFile(event, key) {
 }
 
 function submit() {
-  const { kind, fields } = dialog.value
-  start(kind, fields, kind === 'create' ? fields.name.trim() : selected.value)
+  const { kind, fields, novel } = dialog.value
+  start(kind, fields, kind === 'create' ? fields.name.trim() : novel)
 }
 
 onMounted(async () => {
@@ -403,8 +415,10 @@ onBeforeUnmount(() => window.clearTimeout(timer))
         <div v-else-if="notice && (view !== 'models' || job?.kind !== 'models')" class="feedback" role="status">{{ notice }} <button @click="notice = ''">关闭</button></div>
 
         <template v-if="view === 'models'">
-          <div class="heading"><div><p class="kicker">会话配置</p><h1>模型与费用</h1></div><button :disabled="modelBusy" @click="loadModels">{{ modelBusy ? '读取中…' : '刷新' }}</button></div>
+          <div class="heading"><div><p class="kicker">会话配置</p><h1>模型与费用</h1></div><button :disabled="modelBusy" @click="loadModels(true)">{{ modelBusy ? '同步中…' : '立即刷新免费额度' }}</button></div>
           <div v-if="models" class="stack">
+            <p class="muted" role="status">北京区额度快照：{{ models.quota_sync?.synced_at ? new Date(models.quota_sync.synced_at).toLocaleString('zh-CN') : '尚未同步' }}。启动或进入本页时，距上次成功同步超过 24 小时才自动更新；余额非实时。</p>
+            <p v-if="models.quota_sync?.stale || models.quota_sync?.error" class="error" role="alert">{{ models.quota_sync.error || '额度快照已过期' }}；旧数据仅供参考，可点击刷新重试。</p>
             <div class="metrics">
               <div><span>本次费用</span><strong>{{ money(models.usage.total_cost_yuan) }}</strong></div>
               <div><span>成功调用</span><strong>{{ size(models.usage.total_calls) }}</strong></div>
@@ -414,11 +428,14 @@ onBeforeUnmount(() => window.clearTimeout(timer))
               <h2>角色模型</h2>
               <div class="field-grid">
                 <label v-for="(role, key) in models.roles" :key="key">{{ role.label }}
-                  <select v-model="modelForm[key]" :disabled="verifying || modelBusy">
+                  <select v-model="modelForm[key]" :disabled="verifying || modelBusy" required>
+                    <option value="" disabled>{{ role.options.length ? '请选择有免费额度的模型' : '暂无有额度的文本模型，请刷新额度' }}</option>
                     <option v-for="option in role.options" :key="option.id" :value="option.id" :disabled="!option.configured && option.id !== role.current">
-                      {{ option.name }}{{ option.configured ? '' : '（缺少密钥）' }}
+                      {{ option.name }}{{ option.configured ? '' : '（缺少密钥）' }}{{ option.quota_label ? ' · ' + option.quota_status : '' }}
                     </option>
                   </select>
+                  <span v-if="role.options.some(option => option.id === modelForm[key] && option.quota_status === '有额度')" class="muted">{{ role.options.find(option => option.id === modelForm[key])?.quota_label }}</span>
+                  <span v-else class="muted">当前选择不在免费额度候选中，请重新选择。</span>
                 </label>
               </div>
               <div><button class="primary" :disabled="activeJob || starting || modelBusy">{{ verifying ? '验证中…' : '验证并保存' }}</button></div>
@@ -516,7 +533,7 @@ onBeforeUnmount(() => window.clearTimeout(timer))
                   <div class="actions">
                     <button v-if="chapter.status === '审稿失败'" class="primary" :disabled="activeJob"
                       @click="form('recover', '恢复审稿失败', { chapter: chapter.chapter_num, method: '1' })">恢复审稿</button>
-                    <button :disabled="activeJob || !chapter.content" @click="start('export', { chapter: chapter.chapter_num })">导出 TXT</button>
+                    <button :disabled="activeJob || !chapter.content || !approval.includes(chapter.status)" @click="start('export', { chapter: chapter.chapter_num })">导出 TXT</button>
                     <button class="danger-text" :disabled="activeJob"
                       @click="form('delete_chapters', '删除本章', { first: chapter.chapter_num, last: chapter.chapter_num, confirm: '', single: true })">删除</button>
                   </div>

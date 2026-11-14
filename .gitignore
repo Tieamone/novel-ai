@@ -46,3 +46,7 @@ Thumbs.db
 output/
 sensitive_words.txt
 node_modules/
+
+# 本机账号额度快照
+data/model_quota_cache.json
+data/model_quota_cache.tmp

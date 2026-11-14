@@ -118,19 +118,18 @@ def _get_dashscope_base_url() -> str:
 
 def get_available_models(refresh: bool = False, usage: str = None) -> dict:
     global _available_models
-    if _available_models is None or refresh:
-        try:
-            from core.model_manager import discover_all_models, model_list_to_menu_format
-            models = discover_all_models(refresh=refresh)
-            _available_models = model_list_to_menu_format(models)
-        except Exception as e:
-            print(f"[警告] 动态模型发现失败，使用默认模型：{e}")
-            _available_models = AVAILABLE_MODELS
+    try:
+        from core.model_manager import discover_all_models, model_list_to_menu_format
+        models = discover_all_models(refresh=refresh)
+        _available_models = model_list_to_menu_format(models)
+    except Exception as e:
+        print(f"[警告] 免费模型列表读取失败，请刷新额度：{e}")
+        _available_models = {}
 
     if usage:
         try:
             from core.model_manager import get_models_for_usage, model_list_to_menu_format
-            filtered_models = get_models_for_usage(usage, top_k=30)
+            filtered_models = get_models_for_usage(usage, top_k=None)
             return model_list_to_menu_format(filtered_models)
         except Exception as e:
             print(f"[警告] 模型筛选失败，返回所有模型：{e}")
@@ -858,6 +857,8 @@ def call_reader_reviewer_api(system_prompt: str, user_message: str,
 # ==================== 交互式模型选择 ====================
 
 def select_model_interactive() -> dict:
+    from core.model_quota import sync_quota, quota_label, quota_status
+    sync_quota()
     global _author_model, _author_provider
     global _reviewer_model, _reviewer_provider
     global _reader_reviewer_model, _reader_reviewer_provider
@@ -881,7 +882,7 @@ def select_model_interactive() -> dict:
             else:
                 price_str = f"输入¥{inp * 1000:.2f}/百万token  输出¥{out * 1000:.2f}/百万token"
             print(_console_safe(f"  {key}. {info['name']:<38} [{status}]"))
-            print(_console_safe(f"      {price_str}"))
+            print(_console_safe(f"      {quota_label(info) if info['provider'] == 'dashscope' else price_str}"))
 
         default_choice = "1"
         for key, info in models.items():
@@ -889,14 +890,22 @@ def select_model_interactive() -> dict:
                 default_choice = key
                 break
 
-        print()
+        print("  R. 立即刷新免费额度")
+        print(f"  额度快照：{quota_status()['synced_at'] or '尚未同步'}（北京区；余额非实时）")
         choice = input(f"请选择作者模型（直接回车默认选{default_choice}，当前：{_author_model}）：",
-                       options=tuple((key, info["name"]) for key, info in models.items())).strip() or default_choice
+                       options=tuple((key, info["name"]) for key, info in models.items()) + (("R", "立即刷新免费额度"),)).strip() or default_choice
+
+        if choice.lower() == "r":
+            sync_quota(force=True)
+            continue
 
         if choice not in models:
             print("[提示] 无效选择，使用默认模型")
             choice = default_choice
 
+        if not models:
+            print("[提示] 暂无有额度的文本模型，请输入 R 刷新额度，或按 Ctrl+C 返回。")
+            continue
         selected = models[choice]
 
         api_key_val = os.getenv(selected["env_key"], "")
@@ -971,6 +980,8 @@ def select_all_models_interactive():
 
 
 def _select_single_model(prompt_title: str, default: str, usage: str = None) -> dict:
+    from core.model_quota import sync_quota, quota_label, quota_status
+    sync_quota()
     while True:
         print("-" * 60)
         models = get_available_models(usage=usage)
@@ -986,16 +997,24 @@ def _select_single_model(prompt_title: str, default: str, usage: str = None) -> 
             else:
                 price_str = f"输入¥{inp * 1000:.2f}/百万  输出¥{out * 1000:.2f}/百万"
             print(_console_safe(f"  {key}. {info['name']:<32} [{status}]"))
-            print(_console_safe(f"      {price_str}"))
+            print(_console_safe(f"      {quota_label(info) if info['provider'] == 'dashscope' else price_str}"))
 
-        print()
+        print("  R. 立即刷新免费额度")
+        print(f"  额度快照：{quota_status()['synced_at'] or '尚未同步'}（北京区；余额非实时）")
         choice = input(f"请选择{prompt_title}（直接回车默认选{default}）：",
-                       options=tuple((key, info["name"]) for key, info in models.items())).strip() or default
+                       options=tuple((key, info["name"]) for key, info in models.items()) + (("R", "立即刷新免费额度"),)).strip() or default
+
+        if choice.lower() == "r":
+            sync_quota(force=True)
+            continue
 
         if choice not in models:
             print("[提示] 无效选择，使用默认")
             choice = default
 
+        if not models:
+            print("[提示] 暂无有额度的文本模型，请输入 R 刷新额度，或按 Ctrl+C 返回。")
+            continue
         selected = models[choice]
 
         api_key_val = os.getenv(selected["env_key"], "")
