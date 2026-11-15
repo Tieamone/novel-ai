@@ -62,18 +62,21 @@ READER_REVIEW_PROMPT = """请从读者视角评估以下章节。
 - 重大设定矛盾：与前文已建立的事实直接冲突（死亡人物复活等）
 - 文风突变：叙事视角、人称或整体风格发生无法接受的剧变
 
-请严格按以下JSON格式输出，不要任何其他内容：
+只输出一个合法 JSON 对象。pass 和 veto_triggered 必须是 JSON 布尔值。
+四项分数分别为 0–25 的整数，score_total 必须等于四项分数之和。
+issues 最多列三条，没有时写空数组；veto_reason 仅在命中否决时填写。
+以下是结构示例，结论和分数须依据正文填写：
 {{
-  "pass": true/false,
-  "score_total": 0-100,
-  "score_ai_authenticity": 0-25,
-  "score_logic": 0-25,
-  "score_consistency": 0-25,
-  "score_readability": 0-25,
+  "pass": true,
+  "score_total": 84,
+  "score_ai_authenticity": 20,
+  "score_logic": 22,
+  "score_consistency": 23,
+  "score_readability": 19,
   "veto_triggered": false,
   "veto_reason": "",
-  "issues": ["具体问题（引用原文句子）", "具体问题2"],
-  "suggestions": "具体可执行的改进建议"
+  "issues": [],
+  "suggestions": ""
 }}"""
 
 
