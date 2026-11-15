@@ -79,30 +79,29 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
 - 如果某层没有问题，该层应给出接近满分的评分，不要无故扣分
 - 通过时 suggestions 写"质量合格"，不通过时给出可执行的修订建议
 
-严格只输出JSON，不要解释，不要Markdown：
+只输出一个合法 JSON 对象。pass 必须是 JSON 布尔值。评分字段都是整数；
+score_total 必须等于 score_l1 + score_l2 + score_l3，请计算后填入。
+问题列表最多各列三条，所有理由和建议简明。没有问题时用空数组。
+下面是通过时的结构示例，数值和结论请依据正文填写：
 {
-  "pass": true/false,
-  "score_total": 0-100整数,
-  "score_l1": 0-45整数,
-  "score_l2": 0-25整数,
-  "score_l3": 0-30整数,
-  "veto_items": [
-    {"code": "setting_conflict|timeline_break|core_ooc|critical_payoff_missing", "reason": "命中理由（需引用正文具体段落）"}
-  ],
-  "l1_issues": ["具体问题描述"],
-  "l2_issues": ["具体问题描述"],
-  "l3_issues": ["具体问题描述，注明类型（emotion_labeling/cliche_action/cliche_ending/psych_ending/parallel_abuse/rhythm_flat/metaphor_overload/注水/缺对话等），并引用原文具体句子"],
-  "failure_attribution": {
-    "primary_layer": "L1|L2|L3|none",
-    "root_cause": "最关键失败原因（一句话），若通过写none",
-    "severity": "high|medium|low|none"
-  },
-  "redundancy_score": 0-10整数,
-  "cut_suggestions": [
-    {"start": "可裁切段落的首句（10字以内）", "reason": "裁切理由"}
-  ],
-  "suggestions": "失败时给出具体可执行的修订建议（指出需要改哪段、怎么改）；通过写质量合格"
-}"""
+  "pass": true,
+  "score_total": 85,
+  "score_l1": 38,
+  "score_l2": 21,
+  "score_l3": 26,
+  "veto_items": [],
+  "l1_issues": [],
+  "l2_issues": [],
+  "l3_issues": [],
+  "failure_attribution": {"primary_layer": "none", "root_cause": "none", "severity": "none"},
+  "redundancy_score": 8,
+  "cut_suggestions": [],
+  "suggestions": "质量合格"
+}
+否决项格式为 {"code": "setting_conflict", "reason": "用原文说明冲突"}，code 从上列四项选择。
+可裁切项格式为 {"start": "段落的首句", "reason": "具体理由"}。
+失败归因的 primary_layer 为 L1、L2 或 L3，severity 为 high、medium 或 low。
+不通过时注明具体问题、原文证据和可执行的修订建议。"""
 
 FORESHADOW_REVIEWER_SYSTEM = """你是伏笔专项审核员。先执行逐项证据检查，再给本章评分。候选描述是待证实的主张，不能当成正文事实。
 
