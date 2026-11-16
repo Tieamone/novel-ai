@@ -1,5 +1,7 @@
 # AI 思维链 / 记忆体
 
+宏观策划只设计主线必要的伏笔，可以为空。写作、修订和主审读取当前章的大纲安排，历史动态伏笔不再按年龄自动兑现。写作默认以人物行动和剧情结果为主，环境简写，常规过程概述结果，打磨保留精简稿，低于字数下限时由后续检查报告。
+
 ## 当前上下文
 
 **时间**: 2026-05-19
@@ -47,7 +49,7 @@
   - 导入创建：`main.py` 只做了存大纲→存世界观→存角色→任务卡，完全跳过了伏笔生成
 - **修复**: 在 `main.py` 导入流程中，`split_outline_to_tasks()` 之前添加 `generate_outline_foreshadow(novel_name, target_chapters, review_mode=False)`
 - **位置**: [main.py:L1919-L1920](file:///d:/novel-ai/main.py#L1919-L1920)
-- **效果**: 导入的小说将自动生成 20-30 条大纲伏笔，并经过 `review_outline_foreshadow()` 审稿过滤
+- **效果**: 导入的小说将自动生成 少量必要的大纲伏笔，并经过 `review_outline_foreshadow()` 审稿过滤
 - **幂等性**: 如果伏笔已存在，会自动跳过
 
 ### 2026-05-14 (2): PROJECT_PROFILE.md 全面重写

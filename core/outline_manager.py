@@ -7,6 +7,41 @@ from core.config_loader import get_data_dir
 from core.interaction import ask as input, say as print
 
 
+MACRO_FORESHADOW_SYSTEM = """你是网络小说宏观策划师。先确定主线转折和人物选择，再判断哪些结果需要提前铺垫。
+只设计不可缺少的少量伏笔；不按章节间隔填充，不强凑数量，不拆成一串关联小谜团。
+伏笔不必表现为神秘物件或异常现象，可以是自然出现的规则、能力或人物选择。
+description 使用固定格式「埋入：读者能看见的事实；兑现：后续事件；必要性：这个结果为什么需要提前铺垫」。
+不得提前在埋入章泄露答案。只服务已有大纲，不另造支线；无必要伏笔时返回 []。
+"""
+
+
+def format_chapter_foreshadow(ctx: dict, chapter_num: int) -> str:
+    """写作、节拍与审稿共用本章安排，不将旧库逾期提示当作任务。"""
+    tasks = ctx.get("outline_tasks")
+    if tasks is None:
+        tasks = get_chapter_outline_tasks(ctx.get("novel_name", ""), chapter_num,
+                                          readonly=ctx.get("readonly", False))
+    lines = ["【本章伏笔安排（唯一执行清单，优先于旧任务卡中的泛化埋线要求）】"]
+    for key, label in (("to_plant", "埋入：仅呈现铺垫，不泄露兑现答案"),
+                       ("to_resolve", "兑现：通过本章行动落实结果")):
+        for task in tasks.get(key, []):
+            lines.append(f"- {label} [{task['fid']}] {task['description']}")
+    if len(lines) == 1:
+        lines.append("本章无伏笔任务。")
+    lines.append("不自行新增需要后续解释的秘密，不因旧伏笔沉睡或逾期就提前兑现。")
+    return "\n".join(lines)
+
+
+def _chapter_foreshadow_description(description: str, action: str) -> str:
+    """大纲保留设计理由，章级任务只看当前动作；兼容旧版自由文本。"""
+    parts = re.split(r'[；;\n]\s*兑现[：:]\s*', description.strip(), maxsplit=1)
+    if len(parts) != 2 or not re.match(r'^埋入[：:]', parts[0]):
+        return description
+    if action == 'plant':
+        return parts[0][len('埋入：'):].strip()
+    return re.split(r'[；;\n]\s*必要性[：:]', parts[1], maxsplit=1)[0].strip()
+
+
 def _fix_llm_json(raw: str) -> str:
     """修复 LLM 返回的 JSON 中常见问题（未转义引号、多余逗号等）"""
     # 修复未转义的引号：在 JSON 字符串值内部，将裸露的 " 转为 \"
@@ -178,9 +213,10 @@ def delete_outline_foreshadow(novel_name: str, fid: str) -> bool:
             return cur.rowcount > 0
 
 
-def get_chapter_outline_tasks(novel_name: str, chapter_num: int, *, readonly=False) -> dict:
+def get_chapter_outline_tasks(novel_name: str, chapter_num: int, *, readonly=False,
+                              for_planning=False) -> dict:
     """
-    返回当前章节的大纲伏笔任务，供任务卡生成时注入。
+    返回本章伏笔任务。提前编写任务卡时也包含尚未埋入的未来兑现安排。
     失败时返回空 dict，不抛异常。
     """
     empty = {"to_plant": [], "to_resolve": []}
@@ -198,12 +234,14 @@ def get_chapter_outline_tasks(novel_name: str, chapter_num: int, *, readonly=Fal
                 "SELECT fid, description, importance "
                 "FROM outline_foreshadowing "
                 "WHERE novel_name=? AND resolve_chapter=? "
-                "AND (status='planted' OR (status='planned' AND plant_chapter=resolve_chapter))",
-                (novel_name, chapter_num),
+                "AND (status='planted' OR (status='planned' AND (plant_chapter=resolve_chapter OR ?)))",
+                (novel_name, chapter_num, for_planning),
             ).fetchall()
         return {
-            "to_plant": [dict(r) for r in to_plant],
-            "to_resolve": [dict(r) for r in to_resolve],
+            "to_plant": [{**r, "description": _chapter_foreshadow_description(r["description"], "plant")}
+                         for r in to_plant],
+            "to_resolve": [{**r, "description": _chapter_foreshadow_description(r["description"], "resolve")}
+                           for r in to_resolve],
         }
     except Exception:
         return empty
@@ -264,29 +302,17 @@ def ai_suggest_outline_foreshadow(novel_name: str, *, strict=False):
         pass
 
     # 4. 调用作者模型
-    system_prompt = (
-        "你是专业的网络小说策划师，专精伏笔架构设计。\n"
-        "伏笔设计原则：\n"
-        "1. 伏笔是\"悬而未决的问题\"，每个伏笔应让读者产生疑问并渴望答案\n"
-        "2. 重要伏笔应有2-3个关联伏笔形成链条（暗示→强化→揭示），提高回收满足感\n"
-        "3. 每5-8章至少安排一个伏笔埋入或兑现，避免前密后疏\n"
-        "4. 世界观伏笔作为背景悬疑，情节伏笔驱动冲突，人物伏笔增加共情，宏观悬念贯穿全书\n"
-        "5. 重要度要有层次：不是所有伏笔都5星，穿插2-3星小悬念，大伏笔之间用小伏笔填充\n"
-        "6. 兑现不能早于埋入后10章，给读者发现和讨论的时间\n"
-        "7. 不要把\"事件倒计时\"当成伏笔——\"7天后护山大阵崩了\"是事件节点，不是伏笔，真正的伏笔是\"阵基处有一行不属于魔宗的刻字\"\n"
-        "8. 不要把\"确定性结果\"当成伏笔——\"XX人被击败\"\"XX地陷落\"是剧情推进的结果，不是伏笔，伏笔需挖掘事件中隐藏的\"秘密/原因/起源\"\n"
-        "9. 真正的伏笔必须包含\"悬而未决的问题\"，让读者产生疑问并渴望答案"
-    )
+    system_prompt = MACRO_FORESHADOW_SYSTEM
     user_message = (
         f"=== 小说总大纲 ===\n{outline_text}\n\n"
         f"当前已完成章节：第{max_chapter}章\n"
         f"目标总章节：{target_str}章\n\n"
-        "请根据大纲，设计20-30个关键伏笔，要求：\n"
+        "请根据大纲，只设计对已有主线确有必要的少量伏笔，可返回空数组，要求：\n"
         "1. 每个伏笔必须有明确的埋入章节和兑现章节\n"
         f"2. 埋入章节必须大于第{max_chapter}章（已完成章节不可再埋）\n"
         "3. 分类：情节伏笔/人物伏笔/世界观/宏观悬念\n"
-        "4. 重要度1-5分，至少30%的伏笔重要度不超过3分\n"
-        "5. 覆盖全章范围：在前期(前15%)、中期(15%-75%)、后期(75%-100%)都有伏笔分布\n"
+        "4. 重要度1-5分，不按重要度配额凑数量\n"
+        "5. 围绕必要转折安排，不要求每个阶段都有伏笔\n"
         "6. 不要生成倒计时/限期类伪伏笔\n"
         "7. 不要在伏笔描述中写\"XX天后\"等明确时间期限\n"
         "8. 严格输出JSON数组，不要任何其他内容：\n"
@@ -473,7 +499,7 @@ def generate_outline_foreshadow(novel_name: str, target_chapters: int,
         print("\n" + "-" * 50)
         print("  大纲伏笔生成")
         print("-" * 50)
-        print("  AI 将根据大纲自动设计 20-30 条伏笔，你可以逐条确认或批量录入")
+        print("  AI 将根据主线需要设计少量伏笔，允许没有伏笔，你可以逐条确认或批量录入")
         ai_suggest_outline_foreshadow(novel_name)
     else:
         # 非交互模式：直接用 AI 全部录入
@@ -484,27 +510,15 @@ def generate_outline_foreshadow(novel_name: str, target_chapters: int,
         if not outline_text:
             return 0
 
-        system_prompt = (
-            "你是专业的网络小说策划师，专精伏笔架构设计。\n"
-            "伏笔设计原则：\n"
-            "1. 伏笔是\"悬而未决的问题\"，每个伏笔应让读者产生疑问并渴望答案\n"
-            "2. 重要伏笔应有2-3个关联伏笔形成链条（暗示→强化→揭示）\n"
-            "3. 每5-8章至少安排一个伏笔埋入或兑现\n"
-            "4. 世界观伏笔作为背景悬疑，情节伏笔驱动冲突，人物伏笔增加共情，宏观悬念贯穿全书\n"
-            "5. 重要度要有层次，至少30%不超过3分\n"
-            "6. 兑现不能早于埋入后10章\n"
-            "7. 不要把\"事件倒计时\"当成伏笔——\"7天后护山大阵崩了\"是事件节点，不是伏笔，真正的伏笔是\"阵基处有一行不属于魔宗的刻字\"\n"
-            "8. 不要把\"确定性结果\"当成伏笔——\"XX人被击败\"\"XX地陷落\"是剧情推进的结果，不是伏笔，伏笔需挖掘事件中隐藏的\"秘密/原因/起源\"\n"
-            "9. 真正的伏笔必须包含\"悬而未决的问题\"，让读者产生疑问并渴望答案"
-        )
+        system_prompt = MACRO_FORESHADOW_SYSTEM
         user_message = (
             f"=== 小说总大纲 ===\n{outline_text}\n\n"
             f"目标总章节：{target_chapters}章\n\n"
-            "请根据大纲，设计20-30个关键伏笔。\n"
+            "请根据大纲，只设计对已有主线确有必要的少量伏笔，可返回空数组。\n"
             "1. 每个伏笔必须指定埋入章节和兑现章节\n"
             "2. 分类：情节伏笔/人物伏笔/世界观/宏观悬念\n"
-            "3. 重要度1-5分，至少30%不超过3分\n"
-            "4. 全章范围均匀分布\n"
+            "3. 重要度1-5分，不按配额凑数量\n"
+            "4. 围绕主线需要安排，不要求均匀分布\n"
             "5. 不要生成倒计时/限期类伪伏笔\n"
             "6. 不要在伏笔描述中写\"XX天后\"等明确时间期限\n"
             "7. 严格输出JSON数组：\n"
@@ -541,7 +555,7 @@ def generate_outline_foreshadow(novel_name: str, target_chapters: int,
             print(f"  [调试] 匹配到的内容前200字: {json_match.group()[:200]}")
             return 0
 
-        if not isinstance(suggestions, list):
+        if not isinstance(suggestions, list) or not suggestions:
             return 0
 
         try:
@@ -617,6 +631,8 @@ def review_outline_foreshadow(novel_name, suggestions, outline_text, character_p
     Returns:
         dict: {index: {"passed": bool, "issues": [str], "suggestion": str}}
     """
+    if not suggestions:
+        return {}
     suggestions_text = json.dumps(suggestions, ensure_ascii=False, indent=2)
 
     system_prompt = (
@@ -625,7 +641,7 @@ def review_outline_foreshadow(novel_name, suggestions, outline_text, character_p
         "1. 生硬：伏笔是否过于刻意、矫揉造作，不自然\n"
         "2. OOC：伏笔是否违反人物设定（需对照人物档案判断）\n"
         "3. 基调一致性：伏笔是否与大纲的整体氛围、风格一致\n"
-        "4. 分布合理性：伏笔的埋入章节是否分布均匀，是否过于集中\n\n"
+        "4. 分布合理性：是否确实服务大纲中的转折或选择，是否有多余的小谜团；不要求均匀分布\n\n"
         "审查规则：\n"
         "- 只要任一维度不通过，该伏笔就判定为不通过(passed=false)\n"
         "- 给出具体的问题描述和建议\n"
@@ -717,7 +733,7 @@ def _revise_single_foreshadow(foreshadow: dict, review_item: dict,
     system_prompt = (
         "你是专业的网络小说策划师，负责根据审稿意见修正伏笔设计。\n"
         "修正原则：\n"
-        "1. 保持伏笔的核心悬念不变，只调整呈现方式使其更自然\n"
+        "1. 先判断主线是否确实需要；无必要则返回空对象 {}，不要为了保留悬念继续改造\n"
         "2. 必须紧贴人物设定和世界观，不能凭空编造\n"
         "3. 修正后的伏笔描述要具体、可执行，不要空泛\n"
         "4. 严格输出JSON对象，不要任何其他内容"
@@ -758,7 +774,7 @@ def _revise_single_foreshadow(foreshadow: dict, review_item: dict,
         return None
 
     revised = _parse_json_robust(json_match.group())
-    if revised is None or not isinstance(revised, dict):
+    if not revised or not isinstance(revised, dict):
         print(f"    [修正] JSON 解析失败")
         return None
 

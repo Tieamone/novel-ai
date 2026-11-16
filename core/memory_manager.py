@@ -840,6 +840,10 @@ class MemoryManager:
                 (chapter_num,),
             ).fetchone() is not None
 
+        from core.outline_manager import get_chapter_outline_tasks
+        outline_tasks = get_chapter_outline_tasks(self.novel_name, chapter_num, readonly=self.readonly)
+
+        # 伏笔提示仅供体检和策划参考，不是作者执行清单。
         # 伏笔提示（基于已加载的活跃伏笔，不再额外查 DB）
         foreshadow_hints = self._get_foreshadow_hints_from_list(
             active_foreshadowing, chapter_num
@@ -853,6 +857,7 @@ class MemoryManager:
             "characters":           characters,
             "active_foreshadowing": active_foreshadowing,
             "foreshadow_hints":     foreshadow_hints,
+            "outline_tasks":        outline_tasks,
             "recent_summaries":     recent_summaries,
             "summary_history_incomplete": covers_target,
             "chapter_num":          chapter_num,

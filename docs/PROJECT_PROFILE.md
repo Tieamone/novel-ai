@@ -1,5 +1,7 @@
 # AI 网文写作系统 - 项目白皮书
 
+宏观策划只设计主线必要的伏笔，可以为空。写作、修订和主审读取当前章的大纲安排，历史动态伏笔不再按年龄自动兑现。写作默认以人物行动和剧情结果为主，环境简写，常规过程概述结果，打磨保留精简稿，低于字数下限时由后续检查报告。
+
 ## 1. 项目概况
 
 | 属性         | 说明                                                         |
@@ -93,7 +95,7 @@ run_planner(novel_name, genre, keywords)                       # [core/planner.p
   │
   ├─ Step 1.6: generate_outline_foreshadow(novel_name, ...)   # [core/outline_manager.py:L349]
   │   ↓ 调用 ai_suggest_outline_foreshadow() 或直接 AI 生成
-  │   ↓ 输出：20-30 条大纲伏笔 → outline_foreshadowing 表
+  │   ↓ 输出：少量必要的大纲伏笔 → outline_foreshadowing 表
   │
   ├─ Step 2: get_characters_choice(outline)                   # [core/planner.py:L431]
   │   ↓ 调用 call_author_api() 提取或手动输入角色名单
@@ -131,7 +133,7 @@ main() → _import_from_text_file()
   ↓ 写入大纲、世界观（合并时间线/核心冲突）、角色档案
   ↓ get_style_choice() → style_key
   ↓ generate_outline_foreshadow(novel_name, target_chapters)   # [core/outline_manager.py:L375]
-  │   ↓ 读取 master_outline.md → AI 生成 20-30 条伏笔建议
+  │   ↓ 读取 master_outline.md → AI 生成 少量必要的伏笔建议
   │   ↓ review_outline_foreshadow() 审稿过滤
   │   ↓ 写入 outline_foreshadowing 表
   ↓ split_outline_to_tasks(..., full_batch=True)
@@ -299,7 +301,7 @@ manage_outline_foreshadow(novel_name)    # [core/outline_manager.py:L459]
   └─ 5. AI 辅助生成伏笔建议
        ai_suggest_outline_foreshadow(novel_name)  # [core/outline_manager.py:L166]
          ↓ 读取 master_outline.md + 目标章数
-         ↓ 调用 call_author_api() → 20-30 条伏笔建议
+         ↓ 调用 call_author_api() → 少量必要的伏笔建议
          ↓ 用户选择：全部录入 / 逐条确认 / 取消
          ↓ add_outline_foreshadow() 逐条写入
 ```

@@ -1,3 +1,4 @@
+from core.outline_manager import format_chapter_foreshadow
 import json
 import re
 from datetime import datetime
@@ -17,12 +18,15 @@ REVIEW_PASS_L1 = 30
 
 REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职责是判断章节是否达到发布标准。
 
+先核对任务卡里的章节终点，再评分。如果任务卡明确写了“到这里就停”“本章尚未发生”或类似限制，核对正文有没有越过它。遇到越界，必须在 veto_items 写入 past_chapter_goal，逐字引用第一处越界正文，pass 为 false，即使本章目标已经达成也不能放行。
+例如任务卡写“约好次日验收就停”，正文写“次日，他把样品摆上验收台”已经进入下一场，哪怕还没验收完也要否决。正文只写“明早带样品过来”仍在本章范围。
+
 你深知好的网文应该具备哪些特质：
 - 情节推进有逻辑，人物行为有动机
-- 场景有具体的感官细节，而非空泛描述
+- 场景信息足以理解行动，无效环境、感官和重复心理描写应删减
 - 对话有潜台词，不是说明书式的信息传递
-- 情绪通过行为和生理反应展示，而不是直接贴标签
-- 每章结束时，读者会忍不住往下翻
+- 情绪表达简洁清楚，允许直述，不要求转换成生理反应
+- 章节停在任务目标达成或人物作出选择的地方，允许自然收束
 
 必须执行三层评分并给出结构化归因：
 
@@ -33,18 +37,18 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
 - 场景连贯性：上一章的状态与本章开头是否衔接正常
 
 【L2 伏笔与剧情承接】0-25分
-- 历史未兑现伏笔是否被无视或误解
-- 新增伏笔是否自然嵌入、服务后续
+- 只核对本章安排，不因历史伏笔未处理扣分，无伏笔任务是正常情况
+- 是否擅自新增需要后续解释的秘密；即使自然，也要求删除或改成普通事实
 - 本章是否完成"目标导向推进"（任务卡目标是否达成）
 - 章节内部因果是否完整：有起因、有经过、有结果或悬念
 
 【L3 可读性与网文节奏】0-30分
 
 → AI痕迹检测（最高优先级，每类每处扣2-4分）：
-- 情绪标签直陈（emotion_labeling）：直接写"她感到紧张/他心中涌起/她不禁感动/他意识到"，而非通过行为或生理反应表达
+- 情绪标签直陈（emotion_labeling）：反复解释同一种情绪且没有新增信息；简洁直述情绪或认知不扣分
 - 高频烂俗动作（cliche_action）：深吸一口气平复情绪、握紧拳头下定决心、瞳孔收缩察觉危险、喉咙发紧、脑海浮现
 - 模板收束句（cliche_ending）："这才刚开始/路还很长/无论前方有多少困难/故事远未结束"，每出现一次扣3-5分
-- 心理陈述结尾（psych_ending）：以"她决定了/他知道该怎么做了"等直接心理陈述收章，扣3分
+- 心理陈述结尾（psych_ending）：没有具体行动内容的空泛表态扣3分；明确下一步选择不扣分
 - 先总结后展开（summary_then_expand）：段落以概括性总结句开头，再展开细节（如"总的来说…"/"简单来说…"/"概括一下…"），扣2-3分
 - 三段式收尾（triple_ending）：结尾连续三段呈现"冲突→反思→升华"固定结构（如"虽然困难…但他明白了…从此以后…"），扣3-5分
 - 强行正能量升华（forced_positive）：结尾强行转向积极/励志/哲理，与前文情绪基调不符（如"虽然失败了，但他收获了成长"），扣3-5分
@@ -56,9 +60,11 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
 - 有效推进：是否有冲突升级、信息新增或关系变化（无推进扣5分）
 - 结尾驱动力：读者读完想不想翻下一章
 - 比喻堆砌（metaphor_overload）：平叙段每500字超过2处比喻/拟人（扣5-8分）
-- 缺实质性对话：全章少于2轮有来有回的对话（扣3-5分）
+- 缺实质性对话：必要交涉未写清才扣分，不按对话轮数设下限
 
 → 冗余检测（redundancy）：
+- 常规办事过程没有阻碍却逐步描写时，要求合并概述。赶路、安装、签字、核对和收纳不必逐一展开。关键凭证保留取得事实即可，不因它是伏笔就描写折叠、位置和意义
+- 对话已交代结果，再补表情、脚步声、心理盘算属于重复。修订应删除或合并，不换成另一组动作
 - 标注可裁切的段落（给出段落首句和裁切理由）
 - 标注可精简的对话（哪些对话对情节无贡献）
 - 评分 0-10（10=无冗余，0=大量水字数）
@@ -67,7 +73,9 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
 1) 核心设定冲突（setting_conflict）：与已建立的世界规则或关键事实直接矛盾
 2) 重大时间线矛盾（timeline_break）：事件顺序或时间跨度出现无法自圆其说的矛盾
 3) 主角或核心角色严重OOC（core_ooc）：无任何触发事件的性格或立场突变
-4) 关键承诺伏笔被硬性遗忘导致断裂（critical_payoff_missing）：读者已有强烈预期的伏笔被无视
+4) 关键承诺伏笔被硬性遗忘导致断裂（critical_payoff_missing）：本章任务明确要求兑现且正文遗漏导致因果断裂，不能仅凭历史年龄判定
+5) 伏笔越界（unplanned_foreshadowing）：正文明确制造了本章清单之外、需要后文解释的谜团，或提前兑现仅要求埋入的伏笔。普通物品、正常冲突与下一步行动不属于此项。定位原文并给出删改办法，修订建议不得引入新悬念
+6) 剧情越界（past_chapter_goal）：正文越过了任务卡明确的终点。若本章只约定将来验收、付款或对质，正文开始展现那场后续事件就已越界，即使事件尚未完成。要求在已安排的结果处收束
 
 通过条件（同时满足）：
 - veto_items 为空
@@ -82,14 +90,14 @@ REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职�
 只输出一个合法 JSON 对象。pass 必须是 JSON 布尔值。评分字段都是整数；
 score_total 必须等于 score_l1 + score_l2 + score_l3，请计算后填入。
 问题列表最多各列三条，所有理由和建议简明。没有问题时用空数组。
-下面是通过时的结构示例，数值和结论请依据正文填写：
+下面是字段结构示例。先填实际命中的 veto_items，再决定 pass，结论和分数均不照抄示例：
 {
+  "veto_items": [],
   "pass": true,
   "score_total": 85,
   "score_l1": 38,
   "score_l2": 21,
   "score_l3": 26,
-  "veto_items": [],
   "l1_issues": [],
   "l2_issues": [],
   "l3_issues": [],
@@ -98,7 +106,7 @@ score_total 必须等于 score_l1 + score_l2 + score_l3，请计算后填入。
   "cut_suggestions": [],
   "suggestions": "质量合格"
 }
-否决项格式为 {"code": "setting_conflict", "reason": "用原文说明冲突"}，code 从上列四项选择。
+否决项格式为 {"code": "setting_conflict", "reason": "用原文说明冲突"}，code 从上列否决项选择。
 可裁切项格式为 {"start": "段落的首句", "reason": "具体理由"}。
 失败归因的 primary_layer 为 L1、L2 或 L3，severity 为 high、medium 或 low。
 不通过时注明具体问题、原文证据和可执行的修订建议。"""
@@ -106,6 +114,7 @@ score_total 必须等于 score_l1 + score_l2 + score_l3，请计算后填入。
 FORESHADOW_REVIEWER_SYSTEM = """你是伏笔专项审核员。先执行逐项证据检查，再给本章评分。候选描述是待证实的主张，不能当成正文事实。
 
 逐项证据检查：
+- 候选同时描述埋入、兑现与设计理由时，按本次动作检查：埋入只核对铺垫事实，不要求提前出现兑现结果；兑现核对实际结果，不把设计理由当作正文事实。
 - 埋入候选：先找出描述中的区分性特征，逐个检查本章是否实际描写。仅出现同一物品或人物，缺少关键特征，填 unconfirmed。
 - 例：候选“带三道刻痕的铜环被发现”，正文“他捡起铜环”或“如果铜环有刻痕，他就会留着它”，都填 unconfirmed。“他捡起一只带三道刻痕的铜环”才填 confirmed。
 - 兑现候选：本章必须实际揭示线索所指的结果。明确否定、假设、计划、回忆或只提及一律填 unconfirmed。
@@ -162,6 +171,8 @@ def _normalize_veto_items(value) -> list:
         "timeline_break",
         "core_ooc",
         "critical_payoff_missing",
+        "unplanned_foreshadowing",
+        "past_chapter_goal",
     }
     if not isinstance(value, list):
         return []
@@ -359,58 +370,18 @@ def _build_retry_feedback(result: dict) -> str:
     return suggestions
 
 
-def _build_foreshadow_list(ctx: dict, chapter_num: int) -> dict:
-    """
-    从写作上下文构建伏笔评分所需数据。
-    区分「应兑现」（priority 0-1）和「可铺垫/待推进」（priority 2+）。
-    """
-    active = ctx.get("active_foreshadowing", [])
-    hints_raw = ctx.get("foreshadow_hints", [])
-
-    to_resolve = []
-    for f in sorted(active, key=lambda row: (row.get("plant_chapter") or 1, row.get("fid") or "")):
-        desc = (f.get("description") or "").strip()
-        expected = (f.get("expected_redeem") or "待定").strip()
-        if not desc:
-            continue
-        if expected == "待定":
-            continue
-        is_due = False
-        range_match = re.search(r'第?(\d+)[~\-–到至]+(\d+)', expected)
-        if range_match:
-            s, e = int(range_match.group(1)), int(range_match.group(2))
-            if chapter_num > e:
-                is_due = True
-            elif s <= chapter_num <= e:
-                is_due = True
-        else:
-            single = re.search(r'第?(\d+)', expected)
-            if single:
-                t = int(single.group(1))
-                if chapter_num > t or abs(t - chapter_num) <= 3:
-                    is_due = True
-        if is_due:
-            handle_type = "逾期未兑现" if (
-                range_match and chapter_num > int(range_match.group(2))
-            ) or (
-                not range_match and single and chapter_num > int(single.group(1))
-            ) else "应兑现"
-            to_resolve.append({
-                "fid": f.get("fid", ""),
-                "description": desc,
-                "handle_type": handle_type,
-                "source": "动态",
-                "action": "resolve",
-            })
-
-    active_hints = "\n".join(hints_raw[:15]) if hints_raw else ""
-    if len(active_hints) > 1500:
-        active_hints = active_hints[:1500] + "..."
-
+def _build_foreshadow_list(ctx: dict) -> dict:
+    """专项审核只处理本章分配的候选。"""
+    tasks = ctx.get("outline_tasks", {})
     return {
-        "to_resolve": to_resolve[:8],
-        "active_hints": active_hints,
-        "total_active": len(active),
+        "to_plant": [
+            {**task, "source": "大纲", "action": "plant", "handle_type": "大纲应埋入"}
+            for task in tasks.get("to_plant", [])
+        ],
+        "to_resolve": [
+            {**task, "source": "大纲", "action": "resolve", "handle_type": "大纲应兑现"}
+            for task in tasks.get("to_resolve", [])
+        ],
     }
 
 
@@ -527,7 +498,7 @@ def _apply_foreshadow_l2_judgment(result: dict, fs_score: dict,
     if fs_score["overload_risk"] < 4:
         warnings.append(
             f"⚠️ 本章伏笔积压风险高（{fs_score['overload_risk']}/10），"
-            f"建议减少新伏笔或安排兑现"
+            "请删除未安排的悬念，保留本章已计划的剧情任务"
         )
 
     if not warnings:
@@ -591,11 +562,6 @@ def build_review_prompt(ctx: dict, chapter_num: int,
         for c in chars
     ]) if chars else "（暂无人物设定）"
 
-    foreshadow = ctx.get("active_foreshadowing", [])
-    f_str = "\n".join(
-        [f"- [{f.get('fid', '?')}] {f.get('description', '')}" for f in foreshadow[:8]]
-    ) if foreshadow else "（暂无）"
-
     recent = ctx.get("recent_summaries", [])
     recent_str = "\n".join(f"第{row['chapter_num']}章：{row['summary']}" for row in recent)
 
@@ -606,8 +572,8 @@ def build_review_prompt(ctx: dict, chapter_num: int,
 === 人物设定（核对OOC和状态连贯性）===
 {chars_str}
 
-=== 未兑现伏笔（核对是否被忽略）===
-{f_str}
+=== 本章伏笔任务 ===
+{format_chapter_foreshadow(ctx, chapter_num)}
 
 === 前情概要（核对衔接）===
 {recent_str or "（首章或无近期摘要）"}
@@ -615,7 +581,7 @@ def build_review_prompt(ctx: dict, chapter_num: int,
 === 待审正文 ===
 {content}
 
-请逐层评估后给出最终JSON结论。评分时要公正：做得好的层不要无故扣分，有问题的层要指出具体段落。"""
+先检查正文有没有跨过任务卡指定的停笔处；约定后续事件和写出后续事件是两回事。若有越界，把第一处越界句准确写入 past_chapter_goal 的 reason。再逐层评估并给出 JSON。"""
 
 
 def review_chapter(novel_name: str, chapter_num: int,
@@ -676,17 +642,7 @@ def review_chapter(novel_name: str, chapter_num: int,
     result = _normalize_review_result(parsed)
 
     # 伏笔专项评分（失败不中断主流程）
-    from core.outline_manager import get_chapter_outline_tasks
-    foreshadow_list = _build_foreshadow_list(ctx, chapter_num)
-    outline_tasks = get_chapter_outline_tasks(novel_name, chapter_num)
-    foreshadow_list["to_resolve"].extend(
-        {**task, "source": "大纲", "action": "resolve", "handle_type": "大纲应兑现"}
-        for task in outline_tasks["to_resolve"]
-    )
-    foreshadow_list["to_plant"] = [
-        {**task, "source": "大纲", "action": "plant", "handle_type": "大纲应埋入"}
-        for task in outline_tasks["to_plant"]
-    ]
+    foreshadow_list = _build_foreshadow_list(ctx)
     fs_score = score_foreshadowing(content, foreshadow_list, chapter_num)
     if fs_score:
         result["foreshadow_score"] = fs_score

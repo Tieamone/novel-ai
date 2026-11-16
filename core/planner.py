@@ -25,7 +25,7 @@ WORLD_PROMPT = """你是一位专业的中文网络小说策划师，擅长构�
 1. 世界观必须与大纲内容高度契合，服务于故事的核心冲突
 2. 参考角色背景，让世界观能合理容纳这些角色的存在和行动
 3. 必须包含四个维度：
-   - 地理/物理环境：这个世界长什么样，有什么独特的感官特征（光线、气味、声音）
+   - 地理/物理环境：只说明影响行动、资源与冲突的条件，不罗列感官特征
    - 力量体系/核心规则：这个世界运作的底层逻辑，有什么代价和限制
    - 社会结构与权力格局：谁掌握权力，谁被压迫，普通人过着什么样的生活
    - 世界的伤口：这个世界出了什么问题，或者曾经发生过什么影响至今的事
@@ -84,12 +84,12 @@ def _build_outline_prompt(target_chapters: int) -> str:
 
 要求：
 1. 包含三幕结构，与{target_chapters}章的总篇幅严格对应：
-   - 开局（1-{act1_end}章）：建立世界感和人物，植入核心悬念，让读者对主角有情感投入
-   - 发展（{act1_end+1}-{act2_end}章）：主线冲突层层升级，每段都有新的转折，伏笔交织，支线推进
+   - 开局（1-{act1_end}章）：让主角尽快遇到具体问题并作出选择，必要背景随行动交代
+   - 发展（{act1_end+1}-{act2_end}章）：主线冲突层层升级，每段都有新的转折，人物行动推动局势变化，不强加悬念支线
    - 高潮结局（{act2_end+1}-{target_chapters}章）：矛盾总爆发，伏笔全部兑现，给读者一个意外却合理的结局
 2. 每幕列出3-5个关键转折点，注明大致发生在第几章
-3. 指出主要伏笔的埋设位置和兑现位置（格式：埋于第X章→兑现于第Y章）
-4. 结局要有反转，但反转必须是"读者翻回去看才发现线索一直都在"的那种
+3. 仅对必要的主线转折说明为何需要提前铺垫，指出相应伏笔的埋设位置和兑现位置；不要求额外设计伏笔（格式：埋于第X章→兑现于第Y章）
+4. 结局回答主线冲突，是否反转由情节需要决定
 5. 节奏要与{target_chapters}章的篇幅匹配：短篇紧凑，长篇有铺陈，不人为压缩或注水
 6. 必须给故事一个独特的核心主题句（一句话概括这个故事的灵魂）
 7. 总字数800字以内，直接输出大纲内容"""
@@ -224,7 +224,7 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 
     # 动态编号的新增规则（接在 ending_rule 之后）
     ban_phrase = '禁止使用"继续推进剧情"、"进一步发展"、"主角有了新发现"等空泛表述作为 plot_goal'
-    fs_advice = '如果 prompt 中包含伏笔建议，请将其自然融入对应章节的 plot_goal，不要为此改变原有的剧情逻辑和节奏'
+    fs_advice = '先写清人物目标、阻碍、行动及结果。只将大纲分配给本章的伏笔写入 plot_goal；无安排时注明本章无伏笔任务，不自行添线'
     new_rule_base = 6 if not ending_rule else 7
     new_rules = f"\n{new_rule_base}. {ban_phrase}\n{new_rule_base + 1}. {fs_advice}"
 
@@ -236,7 +236,7 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 1. 每章只安排一个核心情节节点（主角做了什么、发现了什么、与谁发生了什么）
 2. plot_goal要具体到场景级别：不是"主角继续调查"，而是"主角在废弃图书馆找到一本残缺日记，发现其中有自己名字"
 3. 情绪标签的分布要有节奏：不要连续超过3章都是同一个标签，要有起伏
-4. 前5章的任务卡要重点建立世界感和人物关系，不要急着上大冲突
+4. 开篇尽快让人物行动，世界与关系只交代理解当前事件所需的信息
 5. 每隔5-8章要安排一个"高潮/转折"节点（冲突/爽点/反转），保持读者追读动力{ending_rule}{new_rules}
 {ending_block}大纲：
 {outline}
@@ -262,8 +262,8 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
         fs_block = "\n".join(fs_lines)
         prompt += f"""
 
-【本批必须兑现的伏笔】
-以下伏笔沉睡过久，请在本批任务卡中安排至少1-2个章节明确兑现：
+【旧伏笔参考（不是执行任务）】
+以下为历史遗留问题，仅供核对连续性。不能因沉睡时间强制安排兑现，也不得把它们追加为本章伏笔任务：
 {fs_block}"""
 
     if novel_name:
@@ -293,7 +293,7 @@ def _build_extend_task_prompt(from_chapter: int, end_chapter: int,
 
 任务卡规则：
 1. 每章只安排一个核心情节节点，具体到场景级别
-2. 这一批任务卡处于故事中段，要有新的冲突升级，要有伏笔回收，要推进人物关系变化
+2. 这一批任务卡处于故事中段，先写清目标、阻碍、行动与结果。只执行大纲本章伏笔安排，无安排则注明本章无伏笔任务
 3. 每隔5-8章安排一个高潮节点，保持追读驱动力
 4. 情绪标签要有起伏，不要连续同一标签超过3章{ending_rule}
 {ending_block}大纲：
@@ -319,8 +319,8 @@ JSON格式：
         fs_block = "\n".join(fs_lines)
         prompt += f"""
 
-【本批必须兑现的伏笔】
-以下伏笔沉睡过久，请在本批任务卡中安排至少1-2个章节明确兑现：
+【旧伏笔参考（不是执行任务）】
+以下为历史遗留问题，仅供核对连续性。不能因沉睡时间强制安排兑现，也不得把它们追加为本章伏笔任务：
 {fs_block}"""
 
     if novel_name:
@@ -339,7 +339,6 @@ def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
     inject_style: "forced" 强制语气 / "guided" 引导语气（默认从 config 读取）
     """
     try:
-        from collections import defaultdict
         from core.outline_manager import get_chapter_outline_tasks
 
         if inject_style is None:
@@ -349,7 +348,7 @@ def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
         all_plant = []
         all_resolve = []
         for ch in range(chapter_from, actual_to + 1):
-            tasks = get_chapter_outline_tasks(novel_name, ch)
+            tasks = get_chapter_outline_tasks(novel_name, ch, for_planning=True)
             for item in tasks.get("to_plant", []):
                 item["_chapter"] = ch
                 all_plant.append(item)
@@ -360,39 +359,11 @@ def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
         if not all_plant and not all_resolve:
             return prompt
 
-        # ── 伏笔密度控制 ──
-        max_per_ch = cfg("novel", "max_foreshadow_per_chapter", 2)
-        ch_items = defaultdict(list)
-        for item in all_plant:
-            ch_items[item["_chapter"]].append(item)
-        for item in all_resolve:
-            ch_items[item["_chapter"]].append(item)
-
-        for ch, items in ch_items.items():
-            total = len(items)
-            if total > max_per_ch:
-                items_sorted = sorted(
-                    items, key=lambda x: x.get("importance", 0), reverse=True
-                )
-                dropped = items_sorted[max_per_ch:]
-                dropped_fids = [d["fid"] for d in dropped]
-                print(
-                    f"  [伏笔密度] 第{ch}章超限({total}个)，"
-                    f"保留重要度最高的{max_per_ch}个，"
-                    f"降级: {', '.join(dropped_fids)}"
-                )
-                dropped_keys = {(d["fid"], d["_chapter"]) for d in dropped}
-                all_plant = [
-                    t for t in all_plant
-                    if (t["fid"], t["_chapter"]) not in dropped_keys
-                ]
-                all_resolve = [
-                    t for t in all_resolve
-                    if (t["fid"], t["_chapter"]) not in dropped_keys
-                ]
-
-        if not all_plant and not all_resolve:
-            return prompt
+        # 历史计划不静默截断，否则作者和审稿会看到不同任务。
+        maximum = cfg("novel", "max_foreshadow_per_chapter", 2)
+        for ch in range(chapter_from, actual_to + 1):
+            if sum(t["_chapter"] == ch for t in all_plant + all_resolve) > maximum:
+                print(f"  [提示] 第{ch}章历史伏笔安排超过{maximum}项，建议先精简宏观计划；本次不自动改动。")
 
         # ── 构建提示 ──
         is_forced = (inject_style == "forced")
@@ -422,7 +393,7 @@ def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
                         f"{t['description']} (★重要度{t['importance']})"
                     )
                     lines.append(
-                        "  融入提示：可以在场景描写或角色对话中不经意地提及"
+                        "  融入提示：通过本章行动自然落实，不靠重复提及物件充当兑现"
                     )
             if all_resolve:
                 lines.append("以下为各章建议兑现的伏笔：")
@@ -432,12 +403,12 @@ def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
                         f"{t['description']} (★重要度{t['importance']})"
                     )
                     lines.append(
-                        "  融入提示：可以在场景描写或角色对话中不经意地提及"
+                        "  融入提示：通过本章行动自然落实，不靠重复提及物件充当兑现"
                     )
 
         if actual_to < chapter_to:
             lines.append(f"(第{actual_to + 1}章及之后的伏笔将在后续批次中注入)")
-        lines.append("请务必将上述伏笔要求写入对应章节的 plot_goal。")
+        lines.append("只将对应章节可呈现的事实写入 plot_goal，不将兑现答案提前写进埋入章的目标。")
         if not is_forced:
             lines.append(
                 "请以情节自然流畅为优先，不得为埋入伏笔而强行改变情节走向。"
@@ -1063,7 +1034,7 @@ def _generate_single_batch(outline: str, novel_name: str,
         prev_ending = mm_tmp.get_last_chapter_ending(start, chars=400)
         urgent_fs = _get_urgent_foreshadowing(mm_tmp, start)
         if urgent_fs:
-            print(f"  [伏笔] 检测到 {len(urgent_fs)} 个沉睡伏笔，将在任务卡中强制安排兑现")
+            print(f"  [伏笔] 检测到 {len(urgent_fs)} 个沉睡伏笔，仅供核对连续性，不自动安排兑现")
 
     for attempt in range(2):
         raw = call_author_api(
@@ -1170,7 +1141,7 @@ def extend_tasks(novel_name: str, from_chapter: int):
     prev_ending = mm_tmp.get_last_chapter_ending(from_chapter, chars=400)
     urgent_fs = _get_urgent_foreshadowing(mm_tmp, from_chapter)
     if urgent_fs:
-        print(f"  [伏笔] 检测到 {len(urgent_fs)} 个沉睡伏笔，将在任务卡中强制安排兑现")
+        print(f"  [伏笔] 检测到 {len(urgent_fs)} 个沉睡伏笔，仅供核对连续性，不自动安排兑现")
 
     # 最多重试一次
     for attempt in range(2):
@@ -1278,7 +1249,8 @@ def rewrite_task_for_chapter(novel_name: str, chapter_num: int,
 3. 不得再触发上述否决原因
 4. 只安排一个核心情节节点，具体到场景和行动
 5. plot_goal 40-80 字
-6. 【关键约束】只修改实现路径和过程细节，章节结尾的核心状态／情节终态必须与原任务卡保持一致。
+6. 不新增伏笔，未分配伏笔的章节注明本章无伏笔任务。
+7. 【关键约束】只修改实现路径和过程细节，章节结尾的核心状态／情节终态必须与原任务卡保持一致。
    例如：原目标是"众人陷入绝望"，新目标的结尾仍须是"众人陷入绝望"，只改"如何走到这一步"。
    {_end_state_hint}
    这是为了确保后续章节的任务卡不需要联动修改。
@@ -1288,31 +1260,9 @@ def rewrite_task_for_chapter(novel_name: str, chapter_num: int,
 
 emotion_tag 只能从以下 5 个中选 1 个：铺垫 / 冲突 / 爽点 / 低谷 / 反转"""
 
-    # 大纲伏笔强制任务注入
-    try:
-        from core.outline_manager import get_chapter_outline_tasks
-        outline_tasks = get_chapter_outline_tasks(novel_name, chapter_num)
-        to_plant = outline_tasks.get("to_plant", [])
-        to_resolve = outline_tasks.get("to_resolve", [])
-        if to_plant or to_resolve:
-            fs_lines = []
-            if to_plant:
-                fs_lines.append("【本章必须埋入】")
-                for t in to_plant:
-                    stars = "★" * (t.get("importance") or 3)
-                    fs_lines.append(
-                        f"- {t['fid']}: {t['description']}（重要度{stars}）"
-                    )
-            if to_resolve:
-                fs_lines.append("【本章必须兑现】")
-                for t in to_resolve:
-                    stars = "★" * (t.get("importance") or 3)
-                    fs_lines.append(
-                        f"- {t['fid']}: {t['description']}（重要度{stars}）"
-                    )
-            prompt += "\n\n=== 大纲伏笔强制任务 ===\n" + "\n".join(fs_lines)
-    except Exception:
-        pass
+    from core.outline_manager import format_chapter_foreshadow
+
+    prompt += "\n\n" + format_chapter_foreshadow({"novel_name": novel_name}, chapter_num)
 
     raw = call_author_api(
         system_prompt=(

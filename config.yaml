@@ -56,7 +56,7 @@ novel:
   # 任务卡质量审核
   task_card_review_enabled: true     # 是否启用任务卡审核
   task_card_review_pass_score: 28    # 审核通过线（满分40）
-  max_foreshadow_per_chapter: 2      # 策划任务卡的伏笔埋入/兑现上限
+  max_foreshadow_per_chapter: 2      # 历史计划单章伏笔数量的提示阈值，不静默截断执行清单
   foreshadow_injection_style: "guided"  # 策划任务卡的伏笔注入语气: guided(引导式) / forced(强制式)
   plateau_threshold: 5       # 平台期检测：评分波动低于此值视为平台期
   plateau_window: 3          # 平台期检测：最近N轮评分
