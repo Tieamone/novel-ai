@@ -96,6 +96,7 @@ def _get_defaults() -> dict:
             "api_region": "beijing",
             "author": {"default_model": "qwen3.6-flash"},
             "reviewer": {"default_model": "qwen3.6-flash"},
+            "cross_checker": {"default_model": ""},
             "reader_reviewer": {
                 "default_model": "qwen3.6-flash",
                 "enabled": True,

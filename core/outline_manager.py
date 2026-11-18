@@ -217,7 +217,7 @@ def get_chapter_outline_tasks(novel_name: str, chapter_num: int, *, readonly=Fal
                               for_planning=False) -> dict:
     """
     返回本章伏笔任务。提前编写任务卡时也包含尚未埋入的未来兑现安排。
-    失败时返回空 dict，不抛异常。
+    写作读取失败抛异常；只读和策划预览告警后显示空任务。
     """
     empty = {"to_plant": [], "to_resolve": []}
     try:
@@ -243,7 +243,10 @@ def get_chapter_outline_tasks(novel_name: str, chapter_num: int, *, readonly=Fal
             "to_resolve": [{**r, "description": _chapter_foreshadow_description(r["description"], "resolve")}
                            for r in to_resolve],
         }
-    except Exception:
+    except Exception as exc:
+        if not for_planning and not readonly:
+            raise
+        print(f"  [警告] 伏笔预览读取失败：{type(exc).__name__}，本次显示空任务")
         return empty
 
 
@@ -392,6 +395,9 @@ def ai_suggest_outline_foreshadow(novel_name: str, *, strict=False):
         character_profiles = "暂无人物档案"
 
     review = review_outline_foreshadow(novel_name, suggestions, outline_text, character_profiles)
+    if review is None:
+        print("  [未审查] 宏观伏笔审核失败，本次不录入")
+        return 0
     _print_review_table(suggestions, review)
 
     # 6. 打印候选列表
@@ -577,6 +583,9 @@ def generate_outline_foreshadow(novel_name: str, target_chapters: int,
             character_profiles = "暂无人物档案"
 
         review = review_outline_foreshadow(novel_name, suggestions, outline_text, character_profiles)
+        if review is None:
+            print("  [未审查] 宏观伏笔审核失败，本次不录入")
+            return 0
         _print_review_table(suggestions, review)
 
         # ── 修正不通过的伏笔 ──────────────────────────────────────
@@ -589,13 +598,16 @@ def generate_outline_foreshadow(novel_name: str, target_chapters: int,
             # 修正后的伏笔重新审稿
             print(f"  正在重新审稿修正后的伏笔...")
             review = review_outline_foreshadow(novel_name, suggestions, outline_text, character_profiles)
+            if review is None:
+                print("  [未审查] 修正后审核失败，本次不录入")
+                return 0
             _print_review_table(suggestions, review)
         # ───────────────────────────────────────────────────────────
 
         count = 0
         skipped = 0
         for i, s in enumerate(suggestions):
-            r = review.get(i, {"passed": True})
+            r = review.get(i, {"passed": False})
             if not r["passed"]:
                 skipped += 1
                 continue
@@ -660,49 +672,53 @@ def review_outline_foreshadow(novel_name, suggestions, outline_text, character_p
         '}'
     )
 
+    from core.api_client import call_reviewer_api
+
+    def request(message):
+        raw = call_reviewer_api(system_prompt=system_prompt, user_message=message,
+                                max_tokens=4096, temperature=0.3, retry=1)
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        data = _parse_json_robust(match.group()) if match else None
+        if not isinstance(data, dict):
+            raise ValueError("宏观审核JSON无效")
+        return data
+
     print("  正在调用审稿模型审查伏笔质量，请稍候...")
-    try:
-        from core.api_client import call_reviewer_api
-        raw = call_reviewer_api(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            max_tokens=4096,
-            temperature=0.3,
-        )
-    except Exception as e:
-        print(f"  [警告] 审稿API调用失败：{e}，跳过审查")
-        return {i: {"passed": True, "issues": [], "suggestion": ""} for i in range(len(suggestions))}
+    data = None
+    for attempt in range(3):  # 首次请求加最多两次宏观审核重试。
+        try:
+            data = request(user_message)
+            break
+        except Exception as exc:
+            print(f"  [警告] 宏观审核第{attempt + 1}次失败：{type(exc).__name__}")
+    if data is None:
+        return None
 
-    raw_clean = re.sub(
-        r'[<\u2039]think[>\u203a]?[\s\S]*?[<\u2039]\/think[>\u203a]?', '',
-        raw, flags=re.DOTALL
-    ).strip()
-    json_match = re.search(r'\{.*\}', raw_clean, re.DOTALL)
-    if not json_match:
-        print("  [警告] 审稿返回中未找到JSON，跳过审查")
-        return {i: {"passed": True, "issues": [], "suggestion": ""} for i in range(len(suggestions))}
-
-    review_data = _parse_json_robust(json_match.group())
-    if review_data is None:
-        print("  [警告] 审稿JSON解析失败，跳过审查")
-        return {i: {"passed": True, "issues": [], "suggestion": ""} for i in range(len(suggestions))}
+    missing = [i for i in range(len(suggestions)) if not isinstance(data.get(str(i + 1)), dict)]
+    if missing:
+        print(f"  [补审] 缺少序号：{[i + 1 for i in missing]}")
+        try:
+            extra = request(user_message + "\n仅补审缺失序号，保持原编号：" +
+                            json.dumps([i + 1 for i in missing]))
+            for i in missing:
+                if isinstance(extra.get(str(i + 1)), dict):
+                    data[str(i + 1)] = extra[str(i + 1)]
+        except Exception as exc:
+            print(f"  [警告] 补审失败：{type(exc).__name__}，缺项不通过")
 
     result = {}
-    for k, v in review_data.items():
-        try:
-            idx = int(k) - 1
-        except (ValueError, TypeError):
-            continue
-        result[idx] = {
-            "passed": bool(v.get("passed", True)),
-            "issues": v.get("issues", []) if isinstance(v.get("issues"), list) else [],
-            "suggestion": str(v.get("suggestion", "") or ""),
-        }
-
     for i in range(len(suggestions)):
-        if i not in result:
-            result[i] = {"passed": True, "issues": [], "suggestion": ""}
-
+        value = data.get(str(i + 1))
+        if not isinstance(value, dict):
+            result[i] = {"passed": False, "issues": ["缺少有效审查结论"], "suggestion": "重新审查"}
+            continue
+        passed = value.get("passed")
+        result[i] = {
+            "passed": passed is True or (isinstance(passed, str) and passed in ("true", "是")),
+            "issues": [str(x) for x in value.get("issues", [])] if isinstance(value.get("issues"), list) else [],
+            "suggestion": str(value.get("suggestion", "") or ""),
+        }
     return result
 
 
@@ -805,7 +821,7 @@ def _revise_failed_foreshadow(novel_name: str, suggestions: list,
     result = []
 
     for i, s in enumerate(suggestions):
-        r = review.get(i, {"passed": True})
+        r = review.get(i, {"passed": False})
         if r["passed"]:
             result.append(s)
             continue
@@ -837,7 +853,7 @@ def _print_review_table(suggestions, review):
     passed_count = 0
     failed_count = 0
     for i, s in enumerate(suggestions, 1):
-        r = review.get(i - 1, {"passed": True, "issues": [], "suggestion": ""})
+        r = review.get(i - 1, {"passed": False, "issues": ["缺少审查结论"], "suggestion": "重新审查"})
         desc = (s.get("description", "") or "")[:30]
         if r["passed"]:
             passed_count += 1

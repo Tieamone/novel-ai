@@ -6,7 +6,7 @@ from core.interaction import ask as input, say as print, check_cancelled
 
 _SWITCH_CHOICES = (("y", "切换模型"), ("n", "保留当前模型"))
 _RETRY_CHOICES = (("1", "继续局部修订"), ("2", "完全重写"), ("3", "切换模型重新生成"))
-from core.api_client import call_reviewer_api, increment_failure_counter, reset_failure_counter, check_switch_needed
+from core.api_client import call_reviewer_api, call_cross_checker_api, increment_failure_counter, reset_failure_counter, check_switch_needed
 from core.memory_manager import MemoryManager
 from core.config_loader import get as cfg
 from core.reader_reviewer import reader_review_chapter
@@ -18,12 +18,15 @@ REVIEW_PASS_L1 = 30
 
 REVIEWER_SYSTEM = """你是一位经验丰富的网络小说责任编辑，职责是判断章节是否达到发布标准。
 
-先核对任务卡里的章节终点，再评分。如果任务卡明确写了“到这里就停”“本章尚未发生”或类似限制，核对正文有没有越过它。遇到越界，必须在 veto_items 写入 past_chapter_goal，逐字引用第一处越界正文，pass 为 false，即使本章目标已经达成也不能放行。
+先按事件核对任务卡的章节边界，再评分。任务完成后的一两句自然反应、收束不算越界，任务卡的“定格”“立即停笔”也按事件边界理解。开始新的实质行动、产生下个事件的结果或提前兑现后续剧情才算越界，必须在 veto_items 写入 past_chapter_goal，逐字引用第一处越界正文，pass 为 false。
 例如任务卡写“约好次日验收就停”，正文写“次日，他把样品摆上验收台”已经进入下一场，哪怕还没验收完也要否决。正文只写“明早带样品过来”仍在本章范围。
+字数不足本身不扣分。短章须真实呈现完成本章任务所必需的行动、选择和结果。只有几句任务复述、梗概或遗漏关键因果时，指出具体缺失内容，不能要求凑字数。
 
 你深知好的网文应该具备哪些特质：
 - 情节推进有逻辑，人物行为有动机
 - 场景信息足以理解行动，无效环境、感官和重复心理描写应删减
+- 删除后仍能理解事件、冲突和选择的细节应省略。普通流程概述结果不算梗概；只有关键冲突、决定或因果缺失才要求展开。
+- 不要求镜头感、氛围铺垫、痛感比喻或台词间的小动作，不因删减后变短或较前文简洁而扣分。指出冗余原句并建议直接删除，不换一种描写凑回篇幅。
 - 对话有潜台词，不是说明书式的信息传递
 - 情绪表达简洁清楚，允许直述，不要求转换成生理反应
 - 章节停在任务目标达成或人物作出选择的地方，允许自然收束
@@ -104,10 +107,12 @@ score_total 必须等于 score_l1 + score_l2 + score_l3，请计算后填入。
   "failure_attribution": {"primary_layer": "none", "root_cause": "none", "severity": "none"},
   "redundancy_score": 8,
   "cut_suggestions": [],
+  "tail_cut": null,
   "suggestions": "质量合格"
 }
 否决项格式为 {"code": "setting_conflict", "reason": "用原文说明冲突"}，code 从上列否决项选择。
 可裁切项格式为 {"start": "段落的首句", "reason": "具体理由"}。
+仅当本章目标已在前文完整达成，且从某个段落起直到篇末全是可删的越界或冗余尾声时，tail_cut 填 {"goal_complete":true,"start":"第一段待删除文字的完整首句"}，该首句须逐字取自正文且仅出现一次。删除之后必须仍保留本章全部必要事件和结果。普通自然收束、缺失目标、问题分散在全文或无法确定边界时填 null。
 失败归因的 primary_layer 为 L1、L2 或 L3，severity 为 high、medium 或 low。
 不通过时注明具体问题、原文证据和可执行的修订建议。"""
 
@@ -147,7 +152,8 @@ FORESHADOW_REVIEWER_SYSTEM = """你是伏笔专项审核员。先执行逐项证
 - 同一段可以同时支持多个候选，独立判定。仅确认项必须引用正文中直接证明判断的完整短句，逐字照抄。
 
 严格只输出JSON：
-{"embed":9,"resolve":9,"traceable":9,"overload_risk":9,"comment":"一句话说明","decisions":[{"key":"候选1","verdict":"confirmed","quote":"支持判断的原句"},{"key":"候选2","verdict":"unconfirmed","quote":""}]}"""
+每项 restated 用不超过40字复述正文实际发生的事：谁对什么做了什么、结果如何，不能照抄候选主张。
+{"embed":9,"resolve":9,"traceable":9,"overload_risk":9,"comment":"一句话说明","decisions":[{"key":"候选1","verdict":"confirmed","quote":"支持判断的原句","restated":"人物的动作及结果"},{"key":"候选2","verdict":"unconfirmed","quote":"","restated":"正文未出现该事件"}]}"""
 
 
 def _normalize_issue_list(value) -> list:
@@ -355,6 +361,7 @@ def _normalize_review_result(raw_result: dict) -> dict:
         "failure_attribution": failure_attr,
         "redundancy_score": to_int(raw_result.get("redundancy_score", 10), default=10, min_value=0, max_value=10),
         "cut_suggestions": raw_result.get("cut_suggestions", []),
+        "tail_cut": raw_result.get("tail_cut"),
         "suggestions": suggestions,
         "review_error": False,
         "retry_hint": retry_hint,
@@ -383,6 +390,51 @@ def _build_foreshadow_list(ctx: dict) -> dict:
             for task in tasks.get("to_resolve", [])
         ],
     }
+
+
+def _crosscheck_confirmed(chapter_text: str, items: list) -> list | None:
+    """一次批量复核；无法确认等价的候选不推进状态。"""
+    if not items:
+        return []
+    payload = []
+    for item in items:
+        quote = item["quote"]
+        offset = chapter_text.find(quote)
+        payload.append({"key": item["key"], "candidate": item["description"],
+                        "action": item["action"], "restated": item["restated"], "quote": quote,
+                        "context": chapter_text[max(0, offset - 80):offset + len(quote) + 80]})
+    try:
+        raw = call_cross_checker_api(
+            system_prompt=("你是独立的伏笔事实复核员。核对候选、复述、引文及上下文的主语、宾语、动作、因果、否定和结果。"
+                           "只提到物品、传闻假设、否定或主谓颠倒均不等价。候选不是已知事实。"
+                           '仅输出JSON：{"decisions":[{"key":"候选1","equivalent":true,"reason":"理由"}]}。'
+                           "每个编号恰好一次，equivalent只能为JSON布尔值。"),
+            user_message=json.dumps(payload, ensure_ascii=False),
+            temperature=0.1, max_tokens=max(500, len(items) * 200), retry=1,
+        )
+    except Exception as exc:
+        print(f"  [伏笔复核] 请求失败（{type(exc).__name__}），本批未评分")
+        return None
+    data = extract_json_obj(raw).get("decisions") if isinstance(raw, str) else None
+    if not isinstance(data, list):
+        print("  [伏笔复核] JSON 缺少 decisions 列表，本批未评分")
+        return None
+    by_key = {}
+    for entry in data:
+        if isinstance(entry, dict) and isinstance(entry.get("key"), str):
+            by_key.setdefault(entry["key"], []).append(entry)
+    kept = []
+    for item in items:
+        matches = by_key.get(item["key"], [])
+        if (len(matches) != 1 or type(matches[0].get("equivalent")) is not bool
+                or not isinstance(matches[0].get("reason"), str) or not matches[0]["reason"].strip()):
+            print(f"  [伏笔复核] {item['key']} 缺少有效逐项判定，本批未评分")
+            return None
+        if matches[0]["equivalent"]:
+            kept.append({**item, "crosscheck_reason": matches[0]["reason"]})
+        else:
+            print(f"  [伏笔复核] {item['key']} 判定不等价")
+    return kept
 
 
 def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
@@ -431,7 +483,7 @@ def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
             system_prompt=FORESHADOW_REVIEWER_SYSTEM,
             user_message=prompt,
             temperature=0.2,
-            max_tokens=max(400, 180 + 150 * len(candidates)),
+            max_tokens=max(500, 180 + 220 * len(candidates)),
         )
     except Exception:
         return None
@@ -449,27 +501,46 @@ def score_foreshadowing(chapter_text: str, foreshadow_list: dict,
 
     confirmed = []
     entries = parsed.get("decisions")
+    if not isinstance(entries, list):
+        return None
+    # 漏审不能当成“未埋入”：整批候选必须各有一个有效结论。
+    keys = [entry.get("key") for entry in entries if isinstance(entry, dict)]
+    if (len(keys) != len(entries) or any(not isinstance(key, str) for key in keys)
+            or len(keys) != len(candidates) or set(keys) != set(candidates)
+            or any(entry.get("verdict") not in ("confirmed", "unconfirmed") for entry in entries)):
+        print("  [伏笔审核] 逐项结论缺失、重复或无效，本批不更新状态")
+        return None
     if isinstance(entries, list) and review_text == chapter_text:
         seen, duplicates = set(), set()
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
             key, quote = entry.get("key"), entry.get("quote")
+            restated = entry.get("restated")
             if not isinstance(key, str) or key not in candidates:
                 continue
             if key in seen:
                 duplicates.add(key)
             seen.add(key)
             if (entry.get("verdict") == "confirmed" and isinstance(quote, str)
-                    and quote.strip() and quote in chapter_text):
-                confirmed.append((key, candidates[key]))
+                    and quote.strip() and quote in chapter_text
+                    and isinstance(restated, str) and 0 < len(restated.strip()) <= 40):
+                confirmed.append((key, {**candidates[key], "key": key, "quote": quote,
+                                        "restated": restated.strip()}))
         confirmed = [
             item for key, item in sorted(confirmed, key=lambda entry: int(entry[0][2:]))
             if key not in duplicates
         ]
 
+    crosschecked = _crosscheck_confirmed(chapter_text, confirmed)
+    confirmed = crosschecked or []
+    can_defer = crosschecked is not None and review_text == chapter_text
+    planted = {x["fid"] for x in confirmed if x.get("source") == "大纲" and x.get("action") == "plant"}
     return {
         "confirmed": confirmed,
+        "crosscheck_error": crosschecked is None,
+        "unconfirmed_plant": [x["fid"] for x in to_plant
+                              if can_defer and x.get("source") == "大纲" and x["fid"] not in planted],
         "embed": _clamp(parsed.get("embed", 5)),
         "resolve": _clamp(parsed.get("resolve", 5)),
         "traceable": _clamp(parsed.get("traceable", 5)),
@@ -581,7 +652,7 @@ def build_review_prompt(ctx: dict, chapter_num: int,
 === 待审正文 ===
 {content}
 
-先检查正文有没有跨过任务卡指定的停笔处；约定后续事件和写出后续事件是两回事。若有越界，把第一处越界句准确写入 past_chapter_goal 的 reason。再逐层评估并给出 JSON。"""
+先检查是否完成本章任务、是否开始下一实质事件。允许一两句自然收束，短章按内容完整性评分。若有越界，引用原文并按 tail_cut 规则提供可定位的删尾建议。再逐层评估并给出 JSON。"""
 
 
 def review_chapter(novel_name: str, chapter_num: int,
@@ -597,7 +668,12 @@ def review_chapter(novel_name: str, chapter_num: int,
         _persist_review_result(mm, chapter_num, result)
         print(f"  [责任编辑] {length_issue}")
         return result
-    ctx = mm.load_context(chapter_num)
+    try:
+        ctx = mm.load_context(chapter_num)
+    except Exception as exc:
+        result = _review_error_result("章节上下文读取失败，请重试", f"读取失败：{type(exc).__name__}")
+        _persist_review_result(mm, chapter_num, result)
+        return result
 
     print(f"  [责任编辑] 正在审稿第{chapter_num}章...")
     prompt = build_review_prompt(ctx, chapter_num, content, plot_goal)
@@ -863,7 +939,8 @@ def _apply_cut_suggestions_interactive(novel_name: str, chapter_num: int,
         print("  [精简建议] 未选择任何裁切项")
         return content
 
-    word_min = int(cfg("novel", "chapter_word_min", 3000) or 3000)
+    from core.writer import chapter_word_limits
+    word_min, _, _ = chapter_word_limits()
     new_content, applied, skipped = _apply_cut_suggestions_to_text(
         content, cut_suggestions, word_min, selected
     )
@@ -906,6 +983,9 @@ def commit_approved_chapter(novel_name, chapter_num, content, result):
         (result.get("foreshadow_score") or {}).get("confirmed", [])
         if result.get("foreshadow_reviewed_content") == content else []
     )
+    unconfirmed = ((result.get("foreshadow_score") or {}).get("unconfirmed_plant", [])
+                   if result.get("foreshadow_reviewed_content") == content else [])
+    notices = []
     with with_db_connection(novel_name) as conn, DatabaseTransaction(conn):
         updated = conn.execute(
             "UPDATE chapters SET status='已审核', updated_at=datetime('now','localtime') "
@@ -914,6 +994,24 @@ def commit_approved_chapter(novel_name, chapter_num, content, result):
         )
         if updated.rowcount != 1:
             raise ValueError("章节正文已变化，请重新审核")
+        confirmed_plant = {x["fid"] for x in confirmed if x["source"] == "大纲" and x["action"] == "plant"}
+        for fid in sorted(set(unconfirmed) - confirmed_plant):
+            row = conn.execute(
+                "SELECT resolve_chapter FROM outline_foreshadowing WHERE novel_name=? "
+                "AND fid=? AND status='planned' AND plant_chapter=?", (novel_name, fid, chapter_num),
+            ).fetchone()
+            if not row:
+                continue
+            resolve_chapter = row["resolve_chapter"]
+            if isinstance(resolve_chapter, int) and chapter_num + 1 < resolve_chapter:
+                conn.execute(
+                    "UPDATE outline_foreshadowing SET plant_chapter=plant_chapter+1 "
+                    "WHERE novel_name=? AND fid=? AND status='planned' AND plant_chapter=?",
+                    (novel_name, fid, chapter_num),
+                )
+                notices.append(f"伏笔{fid}埋入未确认，顺延至第{chapter_num + 1}章")
+            else:
+                notices.append(f"伏笔{fid}埋入未确认且无顺延空间，兑现任务将不下发")
         for item in confirmed:
             fid = item["fid"]
             if item["source"] == "动态":
@@ -936,8 +1034,32 @@ def commit_approved_chapter(novel_name, chapter_num, content, result):
                 )
 
 
+    for message in notices:
+        print(f"  [伏笔提示] {message}")
+
+
 def force_on_review_exhausted():
     return cfg("novel", "on_review_exhausted", "stop") == "force_and_flag"
+
+
+def _trim_reviewed_tail(content: str, result: dict) -> str:
+    """只按本次主审的明确结论删除可唯一定位的整段尾声，随后仍须重审。"""
+    cut = result.get("tail_cut")
+    if result.get("pass") or result.get("review_error") or not isinstance(cut, dict):
+        return content
+    if cut.get("goal_complete") is not True:
+        return content
+    start = cut.get("start")
+    if not isinstance(start, str) or not start.strip() or content.count(start) != 1:
+        return content
+    offset = content.index(start)
+    if offset < 2 or content[offset - 2:offset] != "\n\n":
+        return content
+    prefix = content[:offset].rstrip()
+    if not prefix or prefix[-1] not in '。！？!?….”’"\'':
+        return content
+    print(f"  [章尾修订] 按主审建议删除尾部{len(content) - len(prefix)}字，重新审核{len(prefix)}字正文")
+    return prefix
 
 
 def write_and_review(novel_name: str, chapter_num: int,
@@ -1052,6 +1174,15 @@ def write_and_review(novel_name: str, chapter_num: int,
                 result = review_chapter(novel_name, chapter_num, content, plot_goal)
             if result.get("review_error"):
                 return failed(_session_id, "责任编辑服务异常")
+            trimmed = _trim_reviewed_tail(content, result)
+            if trimmed != content:
+                content = trimmed
+                _original_content = content
+                mm.save_chapter(chapter_num, f"第{chapter_num}章", content, "草稿",
+                                plot_goal=plot_goal, emotion_tag=emotion_tag)
+                result = review_chapter(novel_name, chapter_num, content, plot_goal)
+                if result.get("review_error"):
+                    return failed(_session_id, "删尾后责任编辑服务异常")
             _scores_history.append(result.get("score_total", 0))
 
             if not result.get("pass"):

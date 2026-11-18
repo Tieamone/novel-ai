@@ -234,7 +234,7 @@ def _build_task_split_prompt(first_batch: int, full_target: int, outline: str,
 
 任务卡规则：
 1. 每章只安排一个核心情节节点（主角做了什么、发现了什么、与谁发生了什么）
-2. plot_goal要具体到场景级别：不是"主角继续调查"，而是"主角在废弃图书馆找到一本残缺日记，发现其中有自己名字"
+2. plot_goal要具体到场景级别：不是"主角继续调查"，而是"主角在废弃图书馆找到一本残缺日记，发现其中有自己名字"。用事件结果界定本章范围，允许自然收束，不要求定格在某个动作瞬间
 3. 情绪标签的分布要有节奏：不要连续超过3章都是同一个标签，要有起伏
 4. 开篇尽快让人物行动，世界与关系只交代理解当前事件所需的信息
 5. 每隔5-8章要安排一个"高潮/转折"节点（冲突/爽点/反转），保持读者追读动力{ending_rule}{new_rules}
@@ -292,7 +292,7 @@ def _build_extend_task_prompt(from_chapter: int, end_chapter: int,
 全书目标总章数为{full_target}章，当前进行到中段，请据此控制推进节奏。
 
 任务卡规则：
-1. 每章只安排一个核心情节节点，具体到场景级别
+1. 每章只安排一个核心情节节点，具体到场景级别。边界按事件结果划分，允许自然收束，不规定必须定格的动作瞬间
 2. 这一批任务卡处于故事中段，先写清目标、阻碍、行动与结果。只执行大纲本章伏笔安排，无安排则注明本章无伏笔任务
 3. 每隔5-8章安排一个高潮节点，保持追读驱动力
 4. 情绪标签要有起伏，不要连续同一标签超过3章{ending_rule}
@@ -345,6 +345,8 @@ def _add_outline_fs_to_prompt(prompt: str, novel_name: str,
             inject_style = cfg("novel", "foreshadow_injection_style", "guided")
 
         actual_to = min(chapter_to, chapter_from + 59)
+        if actual_to < chapter_to:
+            print(f"  [警告] 本批次仅注入前60章伏笔，第{actual_to + 1}–{chapter_to}章未注入；请分批策划。")
         all_plant = []
         all_resolve = []
         for ch in range(chapter_from, actual_to + 1):
@@ -1247,7 +1249,7 @@ def rewrite_task_for_chapter(novel_name: str, chapter_num: int,
 1. 严格遵守大纲整体走向，不超前推进
 2. 人物行为必须符合其性格设定，杜绝 OOC
 3. 不得再触发上述否决原因
-4. 只安排一个核心情节节点，具体到场景和行动
+4. 只安排一个核心情节节点，以事件结果划分边界，允许一两句自然收束，不添加“定格在动作结束瞬间”这样的限制
 5. plot_goal 40-80 字
 6. 不新增伏笔，未分配伏笔的章节注明本章无伏笔任务。
 7. 【关键约束】只修改实现路径和过程细节，章节结尾的核心状态／情节终态必须与原任务卡保持一致。

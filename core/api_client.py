@@ -613,6 +613,8 @@ def _call_dashscope(system_prompt, user_message, model_name, max_tokens, tempera
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+            if model_name.lower().startswith("kimi-k3"):
+                kwargs.pop("temperature")  # Kimi K3 仅接受服务端默认温度
             if is_qwen_thinking:
                 kwargs["extra_body"] = {"enable_thinking": False}
 
@@ -852,6 +854,34 @@ def call_reader_reviewer_api(system_prompt: str, user_message: str,
     return call_api(system_prompt=system_prompt, user_message=user_message,
                     model_name=_reader_reviewer_model, provider=_reader_reviewer_provider,
                     max_tokens=max_tokens, temperature=temperature, retry=retry)
+
+
+def model_family(model_name: str) -> str:
+    """家族用于验收隔离，不把不同版本号当成不同家族。"""
+    name = model_name.lower()
+    for family in ("qwen", "deepseek", "glm", "kimi", "minimax", "mimo"):
+        if name.startswith(family):
+            return family
+    return name.split("-")[0]
+
+
+def get_cross_checker_model():
+    from core.config_loader import get as cfg
+    name = cfg("model", "cross_checker", "default_model", "")
+    name = name.strip() if isinstance(name, str) else ""
+    if not name:
+        return _reviewer_model, _reviewer_provider
+    return name, "mimo" if name.startswith("mimo-") else "dashscope"
+
+
+def call_cross_checker_api(system_prompt: str, user_message: str,
+                           max_tokens: int = None, temperature: float = None, retry: int = 1) -> str:
+    name, provider = get_cross_checker_model()
+    if model_family(name) in (model_family(_author_model), model_family(_reviewer_model)):
+        print("  [警告] 同家族复核：当前交叉复核与作者或主审同家族，不能视为异家族验证")
+    return call_api(system_prompt=system_prompt, user_message=user_message,
+                    model_name=name, provider=provider, max_tokens=max_tokens,
+                    temperature=temperature, retry=retry)
 
 
 # ==================== 交互式模型选择 ====================

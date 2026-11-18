@@ -178,7 +178,7 @@ def get_models_for_usage(usage: str, top_k: int = 5) -> List[Dict]:
         "reviewer":        {"vl", "vision"},
         "reader_reviewer": {"vl", "vision", "math", "coder"},
     }
-    char_exclude_usages = ("reviewer", "reader_reviewer")
+    char_exclude_usages = ("reviewer", "reader_reviewer", "cross_checker")
     excl = excluded_patterns.get(usage, set())
     filtered = []
     for m in all_models:

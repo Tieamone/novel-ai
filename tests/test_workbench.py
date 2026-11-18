@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import main as cli
-from core import api_client, config_loader, db, outline_manager, planner, reader_reviewer, reviewer, writer
+from core import api_client, config_loader, db, model_quota, outline_manager, planner, reader_reviewer, reviewer, writer
 from core.memory_manager import MemoryManager
 from core.utils import DatabaseTransaction, with_db_connection
 from workbench.server import create_app
@@ -17,7 +17,7 @@ GOAL = "主角抵达旧码头寻找失踪船只留下的航行记录"
 PARAGRAPH = "雨停后，她沿着码头走到仓库前，抬手推开了那扇半掩着的门。"
 CONTENT = "\n\n".join([PARAGRAPH, "灯塔上的窗户亮了一下。", *[
     f"她在木板边看到了第{i}个标记，停下脚步，把手里的纸页摊在窗沿上。"
-    for i in range(12)
+    for i in range(100)
 ]])
 
 
@@ -28,10 +28,11 @@ class WorkbenchTests(unittest.TestCase):
         self.root = Path(temporary.name)
         cfg = config_loader._get_defaults()
         cfg["paths"] = {"data_dir": str(self.root / "data"), "output_dir": str(self.root / "output")}
-        cfg["novel"].update(chapter_word_min=80, chapter_word_target=300, chapter_word_max=1200)
+        cfg["novel"].update(chapter_word_min=3000, chapter_word_target=3500, chapter_word_max=4000)
         for target, attr, value in [
             (config_loader, "_config", cfg), (config_loader, "PROJECT_ROOT", self.root),
             (db, "_initialized_novels", set()), (db, "_wal_configured_paths", set()),
+            (model_quota, "query_cli", lambda: []),
         ]:
             change = patch.object(target, attr, value)
             change.start()
@@ -177,9 +178,9 @@ class WorkbenchTests(unittest.TestCase):
     def test_review_contract_rejects_invalid_scores_flags_and_length(self):
         for review in (reviewer, reader_reviewer):
             self.assertFalse(review._normalize_review_result({"pass": "false", "score_total": 100})["pass"])
-        result = reviewer.review_chapter(BOOK, 1, "短稿", GOAL)
+        result = reviewer.review_chapter(BOOK, 1, "", GOAL)
         self.assertFalse(result["pass"])
-        self.assertIn("字数", result["suggestions"])
+        self.assertIn("为空", result["suggestions"])
 
     def test_export_failure_leaves_recovery_pending(self):
         self.seed_task(1, "审稿失败")
@@ -225,8 +226,10 @@ class WorkbenchTests(unittest.TestCase):
             summary = {"embed": 9, "resolve": 9}
             if confirmed is not None:
                 summary["decisions"] = confirmed
-            with patch.object(reviewer, "call_reviewer_api",
-                              side_effect=[json.dumps(editor_ok), json.dumps(summary)]):
+            with (patch.object(reviewer, "call_reviewer_api",
+                               side_effect=[json.dumps(editor_ok), json.dumps(summary)]),
+                  patch.object(reviewer, "call_cross_checker_api",
+                               return_value='{"decisions":[{"key":"候选1","equivalent":true,"reason":"一致"}]}')):
                 return reviewer.review_chapter(BOOK, chapter, content, GOAL)
 
         planted = CONTENT + "铜钥匙藏在仓库。"
@@ -235,7 +238,8 @@ class WorkbenchTests(unittest.TestCase):
                         [{"key": "候选1", "verdict": "confirmed", "quote": "不存在的证据"}]):
             reviewer.commit_approved_chapter(BOOK, 1, planted, review(1, planted, invalid))
             self.assertEqual(status(), "planned")
-        planting = review(1, planted, [{"key": "候选1", "verdict": "confirmed", "quote": "铜钥匙藏在仓库"}])
+        planting = review(1, planted, [{"key": "候选1", "verdict": "confirmed", "quote": "铜钥匙藏在仓库",
+                                         "restated": "铜钥匙藏在仓库"}])
         mm.save_chapter(1, "裁切稿", CONTENT)
         reviewer.commit_approved_chapter(BOOK, 1, CONTENT, planting)
         self.assertEqual(status(), "planned")
@@ -250,7 +254,8 @@ class WorkbenchTests(unittest.TestCase):
 
         resolved = CONTENT + "铜钥匙转动，门应声而开。"
         mm.save_chapter(2, "兑现", resolved)
-        verdict = review(2, resolved, [{"key": "候选1", "verdict": "confirmed", "quote": "铜钥匙转动"}])
+        verdict = review(2, resolved, [{"key": "候选1", "verdict": "confirmed", "quote": "铜钥匙转动",
+                                        "restated": "铜钥匙转动后打开门"}])
         with with_db_connection(BOOK) as conn, DatabaseTransaction(conn):
             conn.execute("""CREATE TRIGGER reject_resolve BEFORE UPDATE ON outline_foreshadowing
                 WHEN NEW.status='resolved' BEGIN SELECT RAISE(ABORT, '模拟事务异常'); END""")
@@ -320,14 +325,14 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue((self.root / "output" / BOOK / "第002章.txt").is_file())
 
     def test_overlong_single_paragraph_is_revised_without_truncating_ending(self):
-        original = "雨落在旧码头。" * 160 + "她转动铜牌，门开了。"
-        revised = "雨落在旧码头。" * 100 + "她转动铜牌，门开了。"
+        original = "雨落在旧码头。" * 650 + "她转动铜牌，门开了。"
+        revised = "雨落在旧码头。" * 475 + "她转动铜牌，门开了。"
         with patch.object(writer, "call_author_api", return_value=revised) as shorten:
-            self.assertEqual(writer._fit_chapter_length(original, 600, 900), revised)
+            self.assertEqual(writer._fit_chapter_length(original, 3000, 4000), revised)
             self.assertIn("她转动铜牌，门开了。", shorten.call_args.kwargs["user_message"])
         for invalid in ("过短", revised + "命运的最后裁决即将到来。"):
             with patch.object(writer, "call_author_api", return_value=invalid):
-                self.assertEqual(writer._fit_chapter_length(original, 600, 900), original)
+                self.assertEqual(writer._fit_chapter_length(original, 3000, 4000), original)
 
     def test_force_policy_distinguishes_content_from_service_failure(self):
         config_loader._config["novel"].update(max_retry=1, on_review_exhausted="force_and_flag")
@@ -387,7 +392,7 @@ class WorkbenchTests(unittest.TestCase):
             patch.object(writer, "_plan_chapter_beats", return_value="查看码头的航行记录"),
             patch.object(writer, "is_high_capacity_model", return_value=True),
             patch.object(writer, "call_author_api", return_value=CONTENT),
-            patch.object(writer, "_polish_chapter", side_effect=lambda content, *_: content),
+            patch.object(writer, "_polish_chapter_ex", side_effect=lambda content, *_, **kw: (content, {})),
             patch.object(reviewer, "call_reviewer_api", return_value=editor_response),
             patch.object(reader_reviewer, "call_reader_reviewer_api", return_value=reader_response),
             patch.object(api_client, "call_reviewer_api", return_value='{"summary":"找到了码头记录"}'),
@@ -490,7 +495,7 @@ class WorkbenchTests(unittest.TestCase):
             patch.object(writer, "_plan_chapter_beats", return_value="查看码头的航行记录"),
             patch.object(writer, "is_high_capacity_model", return_value=True),
             patch.object(writer, "call_author_api", return_value=CONTENT),
-            patch.object(writer, "_polish_chapter", side_effect=lambda content, *_: content),
+            patch.object(writer, "_polish_chapter_ex", side_effect=lambda content, *_, **kw: (content, {})),
             patch.object(reviewer, "call_reviewer_api", return_value='{"pass":true,"score_l1":39,"score_l2":24,"score_l3":29}'),
             patch.object(reader_reviewer, "call_reader_reviewer_api", return_value='{"pass":true,"score_total":93,"score_ai_authenticity":24,"score_logic":23,"score_consistency":23,"score_readability":23}'),
             patch.object(api_client, "call_reviewer_api", return_value='{"summary":"码头的记录"}'),
@@ -517,7 +522,7 @@ class WorkbenchTests(unittest.TestCase):
         }
         with (
             patch.object(api_client, "call_author_api", return_value=json.dumps([suggestion], ensure_ascii=False)) as call,
-            patch.object(outline_manager, "review_outline_foreshadow", return_value=None),
+            patch.object(api_client, "call_reviewer_api", return_value='{"1":{"passed":true}}'),
             patch.object(outline_manager, "_print_review_table"),
         ):
             job_id = self.submit("suggest")

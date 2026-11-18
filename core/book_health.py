@@ -29,6 +29,7 @@ def inspect_book(novel):
         tasks = {row["chapter_num"]: row["status"] for row in rows("chapter_tasks", "SELECT chapter_num, status FROM chapter_tasks")}
 
     coverage = max((row["chapter_num"] for row in summaries if row["is_compressed"]), default=0)
+    written_max = max((row["chapter_num"] for row in chapters if row["size"]), default=0)
     individual = {row["chapter_num"] for row in summaries if not row["is_compressed"]}
     approved = {row["chapter_num"] for row in chapters if row["status"] in EXPORTABLE_STATUSES and row["size"]}
     output = get_safe_output_dir(novel)
@@ -43,6 +44,8 @@ def inspect_book(novel):
         "missing_exports": sorted(approved - exports), "stale_exports": sorted(exports - approved),
         "incomplete_tasks": sorted(n for n in approved if n in tasks and tasks[n] not in ("已完成", "completed")),
         "outline_count": len(outline), "outline_needs_review": [item["fid"] for item in suspicious],
+        "stale_planned": [item["fid"] for item in outline
+                          if item["status"] == "planned" and item["plant_chapter"] < written_max],
         "legacy": legacy, "empty_intent": [name for name in TEMPLATES if not read_filled_intent(data_dir / name)],
     }
 
@@ -56,6 +59,7 @@ def show_book_health(novel, *, interactive=False):
         "stale_exports": "导出但无对应已审正文",
         "incomplete_tasks": "已审但任务未完成",
         "outline_needs_review": "大纲伏笔章号需人工复核",
+        "stale_planned": "已过计划埋入章但仍未埋入",
         "empty_intent": "缺失或未填的创作资料",
     }.items():
         say(f"{label}：{', '.join(map(str, report[field])) or '无'}")

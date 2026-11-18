@@ -3,8 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import json
+import sqlite3
 
-from core import config_loader, db, outline_manager, planner, reviewer, writer
+from core import api_client, book_health, config_loader, db, outline_manager, planner, reviewer, writer
 from core.memory_manager import MemoryManager
 
 
@@ -14,6 +16,7 @@ class NarrativeTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         config = config_loader._get_defaults()
+        config['novel'].update(chapter_word_min=3000, chapter_word_max=4000)
         config['paths'] = {'data_dir': str(self.root / 'data'),
                            'output_dir': str(self.root / 'output')}
         for target, attr, value in (
@@ -73,14 +76,226 @@ class NarrativeTests(unittest.TestCase):
             self.assertIn(block, prompt)
             self.assertNotIn('仓库停运', prompt)
 
-    def test_polish_accepts_large_cut_and_rejects_empty(self):
-        source = '多余环境描写。' * 100 + '他把货交给了买家。'
-        cut = '他把货交给了买家。'
-        with patch.object(writer, 'call_author_api', return_value=cut):
-            self.assertEqual(writer._polish_chapter(source, 1000, len(cut)), cut)
-            self.assertEqual(writer._polish_chapter(source, 1000, len(cut) + 1), cut)
-        with patch.object(writer, 'call_author_api', return_value=''):
-            self.assertEqual(writer._polish_chapter(source, 1000), source)
+    def test_polish_length_and_fact_guards(self):
+        body = lambda length: "甲" * (length - 1) + "。"
+        good = '{"facts":[{"item":"交货","kept":true}],"task_end_kept":true}'
+        lost = '{"facts":[{"item":"交货","kept":false}],"task_end_kept":true}'
+        end_lost = '{"facts":[{"item":"交货","kept":true}],"task_end_kept":false}'
+        for size, candidate, facts, accepted, calls in (
+            (3500, "他把货交给了买家。", lost, False, 1),
+            (3500, body(1400), good, True, 1),
+            (3500, "甲" * 2600, good, False, 0),
+            (3500, "以下是修改稿：" + body(2600), good, False, 0),
+            (3500, body(2000), good, True, 1),
+            (3500, body(2600), lost, False, 1),
+            (3500, body(2600), end_lost, False, 1),
+            (3500, body(2600), '{"facts":[],"task_end_kept":true}', False, 1),
+            (3500, body(2600), OSError("模拟核验故障"), False, 1),
+            (4000, body(2400), good, True, 1),
+            (3500, body(2600), good, True, 1),
+            (3500, "", good, False, 0),
+        ):
+            with self.subTest(size=size, candidate=len(candidate), facts=facts), (
+                patch.object(writer, 'call_author_api', return_value=candidate)
+            ), patch.object(writer, 'call_reviewer_api', side_effect=[facts]) as check:
+                text, report = writer._polish_chapter_ex(body(size), 4096, plot_goal="交货")
+                self.assertEqual(text, candidate if accepted else body(size))
+                self.assertEqual(report["accepted"], accepted)
+                self.assertEqual(check.call_count, calls)
+        self.assertFalse(writer.chapter_length_issue(body(2600)))
+        self.assertFalse(writer.chapter_length_issue(body(2000)))
+        self.assertTrue(writer.chapter_length_issue("  "))
+        self.assertTrue(writer.chapter_length_issue(body(4001)))
+        with patch.object(writer, 'call_author_api', side_effect=OSError):
+            self.assertEqual(writer._polish_chapter(body(3500), 4096), body(3500))
+
+    def test_macro_audit_failures_never_insert(self):
+        (self.mm.data_dir / "master_outline.md").write_text("主角核对凭证。", encoding="utf-8")
+        suggestion = '[{"description":"保留凭证","plant_chapter":1,"resolve_chapter":3}]'
+        for response in (OSError("模拟服务故障"), "没有JSON", "{无效:}"):
+            with patch.object(api_client, "call_author_api", return_value=suggestion), \
+                    patch.object(api_client, "call_reviewer_api", side_effect=[response] * 3) as call:
+                self.assertEqual(outline_manager.generate_outline_foreshadow(self.mm.novel_name, 3), 0)
+                self.assertEqual(call.call_count, 3)
+                self.assertEqual(outline_manager.list_outline_foreshadow(self.mm.novel_name), [])
+
+    def test_macro_audit_supplements_missing_and_parses_strict_booleans(self):
+        with patch.object(api_client, "call_reviewer_api", side_effect=[
+            '{"1":{"passed":"false"},"3":{"passed":"true"},"4":{"passed":1},"5":{"passed":"是"}}',
+            '{"2":{"passed":true}}',
+        ]) as call:
+            result = outline_manager.review_outline_foreshadow("", [{}] * 5, "", "")
+            self.assertEqual([r["passed"] for r in result.values()], [False, True, True, False, True])
+            self.assertEqual(call.call_count, 2)
+
+    def test_writing_context_raises_database_read_failure(self):
+        with patch.object(outline_manager, "with_db_connection", side_effect=sqlite3.OperationalError("模拟")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.mm.load_context(1)
+            self.assertEqual(outline_manager.get_chapter_outline_tasks(self.mm.novel_name, 1, readonly=True),
+                             {"to_plant": [], "to_resolve": []})
+            result = reviewer.review_chapter(self.mm.novel_name, 1, "甲" * 3499 + "。", "交货")
+            self.assertTrue(result["review_error"])
+
+    def test_split_and_revision_apply_same_polish_guard_without_extra_supplement(self):
+        goal = "本章停在交货完成"
+        original = "甲" * 3499 + "。"
+        condensed = "乙" * 2599 + "。"
+        facts = '{"facts":[{"item":"交货","kept":true}],"task_end_kept":true}'
+        with (patch.object(writer, "is_high_capacity_model", return_value=False),
+              patch.object(writer, "_plan_chapter_beats", return_value="1. 交货。"),
+              patch.object(writer, "call_reviewer_api", return_value=facts) as verify,
+              patch.object(writer, "call_author_api", side_effect=[original[:1750], original[1750:], condensed]) as author):
+            self.assertEqual(writer.write_chapter(self.mm.novel_name, 1, goal), condensed)
+            self.assertEqual(author.call_count, 3)
+            self.assertIn(goal, verify.call_args.kwargs["user_message"])
+        with (patch.object(writer, "call_reviewer_api", return_value=facts),
+              patch.object(writer, "call_author_api", side_effect=[original, condensed]) as author):
+            self.assertEqual(writer.revise_chapter(self.mm.novel_name, 1, original, "删冗余", goal), condensed)
+            self.assertEqual(author.call_count, 2)
+
+    def test_short_revision_goes_to_review_without_supplement(self):
+        short = "甲" * 1190 + "。\n\n仓库终于交货。"
+        facts = '{"facts":[{"item":"交货","kept":true}],"task_end_kept":true}'
+        with (patch.object(writer, "call_author_api", side_effect=[short, short]) as author,
+              patch.object(writer, "call_reviewer_api", return_value=facts)):
+            actual = writer.revise_chapter(self.mm.novel_name, 1, "甲" * 3499 + "。", "删去无关尾声", "仓库交货")
+        self.assertEqual(actual, short)
+        self.assertEqual(author.call_count, 2)
+        self.assertFalse(writer.chapter_length_issue(actual))
+
+    def test_tail_cut_is_located_and_reaudited_before_commit(self):
+        prefix = "甲" * 1699 + "。\n\n他确认设备存在隐患。"
+        tail = "他给主管发去了一条挑衅短信。\n\n他决定连夜取证。"
+        draft = prefix + "\n\n" + tail
+        rejected = {"pass": False, "score_total": 68, "tail_cut": {
+            "goal_complete": True, "start": tail.split("\n\n")[0]},
+            "foreshadow_reviewed_content": draft, "foreshadow_score": {"confirmed": [{"fid": "旧结论"}]}}
+        self.assertEqual(reviewer._trim_reviewed_tail(draft, rejected), prefix)
+        for cut in ({"goal_complete": False, "start": tail},
+                    {"goal_complete": "true", "start": tail},
+                    {"goal_complete": True, "start": "不存在的原句。"},
+                    {"goal_complete": True, "start": "给主管"}):
+            self.assertEqual(reviewer._trim_reviewed_tail(draft, {**rejected, "tail_cut": cut}), draft)
+        self.assertEqual(reviewer._trim_reviewed_tail(draft + "\n\n" + tail, rejected), draft + "\n\n" + tail)
+        approved = {"pass": True, "score_total": 90, "foreshadow_reviewed_content": prefix,
+                    "foreshadow_score": {"confirmed": []}}
+        self.mm.save_chapter(1, "正文", draft)
+        with (patch.object(writer, "write_chapter", return_value=draft),
+              patch.object(reviewer, "review_chapter", side_effect=[rejected, approved]) as review,
+              patch.object(reviewer, "reader_review_chapter", return_value={"pass": True, "score_total": 90}) as reader):
+            actual = reviewer.write_and_review(self.mm.novel_name, 1, "确认设备隐患", max_retry=1)
+        self.assertEqual(actual, prefix)
+        self.assertEqual(review.call_args.args[2], prefix)
+        self.assertEqual(reader.call_args.args[2], prefix)
+        self.assertEqual(self.mm.load_chapter(1)["content"], prefix)
+
+    def test_short_synopsis_still_needs_editor_approval(self):
+        novel = self.mm.novel_name
+        self.mm.save_chapter(1, "梗概", "主角发现故障，修好机器。")
+        verdict = {"pass": False, "score_l1": 20, "score_l2": 10, "score_l3": 15,
+                   "suggestions": "缺少发现故障到完成修复的必要因果"}
+        with patch.object(reviewer, "call_reviewer_api", return_value=json.dumps(verdict)) as model:
+            result = reviewer.review_chapter(novel, 1, "主角发现故障，修好机器。", "修复机器")
+        self.assertTrue(model.called)
+        self.assertFalse(result["pass"])
+
+    def test_minor_overflow_cuts_only_selected_middle_paragraph(self):
+        redundant = "雨声又响了一阵，他再次看了看窗外。"
+        closing = "“订单就这么定了。”她把合同交给他。"
+        room = 4015 - len(redundant) - len(closing) - 4
+        beginning = "甲" * (room - 1) + "。"
+        original = "\n\n".join((beginning, redundant, closing))
+        with patch.object(writer, "call_author_api", return_value='{"paragraph":1}') as call:
+            actual = writer._fit_chapter_length(original, 2250, 4000)
+            self.assertEqual(actual, beginning + "\n\n" + closing)
+            self.assertLessEqual(len(actual), 4000)
+            self.assertEqual(call.call_count, 1)
+            self.assertEqual(call.call_args.kwargs["max_tokens"], 128)
+        for response in ('{"paragraph":0}', '{"paragraph":2}', '{"paragraph":true}', '{"paragraph":null}', '非法输出'):
+            with self.subTest(response=response), patch.object(writer, "call_author_api", return_value=response):
+                self.assertEqual(writer._fit_chapter_length(original, 2250, 4000), original)
+        duplicate = original.replace(closing, redundant + "\n\n" + closing)
+        with patch.object(writer, "call_author_api") as call:
+            self.assertEqual(writer._fit_chapter_length(duplicate, 2250, 4000), duplicate)
+            call.assert_not_called()
+
+    def test_plant_deferral_confirmation_and_delete(self):
+        novel = self.mm.novel_name
+        fid = outline_manager.add_outline_foreshadow(novel, "收起借用单", "情节伏笔", 1, 4)
+        body = "他接过借用单。"
+
+        def commit(chapter, confirmed=False):
+            self.mm.save_chapter(chapter, "正文", body)
+            reviewer.commit_approved_chapter(novel, chapter, body, {
+                "pass": True, "foreshadow_reviewed_content": body,
+                "foreshadow_score": {"confirmed": [{"fid": fid, "source": "大纲", "action": "plant"}] if confirmed else [],
+                                     "unconfirmed_plant": [] if confirmed else [fid]},
+            })
+            return outline_manager.list_outline_foreshadow(novel)[0]
+
+        self.assertEqual(commit(1)["plant_chapter"], 2)
+        self.mm.save_chapter(2, "强制稿", body)
+        reviewer._force_approve_chapter(novel, 2, body, self.mm)
+        self.assertEqual(outline_manager.list_outline_foreshadow(novel)[0]["plant_chapter"], 2)
+        self.assertEqual(commit(2)["plant_chapter"], 3)
+        with patch.object(reviewer, "print", create=True) as log:
+            self.assertEqual(commit(3)["plant_chapter"], 3)
+            self.assertIn("无顺延空间", str(log.call_args_list))
+        self.assertFalse(self.mm.load_context(4)["outline_tasks"]["to_resolve"])
+        self.mm.save_chapter(4, "后续章", body)
+        self.assertIn(fid, book_health.inspect_book(novel)["stale_planned"])
+        self.assertEqual(commit(3, confirmed=True)["status"], "planted")
+        self.assertEqual(self.mm.load_context(4)["outline_tasks"]["to_resolve"][0]["fid"], fid)
+        self.mm.delete_chapter(3)
+        row = outline_manager.list_outline_foreshadow(novel)[0]
+        self.assertEqual((row["plant_chapter"], row["status"]), (3, "planned"))
+        outline_manager.update_outline_foreshadow(novel, fid, resolve_chapter=None)
+        self.assertEqual(commit(3)["plant_chapter"], 3)
+
+    def test_crosscheck_downgrades_invalid_or_missing_evidence(self):
+        candidate = {"fid": "OF1", "description": "铜牌开门", "source": "大纲", "action": "resolve"}
+        decision = {"key": "候选1", "quote": "林岚用铜牌打开了门。", "verdict": "confirmed"}
+        for restated, equivalent, expected in (
+            ("", True, False), ("铜牌打不开门", False, False), ("铜牌开门", "true", False),
+            ("铜牌开门", OSError("模拟故障"), False), ("铜牌开门", True, True),
+        ):
+            response = (equivalent if isinstance(equivalent, Exception) else
+                        json.dumps({"decisions": [{"key": "候选1", "equivalent": equivalent, "reason": "比对"}]}))
+            with patch.object(reviewer, "call_reviewer_api", return_value=json.dumps({
+                "decisions": [{**decision, "restated": restated}],
+            })), patch.object(reviewer, "call_cross_checker_api", side_effect=[response]) as cross:
+                result = reviewer.score_foreshadowing("前文。" + decision["quote"] + "后续。", {"to_resolve": [candidate]})
+                self.assertEqual(bool(result["confirmed"]), expected)
+                self.assertEqual(cross.call_count, bool(restated))
+
+    def test_incomplete_foreshadow_review_preserves_plan(self):
+        novel = self.mm.novel_name
+        fid = outline_manager.add_outline_foreshadow(novel, "收起借用单", "情节伏笔", 1, 4)
+        body = "他接过借用单。"
+        candidate = {"fid": fid, "description": "收起借用单", "source": "大纲", "action": "plant"}
+        decision = {"key": "候选1", "verdict": "unconfirmed"}
+        for entries in ([], [decision, decision], [{**decision, "key": "未知"}],
+                        [{**decision, "verdict": "unknown"}], [None], [{"key": []}]):
+            with self.subTest(entries=entries), patch.object(reviewer, "call_reviewer_api", return_value=json.dumps({
+                "decisions": entries,
+            })), patch.object(reviewer, "call_cross_checker_api") as cross:
+                score = reviewer.score_foreshadowing(body, {"to_plant": [candidate]}, 1)
+                self.assertIsNone(score)
+                cross.assert_not_called()
+                self.mm.save_chapter(1, "正文", body)
+                reviewer.commit_approved_chapter(novel, 1, body, {
+                    "pass": True, "foreshadow_reviewed_content": body, "foreshadow_score": score,
+                })
+                row = outline_manager.list_outline_foreshadow(novel)[0]
+                self.assertEqual((row["plant_chapter"], row["status"]), (1, "planned"))
+
+    def test_cross_checker_fallback_warns(self):
+        with patch.object(api_client, "call_api", return_value="{}") as call, \
+                patch.object(api_client, "print") as log:
+            api_client.call_cross_checker_api("系统", "内容")
+            self.assertEqual(call.call_args.kwargs["model_name"], api_client.get_reviewer_model())
+            self.assertIn("同家族复核", str(log.call_args_list))
 
     def test_empty_macro_plan_is_valid_without_review_request(self):
         (self.mm.data_dir / 'master_outline.md').write_text('送货并收取货款。', encoding='utf-8')

@@ -17,6 +17,8 @@ model:
     default_model: qwen3.6-flash
     enabled: true
     pass_threshold: 75
+  cross_checker:
+    default_model: ""  # 留空回退主审，并明确提示同家族复核
 
 # ==================== 写作温度配置 ====================
 # 各任务类型的 temperature 统一在此管理，无需修改代码
