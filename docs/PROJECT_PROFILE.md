@@ -1,6 +1,6 @@
 # AI 网文写作系统 - 项目白皮书
 
-宏观策划只设计主线必要的伏笔，可以为空。写作、修订和主审读取当前章的大纲安排，历史动态伏笔不再按年龄自动兑现。写作默认以人物行动和剧情结果为主，环境简写，常规过程概述结果，打磨保留精简稿，低于字数下限时由后续检查报告。
+宏观策划只设计主线必要的伏笔，可以为空。写作、修订和主审读取当前章的大纲安排，历史动态伏笔不再按年龄自动兑现。常规流程概述结果，关键场面通过现场证据、人物回应和选择的后果展开。轻量打磨可按配置启用，明显超长的正文另走精简和事实核验。
 
 ## 1. 项目概况
 
@@ -207,8 +207,8 @@ write_and_review(novel_name, chapter_num, plot_goal, emotion_tag)
   │        │   True  → build_full_chapter_prompt() → 一次性生成      │
   │        │   False → build_writer_prompt() → 前半段                │
   │        │         → build_continue_prompt() → 后半段              │
-  │        │         → 字数补写 (supplement) 循环                     │
-  │        └─ _polish_chapter() → 去 AI 化打磨和本地诊断              │
+  │        ├─ _polish_chapter_ex() → 可选短语打磨和本地诊断            │
+  │        └─ _fit_chapter_length() → 超长裁切或精简                  │
   │    ↓                                                              │
   │    review_chapter()           # [core/reviewer.py:L578] 责任编辑  │
   │      ├─ build_review_prompt() → REVIEWER_SYSTEM                 │
@@ -340,8 +340,8 @@ _breakpoint_menu(novel_name)             # [main.py:L1285]
   │    查询 writing_sessions 表（由 write_and_review 每次尝试写入）
   │
   ├─ 4. 重写指定章节（保留摘要）
-  │    UPDATE chapters SET content=NULL, status='草稿'
-  │    UPDATE chapter_tasks SET status='待处理'
+  │    删除旧的章节记录、导出和节拍缓存，保留逐章摘要
+  │    将对应任务卡重置为「待处理」
   │
   └─ 5. 清除节拍缓存（指定章节）
       DELETE FROM beats_cache WHERE chapter_num=?
@@ -410,7 +410,7 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `build_writer_prompt()` | `(...)` | 构建小模型前半段 prompt |
 | `build_continue_prompt()` | `(...)` | 构建小模型后半段 prompt |
 | `_plan_chapter_beats()` | `(ctx, chapter_num, plot_goal, emotion_tag) -> str` | AI 节拍规划 |
-| `_polish_chapter()` | `(full_content, max_tokens) -> str` | 去 AI 化打磨和本地规则诊断 |
+| `_polish_chapter_ex()` | `(full_content, max_tokens, word_min=0, *, plot_goal="")` | 返回采用稿及打磨报告，记录跳过、采纳或回退原因 |
 | `_rule_based_ai_check()` | `(text) -> list` | 规则检测 AI 痕迹 |
 | `is_high_capacity_model()` | `() -> bool` | 判断当前模型是否走大模型策略 |
 
@@ -420,8 +420,8 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 |------|------|
 | `AUTHOR_STYLES` (dict, 9种) | 预设写作风格：爽文宗师/悬疑大师/情感流/热血战斗/世界构建者/轻松日常/刘慈欣/金庸/古龙 |
 | `EMOTION_GUIDE` (dict, 5种) | 情绪标签指南：爽点/冲突/反转/低谷/铺垫 |
-| `WRITER_HARD_CONSTRAINTS` (list, 7条) | 写作硬约束规则 |
-| `WRITER_FORBIDDEN_RULES` (list, 11条) | 写作禁止项规则 |
+| `WRITER_HARD_CONSTRAINTS` | 包含章节边界、人物动机、伏笔和关键场面的写作规则 |
+| `WRITER_FORBIDDEN_RULES` | 写作禁止项规则 |
 | `AI_PATTERNS` (list) | AI 痕迹正则检测规则 |
 | `NEGATIVE_EXAMPLES` (str) | 反面教材示例文本 |
 | `HUMAN_WRITING_TECHNIQUES` (str) | 真实写作手法指引 |
@@ -801,8 +801,8 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 | `temperature.writing_main` | float | 0.85 | 大模型一次性生成整章 |
 | `temperature.writing_first_half` | float | 0.90 | 小模型前半段 |
 | `temperature.writing_second_half` | float | 0.70 | 小模型后半段 |
-| `temperature.writing_supplement` | float | 0.75 | 字数补写 |
-| `temperature.revision` | float | 0.70 | 正文修订和去 AI 化打磨 |
+| `temperature.writing_supplement` | float | 0.75 | 早期补写配置，当前写作流程不使用 |
+| `temperature.revision` | float | 0.70 | 正文局部修订 |
 | `temperature.beat_planner` | float | 0.65 | 节拍规划 |
 | `temperature.outline_gen` | float | 0.90 | 总大纲生成 |
 | `temperature.world_gen` | float | 0.85 | 世界观生成 |
@@ -815,9 +815,10 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `novel.chapter_word_target` | int | 3500 | 章节目标字数（中间值） |
-| `novel.chapter_word_min` | int | 3000 | 章节最小字数（低于触发补写） |
-| `novel.chapter_word_max` | int | 4000 | 章节最大字数（达到停止补写） |
+| `novel.chapter_word_target` | int | 3500 | 写作目标，明显超长时按建议区间内的目标精简 |
+| `novel.chapter_word_min` | int | 3000 | 建议下限，完整短章交由双审 |
+| `novel.chapter_word_max` | int | 4000 | 章节硬上限 |
+| `novel.chapter_polish_enabled` | bool | false | 对首稿和修订稿启用轻量短语打磨 |
 | `novel.max_retry` | int | 3 | 每章最多重试次数 |
 | `novel.on_review_exhausted` | str | stop | 内容未通过时停止，或标记强制通过后继续 |
 | `novel.recent_summary_count` | int | 5 | 每次压缩保留的逐章摘要数 |
@@ -846,10 +847,10 @@ _recover_review_failed(novel_name)       # [main.py:L727]
 - [x] 章节字数控制（chapter_word_min / chapter_word_max）
 - [x] max_tokens 动态计算（word_max × 1.75 封顶 7000）
 - [x] 14 个模型支持（DashScope + Mimo 双 Provider）
-- [x] 默认模型更换为 qwen3.6-flash（有免费额度）
+- [x] 默认作者配置为 qwen3.6-flash，实际免费候选以百炼 CLI 返回的账号额度为准
 - [x] 大纲伏笔管理系统（规划→埋入→兑现 完整生命周期）
 - [x] 冲突检测 + 任务卡自动重写
-- [x] AI 痕迹规则检测与去 AI 化打磨
+- [x] AI 痕迹规则检测与可选的轻量短语打磨
 - [x] 9 种预设写作风格 + 自定义风格
 - [x] 章节摘要自动压缩（阶段摘要合并）
 - [x] 伏笔健康度报告

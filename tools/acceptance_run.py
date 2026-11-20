@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from core import api_client, config_loader, model_quota, reviewer, writer
 from core.book_health import inspect_book
+from core.exporter import clean_for_export
 from core.memory_manager import MemoryManager
 from core.outline_manager import add_outline_foreshadow, list_outline_foreshadow
 from core.utils import extract_json_obj, with_db_connection
@@ -56,14 +57,14 @@ class Budget:
         return response
 
 
-def estimate(chapters, samples, max_retry, only_metamorphic=False, split=False):
+def estimate(chapters, samples, max_retry, only_metamorphic=False, split=False, polish=False):
     n = 0 if only_metamorphic else chapters
     compression = 3 if n == 12 else 0
-    # 一次首稿、节拍、打磨、事实核验、两审、记忆、两次对照；两章有伏笔。
+    # 首稿、节拍、双审、记忆。启用轻量打磨时预留候选、事实核验和两次对照。
     normal = {"新书策划估算": 10 if n else 0,
-              "流水线": (9 + int(split)) * n + (4 if n else 0) + compression,
+              "流水线": (5 + int(split) + 4 * int(polish)) * n + (4 if n else 0) + compression,
               "变形": 5 * samples, "变形复核最多追加": 4 * samples}
-    # 每次生成可能分两段、补写三次、精简一次，并有多轮审稿。
+    # 每次生成可能分两段、超长精简并复核事实，也可能有多轮审稿。
     # 额外给裁切复审、一次任务卡重写和对应重试留出余量。
     upper = n * (2 * max_retry * 30 + 6) + compression + 10 * samples
     return {"chapters": n, "samples": samples, "normal": normal,
@@ -228,7 +229,7 @@ def run_pipeline(directory, chapters, pair_model, report, *, seeded=False):
             exported = path.read_text(encoding="utf-8")
             markers = re.findall(r"【[^】\r\n]+】", body)
             export_rows.append({"chapter": number, "source_length": len(body), "export_length": len(exported),
-                                "same_body": body == exported,
+                                "same_body": clean_for_export(body) == exported,
                                 "marker_present": bool(markers),
                                 "marker_kept": all(exported.count(marker) >= count
                                                    for marker, count in Counter(markers).items())})
@@ -253,15 +254,18 @@ def run_pipeline(directory, chapters, pair_model, report, *, seeded=False):
     ) if covered else "未覆盖：写作范围无计划埋入项")
     report["deferrals"] = sum(max(0, item["plant_chapter"] - initial_plan[fid]["plant_chapter"])
                               for fid, item in final_plan.items() if fid in initial_plan)
-    paired = [x for x in polishes if x["accepted"]]
+    attempted = [x for x in polishes if not x.get("skipped")]
+    paired = [x for x in attempted if x["accepted"]]
     stats["成对比较"] = bool(paired) and all(len(x["pair"]) == 2 and min(
         r["fact_retention"] for r in x["pair"]) >= 0.9 for x in paired)
+    if rows and not attempted:
+        stats["成对比较"] = "未覆盖：本次没有需要比较的打磨候选"
     report["metrics"] = {
         "first_pass_rate": sum(len(r["sessions"]) == 1 and r["status"] == "已审核" for r in rows) / max(1, len(rows)),
         "average_retries": sum(max(0, len(r["sessions"]) - 1) for r in rows) / max(1, len(rows)),
         "statuses": dict(Counter(r["status"] or "未生成" for r in rows)),
-        "polish_acceptance": len(paired) / len(polishes) if polishes else None,
-        "polish_rejections": dict(Counter(x["reason"] for x in polishes if not x["accepted"])),
+        "polish_acceptance": len(paired) / len(attempted) if attempted else None,
+        "polish_rejections": dict(Counter(x["reason"] for x in attempted if not x["accepted"])),
     }
 
 
@@ -298,9 +302,10 @@ def cli(label="流水线与变形验收", *, only_metamorphic=False):
     directory = config_loader.get_project_root() / "output" / "acceptance" / stamp
     directory.mkdir(parents=True)
     split = any(part in models["author"].lower() for part in ("flash", "turbo", "lite", "mini"))
+    need_pair = not only_metamorphic and cfg["novel"].get("chapter_polish_enabled", False)
     report = {"mode": "真实" if args.yes else "Dry-run", "result": "DRY-RUN", "models": models,
               "stream": args.stream,
-              "estimate": estimate(args.chapters, args.samples, cfg["novel"].get("max_retry", 3), only_metamorphic, split),
+              "estimate": estimate(args.chapters, args.samples, cfg["novel"].get("max_retry", 3), only_metamorphic, split, need_pair),
               "checks": {}, "chapters": [], "polishes": [], "max_tokens": args.max_tokens}
     budget = None
     try:
@@ -310,12 +315,16 @@ def cli(label="流水线与变形验收", *, only_metamorphic=False):
             if not 0 < args.request_timeout <= 600:
                 raise ValueError("请求超时须大于 0 且不超过 600 秒")
             families = {api_client.model_family(models[r]) for r in ("author", "reviewer")}
-            for role in (("cross_checker",) if only_metamorphic else ("cross_checker", "pair")):
+            for role in (("cross_checker", "pair") if need_pair else ("cross_checker",)):
                 if not models[role] or api_client.model_family(models[role]) in families:
                     raise ValueError(f"{role} 需要明确指定与作者、主审不同家族的模型")
             if not models["generator"] or models["generator"] in (models["reviewer"], models["cross_checker"]):
                 raise ValueError("变体生成模型必须区别于被测两层判定模型")
-            active = {models[r] for r in (("reviewer", "cross_checker", "generator") if only_metamorphic else models)}
+            active = {models[r] for r in ("reviewer", "cross_checker", "generator")}
+            if not only_metamorphic:
+                active.update((models["author"], models["reader"]))
+            if need_pair:
+                active.add(models["pair"])
             today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
             quota = {item["model"]: item for item in model_quota.query_cli()}
             if any(m not in quota or not quota[m]["autoStop"] or quota[m]["expires"] <= today
@@ -354,7 +363,7 @@ def cli(label="流水线与变形验收", *, only_metamorphic=False):
                     return response, getattr(usage, "total_tokens", None)
 
                 guarded_args = [messages[0]["content"], messages[1]["content"], kwargs["model"],
-                                kwargs["max_tokens"], kwargs["temperature"]]
+                                kwargs["max_tokens"], kwargs.get("temperature")]
                 response = budget.call(transport, *guarded_args)
                 print(f"  [验收用量] 第{budget.requests}次 {kwargs['model']}，累计{budget.tokens}/{budget.limit or '无人工上限'} token",
                       flush=True)

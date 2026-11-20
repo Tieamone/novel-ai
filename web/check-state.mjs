@@ -6,10 +6,12 @@ const source = fs.readFileSync(new URL('./src/App.vue', import.meta.url), 'utf8'
 function setup() {
   const requests = []
   const context = vm.createContext({ ref, computed, watch, onMounted() {}, onBeforeUnmount() {},
-    localStorage: { getItem() {}, setItem() {} }, window: {}, URLSearchParams, TextDecoder,
+    localStorage: { getItem() {}, setItem() {} }, window: { setTimeout() {} }, URLSearchParams, TextDecoder,
     fetch(url, options) { return new Promise(resolve => requests.push({ url, options, done: data => resolve({ ok: true, json: async () => data }) })) },
   })
-  const state = vm.runInContext(source + '\n;({ selected, chapter, checkpoint, checkpointNumber, book, view, dialog, styleForm, modelForm, openChapter, loadCheckpoint, loadBook, form, submit })', context)
+  const state = vm.runInContext(source + `\n;({ selected, chapter, checkpoint, checkpointNumber, book, view, dialog,
+    styleForm, modelForm, openChapter, loadCheckpoint, loadBook, form, submit, receive, finished,
+    activeJob, jobOpen, dialogReady, respond })`, context)
   return { state, requests }
 }
 {
@@ -46,4 +48,43 @@ function setup() {
   assert.equal(s.dialog.value, null, '切书关闭旧书弹窗')
   assert.equal(s.styleForm.value.custom, '', '切书不能保留旧书风格草稿')
 }
-console.log('通过：章节乱序响应、切章清空、刷新与选择竞争、断点输入一致性、切书弹窗与草稿隔离')
+{
+  const { state: s, requests: r } = setup()
+  const running = { id: 'old', status: 'running', kind: 'generate', log: [] }
+  s.receive(running)
+  s.form('create', '新建小说', { name: '表单草稿' })
+  const waiting = { ...running, status: 'waiting', prompt: { id: 1 } }
+  s.receive(waiting)
+  assert.equal(s.dialogReady.value, true, '后台任务等待时仍可查看新建表单')
+  assert.equal(s.jobOpen.value, false, '后台任务的新提示不会盖住正在填写的表单')
+  assert.equal(s.activeJob.value, true)
+  s.submit()
+  assert.equal(r.length, 0, '等待确认期间禁止并发提交写入任务')
+  const answer = s.respond('继续')
+  assert.equal(r[0].url, '/api/jobs/old/answer')
+  r[0].done({ ok: true }); await answer
+  assert.equal(s.dialog.value.fields.name, '表单草稿', '处理当前任务后保留填写的书名')
+}
+{
+  const { state: s, requests: r } = setup()
+  s.form('delete_chapters', '批量删除章节', { range: '5-2', confirm: 'YES' })
+  s.submit()
+  assert.match(s.dialog.value.error, /连续范围/)
+  assert.equal(r.length, 0, '倒序范围不提交')
+  s.dialog.value.fields.range = '2-5'
+  const submitting = s.submit()
+  const payload = JSON.parse(r[0].options.body)
+  assert.equal(payload.first, 2)
+  assert.equal(payload.last, 5)
+  const job = { id: 'delete', kind: 'delete_chapters', status: 'running', log: [] }
+  r[0].done(job); await submitting
+  assert.equal(s.jobOpen.value, true)
+  assert.equal(s.dialogReady.value, false, '已提交的弹窗让出任务面板')
+  s.receive({ ...job, status: 'failed', error: '选定范围内有章节不存在' })
+  const finishing = s.finished()
+  assert.equal(s.jobOpen.value, false)
+  assert.equal(s.dialog.value.fields.range, '2-5')
+  assert.match(s.dialog.value.error, /不存在/)
+  r[1].done({ token: '', novels: [] }); await finishing
+}
+console.log('通过：切书和乱序响应、断点输入一致性、任务阻塞时保留表单、删章范围与失败重试')

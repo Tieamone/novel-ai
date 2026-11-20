@@ -76,38 +76,36 @@ class NarrativeTests(unittest.TestCase):
             self.assertIn(block, prompt)
             self.assertNotIn('仓库停运', prompt)
 
-    def test_polish_length_and_fact_guards(self):
-        body = lambda length: "甲" * (length - 1) + "。"
+    def test_light_polish_applies_only_located_phrases_after_fact_check(self):
+        config_loader._config["novel"]["chapter_polish_enabled"] = True
+        original = "第1章 交货\n\n他不由自主地看了一眼秤。\n\n“少了一斤。”她收回了签字笔。"
+        candidate = original.replace("不由自主地看了一眼", "瞥了眼")
+        edits = '{"edits":[{"old":"不由自主地看了一眼","new":"瞥了眼"}]}'
         good = '{"facts":[{"item":"交货","kept":true}],"task_end_kept":true}'
         lost = '{"facts":[{"item":"交货","kept":false}],"task_end_kept":true}'
         end_lost = '{"facts":[{"item":"交货","kept":true}],"task_end_kept":false}'
-        for size, candidate, facts, accepted, calls in (
-            (3500, "他把货交给了买家。", lost, False, 1),
-            (3500, body(1400), good, True, 1),
-            (3500, "甲" * 2600, good, False, 0),
-            (3500, "以下是修改稿：" + body(2600), good, False, 0),
-            (3500, body(2000), good, True, 1),
-            (3500, body(2600), lost, False, 1),
-            (3500, body(2600), end_lost, False, 1),
-            (3500, body(2600), '{"facts":[],"task_end_kept":true}', False, 1),
-            (3500, body(2600), OSError("模拟核验故障"), False, 1),
-            (4000, body(2400), good, True, 1),
-            (3500, body(2600), good, True, 1),
-            (3500, "", good, False, 0),
-        ):
-            with self.subTest(size=size, candidate=len(candidate), facts=facts), (
-                patch.object(writer, 'call_author_api', return_value=candidate)
-            ), patch.object(writer, 'call_reviewer_api', side_effect=[facts]) as check:
-                text, report = writer._polish_chapter_ex(body(size), 4096, plot_goal="交货")
-                self.assertEqual(text, candidate if accepted else body(size))
-                self.assertEqual(report["accepted"], accepted)
-                self.assertEqual(check.call_count, calls)
-        self.assertFalse(writer.chapter_length_issue(body(2600)))
-        self.assertFalse(writer.chapter_length_issue(body(2000)))
+        for facts in (good, lost, end_lost, '{"facts":[],"task_end_kept":true}', OSError("核验中断")):
+            with (self.subTest(facts=facts), patch.object(writer, 'call_author_api', return_value=edits),
+                  patch.object(writer, 'call_reviewer_api', side_effect=[facts]) as check):
+                text, report = writer._polish_chapter_ex(original, 4096, plot_goal="交货")
+                self.assertEqual(text, candidate if facts == good else original)
+                self.assertEqual(report["accepted"], facts == good)
+                self.assertIn("交货", check.call_args.kwargs["user_message"])
+        for raw in ("整章重写。", '{"edits":[]}', '{"edits":[{"old":"秤","new":""}]}',
+                    '{"edits":[{"old":"不存在","new":"改词"}]}',
+                    '{"edits":[{"old":"了","new":"着"}]}',
+                    '{"edits":[{"old":"看了一眼","new":"看了看"},{"old":"一眼秤","new":"秤盘"}]}'):
+            with (self.subTest(raw=raw), patch.object(writer, 'call_author_api', return_value=raw),
+                  patch.object(writer, 'call_reviewer_api') as check):
+                self.assertEqual(writer._polish_chapter(original, 4096), original)
+                check.assert_not_called()
+        with (patch.object(writer, 'call_author_api', side_effect=OSError),
+              patch.object(writer, 'call_reviewer_api') as check):
+            self.assertEqual(writer._polish_chapter(original, 4096), original)
+            check.assert_not_called()
+        self.assertFalse(writer.chapter_length_issue(original))
         self.assertTrue(writer.chapter_length_issue("  "))
-        self.assertTrue(writer.chapter_length_issue(body(4001)))
-        with patch.object(writer, 'call_author_api', side_effect=OSError):
-            self.assertEqual(writer._polish_chapter(body(3500), 4096), body(3500))
+        self.assertTrue(writer.chapter_length_issue("甲" * 4001))
 
     def test_macro_audit_failures_never_insert(self):
         (self.mm.data_dir / "master_outline.md").write_text("主角核对凭证。", encoding="utf-8")
@@ -138,31 +136,53 @@ class NarrativeTests(unittest.TestCase):
             self.assertTrue(result["review_error"])
 
     def test_split_and_revision_apply_same_polish_guard_without_extra_supplement(self):
+        config_loader._config["novel"]["chapter_polish_enabled"] = True
         goal = "本章停在交货完成"
-        original = "甲" * 3499 + "。"
-        condensed = "乙" * 2599 + "。"
+        first, second = "甲方看了一眼笔尖。", "“少了一斤。”她收回了签字笔。"
+        original = first + "\n\n" + second
+        edits = '{"edits":[{"old":"看了一眼","new":"瞥了眼"}]}'
+        expected = original.replace("看了一眼", "瞥了眼")
         facts = '{"facts":[{"item":"交货","kept":true}],"task_end_kept":true}'
         with (patch.object(writer, "is_high_capacity_model", return_value=False),
-              patch.object(writer, "_plan_chapter_beats", return_value="1. 交货。"),
+              patch.object(writer, "_plan_chapter_beats", return_value="1. 买家拒签。\n2. 发现秤偏。\n3. 复秤后签收。"),
               patch.object(writer, "call_reviewer_api", return_value=facts) as verify,
-              patch.object(writer, "call_author_api", side_effect=[original[:1750], original[1750:], condensed]) as author):
-            self.assertEqual(writer.write_chapter(self.mm.novel_name, 1, goal), condensed)
+              patch.object(writer, "call_author_api", side_effect=[first, second, edits]) as author):
+            self.assertEqual(writer.write_chapter(self.mm.novel_name, 1, goal), expected)
             self.assertEqual(author.call_count, 3)
+            self.assertNotIn("复秤后签收", author.call_args_list[0].kwargs["user_message"])
+            self.assertIn("复秤后签收", author.call_args_list[1].kwargs["user_message"])
+            for call in author.call_args_list[:2]:
+                self.assertEqual(sum(call.kwargs[key].count(writer.NARRATIVE_DETAIL_RULE)
+                                     for key in ("system_prompt", "user_message")), 1)
             self.assertIn(goal, verify.call_args.kwargs["user_message"])
         with (patch.object(writer, "call_reviewer_api", return_value=facts),
-              patch.object(writer, "call_author_api", side_effect=[original, condensed]) as author):
-            self.assertEqual(writer.revise_chapter(self.mm.novel_name, 1, original, "删冗余", goal), condensed)
+              patch.object(writer, "call_author_api", side_effect=[original, edits]) as author):
+            self.assertEqual(writer.revise_chapter(self.mm.novel_name, 1, original, "按原文修订", goal), expected)
             self.assertEqual(author.call_count, 2)
 
     def test_short_revision_goes_to_review_without_supplement(self):
+        config_loader._config["novel"]["chapter_polish_enabled"] = False
         short = "甲" * 1190 + "。\n\n仓库终于交货。"
-        facts = '{"facts":[{"item":"交货","kept":true}],"task_end_kept":true}'
-        with (patch.object(writer, "call_author_api", side_effect=[short, short]) as author,
-              patch.object(writer, "call_reviewer_api", return_value=facts)):
+        with (patch.object(writer, "call_author_api", side_effect=[short]) as author,
+              patch.object(writer, "call_reviewer_api") as check):
             actual = writer.revise_chapter(self.mm.novel_name, 1, "甲" * 3499 + "。", "删去无关尾声", "仓库交货")
         self.assertEqual(actual, short)
-        self.assertEqual(author.call_count, 2)
+        self.assertEqual(author.call_count, 1)
+        check.assert_not_called()
         self.assertFalse(writer.chapter_length_issue(actual))
+
+    def test_whole_draft_with_polish_off_preserves_scene(self):
+        config_loader._config["novel"]["chapter_polish_enabled"] = False
+        body = "第1章 称重\n\n“少了一斤。”她把签字笔收了回去。\n\n买家把秤推回柜台。"
+        with (patch.object(writer, "is_high_capacity_model", return_value=True),
+              patch.object(writer, "_plan_chapter_beats", return_value="1. 买家要求复称。"),
+              patch.object(writer, "call_author_api", return_value=body) as author,
+              patch.object(writer, "call_reviewer_api") as verify):
+            self.assertEqual(writer.write_chapter(self.mm.novel_name, 1, "买家要求复称"), body)
+        author.assert_called_once()
+        prompt = author.call_args.kwargs
+        self.assertEqual((prompt["system_prompt"] + prompt["user_message"]).count(writer.NARRATIVE_DETAIL_RULE), 1)
+        verify.assert_not_called()
 
     def test_tail_cut_is_located_and_reaudited_before_commit(self):
         prefix = "甲" * 1699 + "。\n\n他确认设备存在隐患。"

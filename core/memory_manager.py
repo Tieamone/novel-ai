@@ -732,46 +732,75 @@ class MemoryManager:
             ).fetchone()
         return dict(row) if row else {}
 
-    def delete_chapter(self, chapter_num: int) -> bool:
+    def delete_chapter(self, chapter_num: int, *, keep_summary=False) -> bool:
+        return self.delete_chapters(chapter_num, chapter_num, check_targets=False, keep_summary=keep_summary)
+
+    def delete_chapters(self, first: int, last: int, *, check_targets=True, keep_summary=False) -> bool:
         """移除正文与对应记忆，回滚可按章号定位的伏笔，并重置任务。"""
+        if not 1 <= first <= last:
+            raise ValueError("请输入有效的章节范围")
         with with_db_connection(self.novel_name) as conn, DatabaseTransaction(conn):
-            chapter = conn.execute(
-                "SELECT status FROM chapters WHERE chapter_num=?", (chapter_num,)
-            ).fetchone()
-            if chapter and chapter["status"] in ("已审核", "approved"):
-                conn.execute(
-                    "UPDATE outline_foreshadowing SET status='planned' "
-                    "WHERE novel_name=? AND plant_chapter=? AND status IN ('planted', 'resolved')",
-                    (self.novel_name, chapter_num),
-                )
-                conn.execute(
-                    "UPDATE outline_foreshadowing SET status='planted' "
-                    "WHERE novel_name=? AND resolve_chapter=? AND plant_chapter < ? "
-                    "AND status='resolved' AND EXISTS ("
-                    "SELECT 1 FROM chapters WHERE chapter_num=plant_chapter AND status IN ('approved', '已审核'))",
-                    (self.novel_name, chapter_num, chapter_num),
-                )
-            conn.execute(
-                "UPDATE foreshadowing SET status='active', redeemed_chapter=NULL "
-                "WHERE status='redeemed' AND redeemed_chapter=?", (chapter_num,)
-            )
-            conn.execute("DELETE FROM chapters WHERE chapter_num=?", (chapter_num,))
-            conn.execute(
-                "DELETE FROM summaries WHERE chapter_num=? "
-                "AND (is_compressed=0 OR summary NOT LIKE '[阶段摘要%')",
-                (chapter_num,),
-            )
-            conn.execute(
-                "UPDATE chapter_tasks SET status='待处理', updated_at=datetime('now','localtime') "
-                "WHERE chapter_num=?", (chapter_num,)
-            )
+            if check_targets:
+                rows = conn.execute("""
+                    SELECT c.chapter_num, c.status, t.status AS task_status
+                    FROM chapters c LEFT JOIN chapter_tasks t USING (chapter_num)
+                    WHERE c.chapter_num BETWEEN ? AND ?
+                """, (first, last)).fetchall()
+                if len({row["chapter_num"] for row in rows}) != last - first + 1:
+                    raise ValueError(f"第{first}章不存在" if first == last else "选定范围内有章节不存在")
+                for row in rows:
+                    if row["status"] == "writing" or row["task_status"] in ("进行中", "in_progress"):
+                        raise ValueError(f"第{row['chapter_num']}章正在写作，请先检查断点")
+
+            for chapter_num in range(first, last + 1):
+                self._delete_chapter_records(conn, chapter_num, keep_summary)
             later = conn.execute(
                 "SELECT 1 FROM chapters WHERE chapter_num>? AND LENGTH(TRIM(content))>0 LIMIT 1",
-                (chapter_num,),
+                (last,),
             ).fetchone()
         self._refresh_foreshadowing_md()
         self._refresh_summaries_md()
         return later is not None
+
+    def _delete_chapter_records(self, conn, chapter_num, keep_summary):
+        chapter = conn.execute(
+            "SELECT status, summary FROM chapters WHERE chapter_num=?", (chapter_num,)
+        ).fetchone()
+        if chapter and chapter["status"] in ("已审核", "approved"):
+            conn.execute(
+                "UPDATE outline_foreshadowing SET status='planned' "
+                "WHERE novel_name=? AND plant_chapter=? AND status IN ('planted', 'resolved')",
+                (self.novel_name, chapter_num),
+            )
+            conn.execute(
+                "UPDATE outline_foreshadowing SET status='planted' "
+                "WHERE novel_name=? AND resolve_chapter=? AND plant_chapter < ? "
+                "AND status='resolved' AND EXISTS ("
+                "SELECT 1 FROM chapters WHERE chapter_num=plant_chapter AND status IN ('approved', '已审核'))",
+                (self.novel_name, chapter_num, chapter_num),
+            )
+        if keep_summary and chapter and (chapter["summary"] or "").strip():
+            conn.execute("""
+                INSERT INTO summaries (chapter_num, summary)
+                SELECT ?, ? WHERE NOT EXISTS (
+                    SELECT 1 FROM summaries WHERE chapter_num=?
+                    AND (is_compressed=0 OR summary NOT LIKE '[阶段摘要%')
+                )
+            """, (chapter_num, chapter["summary"], chapter_num))
+        if not keep_summary:
+            conn.execute(
+                "DELETE FROM summaries WHERE chapter_num=? "
+                "AND (is_compressed=0 OR summary NOT LIKE '[阶段摘要%')", (chapter_num,),
+            )
+        conn.execute(
+            "UPDATE foreshadowing SET status='active', redeemed_chapter=NULL "
+            "WHERE status='redeemed' AND redeemed_chapter=?", (chapter_num,)
+        )
+        conn.execute("DELETE FROM chapters WHERE chapter_num=?", (chapter_num,))
+        conn.execute(
+            "UPDATE chapter_tasks SET status='待处理', updated_at=datetime('now','localtime') "
+            "WHERE chapter_num=?", (chapter_num,)
+        )
 
     def load_context(self, chapter_num: int) -> dict:
         """

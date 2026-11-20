@@ -127,9 +127,12 @@ class Jobs:
         self.lock = Lock()
         self.items = {}
         self.latest = None
+        self.closing = False
 
     def start(self, kind, title, novel, action):
         with self.lock:
+            if self.closing:
+                raise ValueError("工作台正在退出，请重新打开")
             if self.latest and self.latest.snapshot()["status"] in ACTIVE_STATES:
                 raise ValueError("已有操作正在执行，请先处理当前任务")
             if len(self.items) >= 12:
@@ -138,6 +141,15 @@ class Jobs:
             self.items[job.id] = self.latest = job
             Thread(target=job.run, args=(action,), daemon=True).start()
             return job.snapshot()
+
+    def request_shutdown(self):
+        with self.lock:
+            if self.latest and self.latest.snapshot()["status"] in ACTIVE_STATES:
+                raise ValueError("请先处理当前任务，再退出工作台")
+            if self.closing:
+                return False
+            self.closing = True
+            return True
 
     def get(self, job_id):
         with self.lock:

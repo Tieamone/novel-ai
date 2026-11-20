@@ -442,28 +442,17 @@ EMOTION_GUIDE = {
 # ==================== 写作硬约束 ====================
 
 # 写作硬约束：用"作家的直觉"而非"检查清单"的方式表述
-NARRATIVE_DETAIL_RULE = (
-    "默认用直白、利落的网文叙述。这条优先于风格参考中的氛围营造、细腻描写和镜头感。"
-    "每个细节先问：删掉后，读者是否仍能理解事件、冲突和人物选择？能就删。"
-    "普通过程直接概述结果。赶路、停靠、休息、安装、签字和收纳若无阻碍，一句带过或省略；"
-    "只有阻碍、争执、关键选择及其后果值得展开。某件物品以后有用，只需交代取得和保留，"
-    "不逐步写如何检查、折叠、装入口袋，不解释它为什么普通或重要。"
-    "对话已经交代结果，就接下一件事，不补表情、脚步声、心理复述。"
-    "例如，赶到仓库、取件、检查、签名、装袋全部顺利，可写成‘他领到了配件，收好借用单’。"
-    "结果概述可以替代整段动作，不必为原文的每一步保留一句。"
-    "不要在每段开头布置光线、声音、天气，或在台词间插入眼神、手指和呼吸。"
-    "疼痛写‘手很疼’即可，除非疼痛具体妨碍行动，不展开痛感比喻和身体部位。"
-    "人物已经做出选择，不再解释他为何觉得这很自然、这意味着什么。"
-    "关键冲突保留交涉、决定和后果，普通环节只交代结果；删短后直接结束，不补情节或描写。"
-)
+NARRATIVE_DETAIL_RULE = """顺利的流程概述结果，把篇幅留给真正改变局面的时刻。
+写关键判断时，让读者看到人物凭什么这么想：他听见、摸到或看出了什么，因此改变了哪一步行动。
+有人交涉时，写出双方的要求和回应，让拒绝、让步或误解影响接下来的选择。
+独处时，让人物试一试，用现场的反馈印证或推翻他的判断。失误和意外从已有处境中发生。
+写清人物在压力下作出的选择和可见后果，让读者自己体会其中的意味。
+事情已经从行动或对话里交代清楚，就接着往下写。"""
 
 WRITER_HARD_CONSTRAINTS = [
     "优先写清人物目标、阻碍、行动与结果。完成任务后允许一两句自然收束，不开始新的实质行动或提前兑现后续剧情。完整短章可以结束，不为字数扩写。",
     "人物行动要有动机，遵守已建立的世界规则和前文事实；改变立场要交代原因。",
     "只执行本章伏笔安排。没有安排就不埋新线，不自行创造待解释的身份、物件或异常能力。",
-    "描写只保留影响行动、选择或理解剧情的信息；普通环境和转场简写，关键场面才展开。",
-    "对话用于交涉和推进事件，不强凑轮数，不为隔开台词插入无效动作。",
-    "允许简洁直述信息与情绪，不强行改成生理反应，不靠装饰性描写补字数。",
     NARRATIVE_DETAIL_RULE,
 ]
 
@@ -500,8 +489,7 @@ BEAT_PLANNER_SYSTEM = """你是一位帮作者构思章节节拍的创作顾问�
 HUMAN_WRITING_TECHNIQUES = """
 【网文表达】
 让读者顺着人物的行动理解事情。短句和长句自然交替，不按配额安排。
-删掉不影响理解的环境、材质、光影、气味和重复心理描写。
-人物可以直接表达情绪和判断，重要选择再给必要的动作与对话。
+简短交代熟悉的环境和人物已经知道的信息。关键场面顺着人物当下能察觉的事写。
 允许正常结束一个场景；追读动力来自尚待完成的目标，不必每章制造秘密。
 """
 
@@ -509,7 +497,8 @@ NEGATIVE_EXAMPLES = """冗余示例：反复描写门的纹理、光线和气味
 修订方向：简要交代地点，让人物直接行动。不要把一句情绪直述扩成一串生理反应。"""
 
 REVISION_SYSTEM = """你是网文修订师。按审稿指出的因果问题修正行动链，删掉重复和无效铺陈。
-以任务卡指定的最后事件为终点，删除越界剧情。保留其余关键事件与人物选择，不新增伏笔，不把简洁直述扩成动作或感官描写。
+如果审稿指出关键处只有结论，在被点出的地方补回人物据以判断的现象、必要的交涉或选择的后果。
+以任务卡指定的最后事件为终点，删除越界剧情。保留其余关键事件与人物选择，不新增伏笔。
 若只需修正章末，保留此前合格的正文段落，完成缺少的结果或删除终点之后的文字。不要顺手把整章缩成梗概。
 只输出完整正文。"""
 
@@ -861,7 +850,7 @@ def chapter_word_limits(word_min=0):
     return 1, minimum, maximum
 
 
-def _polish_rejection(original, polished, floor, maximum):
+def _polish_rejection(polished, floor, maximum):
     if not isinstance(polished, str) or not polished.strip():
         return "候选为空"
     text = polished.strip()
@@ -874,16 +863,40 @@ def _polish_rejection(original, polished, floor, maximum):
     return ""
 
 
-def _accept_polished(original, polished, floor, maximum):
-    return not _polish_rejection(original, polished, floor, maximum)
+def _apply_polish_edits(original: str, raw: str) -> str:
+    """用原稿坐标一次性替换短语，保留其余文字、对话和分段。"""
+    edits = extract_json_obj(raw).get("edits")
+    if not isinstance(edits, list) or len(edits) > 6:
+        raise ValueError("打磨建议须为不超过六项的列表")
+    spans = []
+    for edit in edits:
+        if not isinstance(edit, dict):
+            raise ValueError("打磨建议缺少原词或替换词")
+        old, new = edit.get("old"), edit.get("new")
+        if any(not isinstance(s, str) or not s.strip() or len(s) > 32
+               or re.search(r'[\r\n。！？!?“”「」]', s) for s in (old, new)):
+            raise ValueError("打磨只接受同一句内的非空短语")
+        start = original.find(old)
+        if start < 0 or original.find(old, start + 1) >= 0:
+            raise ValueError("打磨原词无法唯一定位")
+        spans.append((start, start + len(old), new))
+
+    parts, end = [], 0
+    for start, stop, new in sorted(spans):
+        if start < end:
+            raise ValueError("打磨建议有重叠")
+        parts.extend((original[end:start], new))
+        end = stop
+    return "".join(parts) + original[end:]
 
 
 def _facts_preserved(original, polished, plot_goal, report=None):
     report = report if report is not None else {}
     try:
         raw = call_reviewer_api(
-            system_prompt=("你是正文事实核验员。先从原稿独立列出所有改变局势的事件、人物选择、必要证据和章末结果，"
-                           "逐项检查候选是否保留相同主谓关系、因果、否定和结果。不能只列候选里剩下的事实。"
+            system_prompt=("你是正文事实核验员。先从原稿独立列出改变局势的事件、促成判断的现场证据、改变行动的交涉、人物选择和章末结果，"
+                           "逐项检查候选是否保留相同主谓关系、因果、否定和结果。重复动作合并一项，每个item用一句短语。"
+                           "不能只列候选里剩下的事实。"
                            "简洁概述不等于丢失事实。task_end_kept 检查原稿章末结果与任务终点是否保留。"
                            '只输出JSON：{"facts":[{"item":"事实","kept":true}],"task_end_kept":true}'),
             user_message=f"【本章任务】\n{plot_goal or '按原稿核验章末结果'}\n【原稿】\n{original}\n【候选】\n{polished}",
@@ -915,36 +928,33 @@ def _polish_chapter_ex(full_content: str, max_tokens: int, word_min: int = 0,
     original = full_content
     report = {"accepted": False, "before": len(original.strip()), "candidate": 0,
               "after": len(original.strip()), "reason": "", "floor": floor, "maximum": maximum}
-    _deai_system = (
-        "你是网文文字打磨师。按事件重写：先判断本段改变了什么，再用最简洁的叙述交代。"
-        "顺利完成的日常流程整段合并为结果，只有发生争执、受阻或重要选择才展开对话与动作。"
-        "保留原有标题、事件因果、关键选择、必要证据和结尾结果。保留事实不等于保留原句或过程。"
-        "删去不影响后续的具体时间、休息、停车位置、取放动作、表情和心中盘算。"
-        "允许直接交代情绪和信息，不把比喻替换成更长的感官描写。"
-        f"返回完整章节，不超过{maximum}字（含标点和换行），不设原稿保留比例。"
-        "无需写满上限，也不能缩成梗概。不为凑字数填充。只输出修改后的完整正文。"
-        + NARRATIVE_DETAIL_RULE
-    )
-    try:
-        polished = call_author_api(
-            system_prompt=_deai_system,
-            user_message=full_content,
-            temperature=cfg("temperature", "revision", 0.70),
-            max_tokens=max_tokens,
-        )
-        polished = clean_content(polished)
-        report["candidate"] = len(polished)
-        report["reason"] = _polish_rejection(original, polished, floor, maximum)
-        if (_accept_polished(original, polished, floor, maximum)
-                and _facts_preserved(original, polished, plot_goal, report)):
-            print(f"  [去AI化] 完成：{len(polished)}字")
-            full_content = polished
-            report.update(accepted=True, reason="通过", after=len(polished))
-        else:
-            print(f"  [去AI化] {report['reason']}，保留原稿")
-    except Exception as e:
-        report["reason"] = f"打磨调用失败：{type(e).__name__}"
-        print(f"  [去AI化] {report['reason']}，保留原稿")
+    if not cfg("novel", "chapter_polish_enabled", False):
+        report.update(reason="已关闭轻量打磨", skipped=True)
+    elif len(original) > maximum:
+        report.update(reason="超长原稿交给字数精简", skipped=True)
+    else:
+        try:
+            raw = call_author_api(
+                system_prompt=("你是网文文字打磨师。只替换确有模板腔的词组，保留语义、语气、现场证据和人物说话方式。"
+                               "保留标题、人名、数值、动作和句子结构。每个原词在正文中须唯一，原词和替换词各不超过32字。"
+                               '只返回 JSON {"edits":[{"old":"原词","new":"替换词"}]}，最多六处。自然的原句请保留，'
+                               '无需替换时返回 {"edits":[]}。'),
+                user_message=original, temperature=0.2, max_tokens=min(max_tokens, 800),
+            )
+            polished = _apply_polish_edits(original, raw)
+            report["candidate"] = len(polished)
+            if polished == original:
+                report.update(reason="无需替换", skipped=True)
+            else:
+                report["reason"] = _polish_rejection(polished, floor, maximum)
+            if not report["reason"] and _facts_preserved(original, polished, plot_goal, report):
+                full_content = polished
+                report.update(accepted=True, reason="通过", after=len(polished))
+        except ValueError as exc:
+            report["reason"] = str(exc)
+        except Exception as exc:
+            report["reason"] = f"打磨调用失败：{type(exc).__name__}"
+    print(f"  [轻量打磨] {report['reason']}")
 
     # ── 规则诊断（仅报告，不修订）─────────────────────────────
     detected_issues = _rule_based_ai_check(full_content)
@@ -1108,7 +1118,7 @@ def build_writer_prompt(ctx: dict, chapter_num: int,
 
 {retry_block}
 开始写。第一行是章节标题（第{chapter_num}章 + 你拟的标题），然后直接进入正文。
-只写前半段节拍，停在一个自然转折处。把任务卡的最终结果留给后半段。
+写完分给前半段的节拍就停笔。若全章只有一个事件，这一段只写它的起因和阻碍，把实际结果留给后半段。
 前半段以约{word_target // 2}字为参考，不为字数添加场景或重复描写。"""
 
 
@@ -1144,7 +1154,7 @@ def build_continue_prompt(chapter_num: int, plot_goal: str,
 【前半段结尾（从这里接着写，不要重复这段内容）】
 ...{last_part}
 
-接着写后半段，以约{half_target}字为参考，上限{half_max}字，把这章写完。必要情节已完成时直接收束。
+接着写后半段，以约{half_target}字为参考，上限{half_max}字。若前半段已经完成终点，只用一两句收束，不另开交涉或事后汇报。
 
 【结尾】
 写出任务卡指定的结果，允许一两句自然收束。不要开启下一个实质事件或提前兑现后续剧情。
@@ -1204,30 +1214,47 @@ def _cut_minor_overflow(content, minimum, maximum):
     return content
 
 
-def _fit_chapter_length(content: str, minimum: int, maximum: int) -> str:
+def _fit_chapter_length(content: str, minimum: int, maximum: int, *, plot_goal: str = "") -> str:
     """超长时尝试精简全文，保留结尾和伏笔，最终仍由正常审核把关。"""
     if len(content) <= maximum:
         return content
     if _minor_overflow(content, maximum):
         return _cut_minor_overflow(content, minimum, maximum)
 
-    target = (minimum + maximum) // 2
+    target = min(maximum, max(minimum, cfg("novel", "chapter_word_min", 3000),
+                              cfg("novel", "chapter_word_target", 3500)))
     body = content.strip()
     before_end = body.rstrip('。！？!?…」』”’"')
     final_start = max((before_end.rfind(mark) for mark in "。！？!?"), default=-1) + 1
     closing = body[final_start:].strip()
-    shorter = clean_content(call_author_api(
-        system_prompt=(
-            "你是小说编辑。通过删除或缩短冗余内容精简全文，保留事实、关键线索和主角行动。"
-            "不得增加新内容，最后一句原样保留。只输出完整正文。"
-        ),
-        user_message=f"将以下正文精简到约 {target} 字，总字符数（含标点和换行）必须在 {minimum}–{maximum} 之间。\n\n{content}",
-        temperature=0.25,
-        max_tokens=min(int(maximum * 1.4), 7000),
-    ))
+
+    def shorten(draft):
+        return clean_content(call_author_api(
+            system_prompt=(
+                "你是小说编辑。按段压缩重复解释、常规操作和已说清的背景。可以把数段顺利的过程合成一句。"
+                "把篇幅留给促使人物改判的具体线索、改变行动的回应、人物选择和后果。"
+                "不得增加新内容，最后一句原样保留。只输出完整正文。"
+            ),
+            user_message=(f"原稿有 {len(draft)} 字。需实际删去约 {len(draft) - target} 字，"
+                          f"将篇幅缩至原稿的 {target / len(draft):.0%}，目标约 {target} 字。"
+                          f"硬上限 {maximum} 字（含标点和换行）。原样保留末句：{closing}\n\n{draft}"),
+            temperature=0.25, max_tokens=min(int(maximum * 1.4), 7000),
+        ))
+
+    shorter = shorten(content)
+    if maximum < len(shorter) < len(content) and shorter.endswith(closing):
+        print(f"  [精简] 候选仍有 {len(shorter)} 字，按实际差额再精简一次")
+        if _minor_overflow(shorter, maximum):
+            shorter = _cut_minor_overflow(shorter, minimum, maximum)
+        else:
+            shorter = shorten(shorter)
     if minimum <= len(shorter) <= maximum and shorter.endswith(closing):
-        print(f"  [精简] 超长正文从 {len(content)} 字调整为 {len(shorter)} 字")
-        return shorter
+        report = {}
+        if _facts_preserved(content, shorter, plot_goal, report):
+            print(f"  [精简] 超长正文从 {len(content)} 字调整为 {len(shorter)} 字")
+            return shorter
+        print(f"  [精简] {report['reason']}，保留原稿供审稿判断")
+        return content
     reasons = []
     if not minimum <= len(shorter) <= maximum:
         reasons.append(f"候选{len(shorter)}字，要求{minimum}–{maximum}")
@@ -1311,7 +1338,7 @@ def revise_chapter(novel_name: str, chapter_num: int,
 {forbidden_rules}
 
 根据任务卡修复因果，删除越界或重复内容。建议{word_min}–{word_max}字，上限{word_max}字。
-短于建议也可以提交，只须完整呈现必要事件。删减后不扩写、不凑字数，保留未被指出有问题的正文。
+短于建议也可以提交。按修改要求展开缺失的关键场面，保留未被指出有问题的正文。
 只输出修改后的完整正文，不要任何说明。"""
 
     print(f"  [修改] 正在基于原文进行局部修改...")
@@ -1340,7 +1367,7 @@ def revise_chapter(novel_name: str, chapter_num: int,
         for w in cross_warnings:
             print(f"    ⚠ {w}")
 
-    full_content = _fit_chapter_length(full_content, floor, word_max)
+    full_content = _fit_chapter_length(full_content, floor, word_max, plot_goal=plot_goal)
     total = len(full_content)
 
     print(f"  [OK] 第{chapter_num}章修改完成，总字数：{total}字")
@@ -1453,7 +1480,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         )
 
         full_content = call_author_api(
-            system_prompt=system_prompt + "\n" + "\n".join(WRITER_HARD_CONSTRAINTS),
+            system_prompt=system_prompt,
             user_message=prompt,
             temperature=cfg("temperature", "writing_main", 0.85),
             max_tokens=min(int(word_max * 1.75), 7000),
@@ -1467,14 +1494,18 @@ def write_chapter(novel_name: str, chapter_num: int,
         
         # 前半段
         print(f"  正在生成第{chapter_num}章（前半段·{emotion_tag}）...")
+        beats = (beat_plan or "").splitlines()
+        middle = (len(beats) + 1) // 2
+        first_beats = "\n".join(beats[:middle])
+        remaining_beats = "\n".join(beats[middle:]) if len(beats) > 1 else beat_plan
         prompt = build_writer_prompt(
-            ctx, chapter_num, plot_goal, emotion_tag, beat_plan,
+            ctx, chapter_num, plot_goal, emotion_tag, first_beats,
             prev_chapter_ending=prev_chapter_ending,
             word_min=word_min, word_max=word_max,
             retry_feedback=retry_feedback, word_target=word_target
         )
         first_half = call_author_api(
-            system_prompt=system_prompt + "\n" + "\n".join(WRITER_HARD_CONSTRAINTS),
+            system_prompt=system_prompt,
             user_message=prompt,
             temperature=cfg("temperature", "writing_first_half", 0.90),
             max_tokens=min(int(word_max // 2 * 1.5), max_tokens_cfg),
@@ -1485,7 +1516,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         # 后半段
         print(f"  正在生成第{chapter_num}章（后半段）...")
         continue_prompt = build_continue_prompt(
-            chapter_num, plot_goal, emotion_tag, first_half, beat_plan,
+            chapter_num, plot_goal, emotion_tag, first_half, remaining_beats,
             word_min=word_min, word_max=word_max,
             retry_feedback=retry_feedback,
             foreshadow_block=format_chapter_foreshadow(ctx, chapter_num), word_target=word_target
@@ -1523,7 +1554,7 @@ def write_chapter(novel_name: str, chapter_num: int,
         for w in cross_warnings:
             print(f"    ⚠ {w}")
 
-    full_content = _fit_chapter_length(full_content, min_words, word_max)
+    full_content = _fit_chapter_length(full_content, min_words, word_max, plot_goal=plot_goal)
     total = len(full_content)
 
     print(f"  [OK] 第{chapter_num}章完成，总字数：{total}字（目标：{word_min}-{word_max}）")

@@ -17,7 +17,7 @@ STATIC = Path(__file__).resolve().parents[1] / "web" / "dist"
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
-def create_app():
+def create_app(on_exit=None):
     app = Flask(__name__, static_folder=None)
     app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
     app.config["TRUSTED_HOSTS"] = sorted(LOOPBACK)
@@ -199,6 +199,14 @@ def create_app():
         else:
             novel = None
         return jsonify(jobs.start(kind, actions.TITLES[kind], novel, lambda: actions.run(kind, novel, data))), 202
+
+    @app.post("/api/exit")
+    def exit_workbench():
+        if on_exit is None:
+            raise ValueError("请从启动窗口停止当前工作台服务")
+        if jobs.request_shutdown():
+            on_exit()
+        return jsonify(message="再次打开请运行 python main.py。")
 
     def get_job(job_id):
         job = jobs.get(job_id)

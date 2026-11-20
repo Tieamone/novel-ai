@@ -24,7 +24,7 @@ def main():
     if not 1 <= args.port <= 65535:
         parser.exit(2, "端口应在 1 至 65535 之间。\n")
     try:
-        from waitress import create_server
+        from waitress import create_server, wasyncore
         from workbench.server import STATIC, create_app
         from workbench.jobs import ACTIVE_STATES
     except ModuleNotFoundError as error:
@@ -35,9 +35,20 @@ def main():
         parser.exit(2, "缺少网页构建文件，请先进入 web 目录执行 npm ci 和 npm run build。\n")
     from core.model_quota import sync_quota
     sync_quota()
-    app = create_app()
+    sockets = {}
+
+    def close_sockets():
+        wasyncore.close_all(sockets, ignore_all=True)
+
+    def request_exit():
+        # 先返回网页响应，再由服务线程关闭监听和连接。
+        shutdown = Timer(0.5, server.trigger.pull_trigger, args=(close_sockets,))
+        shutdown.daemon = True
+        shutdown.start()
+
+    app = create_app(on_exit=request_exit)
     try:
-        server = create_server(app, host="127.0.0.1", port=args.port, threads=4)
+        server = create_server(app, map=sockets, host="127.0.0.1", port=args.port, threads=4)
     except OSError:
         parser.exit(1, f"无法监听本机端口 {args.port}，请检查占用或用 --port 指定其他端口。\n")
     url = f"http://127.0.0.1:{args.port}"
@@ -60,6 +71,8 @@ def main():
             job.cancel()
             with job.changed:
                 job.changed.wait_for(lambda: job.status not in ACTIVE_STATES)
+        close_sockets()
+        server.task_dispatcher.shutdown()
 
 
 if __name__ == "__main__":

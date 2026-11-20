@@ -30,7 +30,7 @@ temperature:
   writing_supplement: 0.75   # 字数补写
 
   # 修订类
-  revision: 0.70          # 正文修改和去 AI 化打磨
+  revision: 0.70          # 正文局部修订
 
   # 节拍规划
   beat_planner: 0.65      # 节拍规划
@@ -47,6 +47,7 @@ novel:
   chapter_word_target: 3500
   chapter_word_min: 3000
   chapter_word_max: 4000
+  chapter_polish_enabled: false  # true 时仅替换可唯一定位的模板词组
   # 审稿内容不达标时的策略。force_and_flag 会将强制通过正文用于后续记忆。
   on_review_exhausted: stop
   max_retry: 3

@@ -481,7 +481,7 @@ def generate_chapter_auto(novel_name: str):
         if approved:
             reset_writing_checkpoint(novel_name, next_num)
         else:
-            rewrite_writing_checkpoint(novel_name, next_num)
+            rewrite_writing_checkpoint(novel_name, next_num, keep_summary=False)
     elif (task and task["status"] == TASK_REVIEW_FAILED) or (
         next_num in chapters and chapters[next_num]["status"] == CHAPTER_STATUS_REVIEW_FAILED
     ):
@@ -1001,7 +1001,7 @@ def _edit_author_intent(novel_name: str):
 def _delete_chapter(novel_name: str):
     """
     删除指定章节的数据库记录，重置任务卡为 pending，可重新生成。
-    注意：伏笔记录不自动回滚，摘要压缩历史无法撤销。
+    可按章号定位的伏笔会回滚，已压缩的阶段摘要保留。
     """
     with with_db_connection(novel_name) as conn:
         rows = conn.execute(
@@ -1068,30 +1068,32 @@ def _delete_chapter(novel_name: str):
         return
 
     print(f"\n[OK] 第{chapter_num}章已删除，任务卡已重置为 待处理。")
-    print(f"  提示：直接选择「自动生成下一章」时会跳过此章（已有更新章节）。")
-    print(f"  若需重新生成第{chapter_num}章，请先删除第{chapter_num}章之后的所有章节，")
-    print(f"  或通过「恢复审稿失败」入口手动处理。")
+    print("  提示：「自动生成下一章」会从最早的未完成章节开始。")
 
 
 def delete_chapter(novel_name, chapter_num):
-    with with_db_connection(novel_name) as conn:
-        chapter = conn.execute(
-            "SELECT status FROM chapters WHERE chapter_num=?", (chapter_num,)
-        ).fetchone()
-        task = conn.execute(
-            "SELECT status FROM chapter_tasks WHERE chapter_num=?", (chapter_num,)
-        ).fetchone()
-    if not chapter:
-        raise ValueError(f"第{chapter_num}章不存在")
-    if chapter["status"] == "writing" or (task and task["status"] in (TASK_IN_PROGRESS, "in_progress")):
-        raise ValueError(f"第{chapter_num}章正在写作")
-    _remove_chapter_version(novel_name, chapter_num)
+    delete_chapter_range(novel_name, chapter_num, chapter_num)
 
 
-def _remove_chapter_version(novel_name, chapter_num):
-    if MemoryManager(novel_name).delete_chapter(chapter_num):
-        print(f"[提示] 第{chapter_num}章之后已有正文，请复核后续剧情和伏笔。")
-    (_output_dir(novel_name) / f"第{chapter_num:03d}章.txt").unlink(missing_ok=True)
+def delete_chapter_range(novel_name, first, last):
+    later = MemoryManager(novel_name).delete_chapters(first, last)
+    _remove_chapter_exports(novel_name, first, last, later)
+
+
+def _remove_chapter_exports(novel_name, first, last, later):
+    if later:
+        print(f"[提示] 第{last}章之后已有正文，请复核后续剧情和伏笔。")
+    output = _output_dir(novel_name)
+    failed = []
+    for chapter_num in range(first, last + 1):
+        path = output / f"第{chapter_num:03d}章.txt"
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            print(f"[错误] 无法删除导出文件 {path.name}：{error}")
+            failed.append(path.name)
+    if failed:
+        raise ValueError(f"章节数据已更新。以下导出文件需手动删除：{'、'.join(failed)}")
 
 
 def _delete_chapters_batch(novel_name: str):
@@ -1120,9 +1122,7 @@ def _delete_chapters_batch(novel_name: str):
         
         # 解析范围
         if "-" in range_input:
-            parts = range_input.split("-")
-            start_num = int(parts[0].strip())
-            end_num = int(parts[1].strip())
+            start_num, end_num = map(int, range_input.split("-"))
         else:
             # 单个数字的情况
             start_num = int(range_input)
@@ -1164,7 +1164,7 @@ def _delete_chapters_batch(novel_name: str):
         print("  - 章节正文和摘要将被清除")
         print("  - 任务卡状态重置为 pending，可重新生成")
         print("  - 导出文件（如已存在）将被删除")
-        print("  ⚠ 注意：这些章节已提取的伏笔记录不会自动撤销")
+        print("  - 可按章号定位的伏笔状态会回滚，已压缩的阶段摘要保留")
         print()
         
         # 确认删除
@@ -1178,16 +1178,17 @@ def _delete_chapters_batch(novel_name: str):
             print("[取消] 已取消删除")
             return
         
-        for chapter_num in range(start_num, end_num + 1):
-            delete_chapter(novel_name, chapter_num)
-        print(f"\n[OK] 已删除第{start_num}章到第{end_num}章，任务卡已重置为待处理")
-
-        print(f"  提示：可直接选择「自动生成下一章」或「批量自动生成」重新生成这些章节。")
-        
     except ValueError:
         print("[错误] 请输入有效格式（如：2-5 或 3）")
-    except Exception as e:
-        print(f"[错误] 删除失败：{e}")
+        return
+
+    try:
+        delete_chapter_range(novel_name, start_num, end_num)
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(f"[错误] 删除失败：{error}")
+        return
+    print(f"\n[OK] 已删除第{start_num}章到第{end_num}章，任务卡已重置为待处理")
+    print("  提示：「自动生成下一章」会从最早的未完成章节开始。")
 
 
 def _delete_novel(novel_name: str) -> bool:
@@ -1201,7 +1202,7 @@ def _delete_novel(novel_name: str) -> bool:
 
     chapter_count = 0
     try:
-        with with_db_connection(novel_name) as conn:
+        with with_db_connection(novel_name, readonly=True) as conn:
             chapter_count = conn.execute(
                 "SELECT COUNT(*) as cnt FROM chapters"
             ).fetchone()["cnt"]
@@ -1249,10 +1250,10 @@ def delete_novel(novel_name):
         raise ValueError("小说目录指向了其他位置")
     if not (data_path / "novel.db").is_file():
         raise ValueError("小说数据库不存在")
-    with with_db_connection(novel_name) as conn:
+    with with_db_connection(novel_name, readonly=True) as conn:
         task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chapter_tasks)")}
         active = "status" in task_columns and conn.execute(
-            "SELECT 1 FROM chapter_tasks WHERE status=? LIMIT 1", (TASK_IN_PROGRESS,),
+            "SELECT 1 FROM chapter_tasks WHERE status IN (?, 'in_progress') LIMIT 1", (TASK_IN_PROGRESS,),
         ).fetchone()
     if active:
         raise ValueError("小说有正在写作的任务，请先检查断点")
@@ -1539,9 +1540,10 @@ def reset_writing_checkpoint(novel_name, num):
     writer._cached_beat_plan = ""
 
 
-def rewrite_writing_checkpoint(novel_name, num):
-    _remove_chapter_version(novel_name, num)
+def rewrite_writing_checkpoint(novel_name, num, *, keep_summary=True):
+    later = MemoryManager(novel_name).delete_chapter(num, keep_summary=keep_summary)
     clear_writing_beats(novel_name, num)
+    _remove_chapter_exports(novel_name, num, num, later)
 
 
 def clear_writing_beats(novel_name, num):

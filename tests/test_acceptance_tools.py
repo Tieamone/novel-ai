@@ -9,6 +9,11 @@ from tools import acceptance_run, foreshadow_metamorphic
 
 
 class AcceptanceToolsTests(unittest.TestCase):
+    def test_disabled_polish_does_not_budget_for_candidate_or_pair_reviews(self):
+        without = acceptance_run.estimate(3, 1, 2)
+        with_polish = acceptance_run.estimate(3, 1, 2, polish=True)
+        self.assertEqual(with_polish["typical_requests"] - without["typical_requests"], 12)
+
     def test_variant_changes_only_target_paragraph(self):
         replace = foreshadow_metamorphic.replace_paragraph
         self.assertEqual(replace("第一段\n\n旧段\n\n末段", "旧段", "新段"), "第一段\n\n新段\n\n末段")
@@ -92,7 +97,7 @@ class AcceptanceToolsTests(unittest.TestCase):
 
     def test_mocked_pipeline_crosses_two_compressions_through_real_entry(self):
         cfg = config_loader._get_defaults()
-        cfg["novel"].update(chapter_word_min=3000, chapter_word_max=4000,
+        cfg["novel"].update(chapter_word_min=3000, chapter_word_max=4000, chapter_polish_enabled=True,
                             compress_after_chapters=6, recent_summary_count=2)
         report = {"chapters": [], "polishes": [], "checks": {}}
         lines = iter([
@@ -104,7 +109,8 @@ class AcceptanceToolsTests(unittest.TestCase):
         current = ""
 
         def body(size):
-            return current + "甲" * (size - len(current) - 1) + "。"
+            scene = "## 交接\n\n" + current + "他不由自主地收回了手。"
+            return scene + "甲" * (size - len(scene) - 1) + "。"
 
         def mock_model(system_prompt, user_message, **kwargs):
             nonlocal current
@@ -114,7 +120,7 @@ class AcceptanceToolsTests(unittest.TestCase):
             if "只输出JSON" in system_prompt and "正文事实核验员" in system_prompt:
                 return '{"facts":[{"item":"解决问题","kept":true}],"task_end_kept":true}'
             if "文字打磨师" in system_prompt:
-                return body(2600)
+                return '{"edits":[{"old":"不由自主地收回","new":"收回"}]}'
             if "独立网文编辑" in system_prompt:
                 return '{"total":1,"kept":1,"preferred":"平局"}'
             if system_prompt == reviewer.FORESHADOW_REVIEWER_SYSTEM:
@@ -141,5 +147,6 @@ class AcceptanceToolsTests(unittest.TestCase):
                   patch.object(writer, "is_high_capacity_model", return_value=True)):
                 acceptance_run.run_pipeline(root, 12, "模拟裁判", report, seeded=True)
         self.assertTrue(all(value is True for value in report["checks"].values()), report)
+        self.assertTrue(all(row["source_length"] - row["export_length"] == 3 for row in report["exports"]))
         self.assertEqual([row["stage"] for row in report["context"] if row["chapter"] in (8, 12, 13)], [5, 5, 10])
         self.assertEqual(report["metrics"]["polish_acceptance"], 1)

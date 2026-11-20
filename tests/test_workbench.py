@@ -3,11 +3,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import main as cli
 from core import api_client, config_loader, db, model_quota, outline_manager, planner, reader_reviewer, reviewer, writer
 from core.memory_manager import MemoryManager
+from core.interaction import ask
 from core.utils import DatabaseTransaction, with_db_connection
 from workbench.server import create_app
 
@@ -325,11 +326,25 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue((self.root / "output" / BOOK / "第002章.txt").is_file())
 
     def test_overlong_single_paragraph_is_revised_without_truncating_ending(self):
+        config_loader._config["novel"].update(chapter_word_min=3000, chapter_word_target=3500)
         original = "雨落在旧码头。" * 650 + "她转动铜牌，门开了。"
         revised = "雨落在旧码头。" * 475 + "她转动铜牌，门开了。"
-        with patch.object(writer, "call_author_api", return_value=revised) as shorten:
-            self.assertEqual(writer._fit_chapter_length(original, 3000, 4000), revised)
+        facts = '{"facts":[{"item":"转动铜牌开门","kept":true}],"task_end_kept":true}'
+        with (patch.object(writer, "call_author_api", return_value=revised) as shorten,
+              patch.object(writer, "call_reviewer_api", return_value=facts) as check):
+            self.assertEqual(writer._fit_chapter_length(original, 1, 4000, plot_goal="用铜牌开门"), revised)
+            self.assertIn("约 3500 字", shorten.call_args.kwargs["user_message"])
             self.assertIn("她转动铜牌，门开了。", shorten.call_args.kwargs["user_message"])
+            self.assertIn("用铜牌开门", check.call_args.kwargs["user_message"])
+        with (patch.object(writer, "call_author_api", return_value=revised),
+              patch.object(writer, "call_reviewer_api", return_value=facts.replace("true", "false"))):
+            self.assertEqual(writer._fit_chapter_length(original, 1, 4000), original)
+        partial = "雨落在旧码头。" * 605 + "她转动铜牌，门开了。"
+        with (patch.object(writer, "call_author_api", side_effect=[partial, revised]) as shorten,
+              patch.object(writer, "call_reviewer_api", return_value=facts) as check):
+            self.assertEqual(writer._fit_chapter_length(original, 1, 4000), revised)
+            self.assertIn(f"原稿有 {len(partial)} 字", shorten.call_args.kwargs["user_message"])
+            self.assertIn(original, check.call_args.kwargs["user_message"])
         for invalid in ("过短", revised + "命运的最后裁决即将到来。"):
             with patch.object(writer, "call_author_api", return_value=invalid):
                 self.assertEqual(writer._fit_chapter_length(original, 3000, 4000), original)
@@ -482,11 +497,57 @@ class WorkbenchTests(unittest.TestCase):
         self.completed("rewrite", chapter=1, confirm="YES")
         self.assertFalse(mm.load_chapter(1).get("content"))
         with with_db_connection(BOOK) as conn:
-            self.assertIsNone(conn.execute("SELECT summary FROM summaries WHERE chapter_num=1").fetchone())
+            self.assertEqual(conn.execute("SELECT summary FROM summaries WHERE chapter_num=1").fetchone()[0], "停在码头")
+        self.assertFalse((self.root / "output" / BOOK / "第001章.txt").exists())
         self.completed("delete_chapters", first=2, last=2, confirm="YES")
         self.assertEqual(self.get("/api/book")["chapters"], [])
-        self.completed("delete_book", name_confirmation=BOOK, confirm="YES")
+        failed = self.wait(self.submit("delete_book", name_confirmation="书名不匹配", confirm="YES"), "failed")
+        self.assertIn("书名", failed["error"])
+        self.completed("delete_book", name_confirmation=f" {BOOK} ", confirm=" YES ")
         self.assertEqual(self.get("/api/bootstrap")["novels"], [])
+        self.assertFalse((self.root / "data" / BOOK).exists())
+        self.assertFalse((self.root / "output" / BOOK).exists())
+
+    def test_range_deletion_checks_all_targets_before_removing_chapters(self):
+        mm = MemoryManager(BOOK)
+        for chapter in range(1, 5):
+            self.seed_task(chapter, "in_progress" if chapter == 3 else "已完成")
+            mm.save_chapter(chapter, "码头", CONTENT, "已审核", GOAL, "铺垫")
+            mm.add_summary(chapter, GOAL)
+            cli.export_chapter(BOOK, chapter)
+
+        failed = self.wait(self.submit("delete_chapters", first=2, last=3, confirm="YES"), "failed")
+        self.assertIn("第3章正在写作", failed["error"])
+        self.assertEqual([row["chapter_num"] for row in self.get("/api/book")["chapters"]], [1, 2, 3, 4])
+        self.assertTrue((self.root / "output" / BOOK / "第002章.txt").is_file())
+
+        self.completed("reset", chapter=3, confirm="YES")
+        self.completed("delete_chapters", first=2, last=3, confirm="YES")
+        book = self.get("/api/book")
+        self.assertEqual([row["chapter_num"] for row in book["chapters"]], [1, 4])
+        self.assertEqual([row["status"] for row in book["tasks"]], ["已完成", "待处理", "待处理", "已完成"])
+        with with_db_connection(BOOK) as conn:
+            self.assertEqual([row[0] for row in conn.execute("SELECT chapter_num FROM summaries ORDER BY chapter_num")], [1, 4])
+        self.assertEqual(sorted(path.name for path in (self.root / "output" / BOOK).glob("*.txt")),
+                         ["第001章.txt", "第004章.txt"])
+
+    def test_exit_requires_idle_workbench_and_prevents_new_jobs(self):
+        on_exit = Mock()
+        self.client = create_app(on_exit=on_exit).test_client()
+        self.headers = {"X-Workbench-Token": self.client.get("/api/bootstrap").json["token"]}
+        self.assertEqual(self.client.post("/api/exit", json={}).status_code, 403)
+        with patch("workbench.actions.run", side_effect=lambda *_: ask("完成当前任务")):
+            job_id = self.submit("book_health")
+            self.wait(job_id, "waiting")
+            self.assertEqual(self.client.post("/api/exit", json={}, headers=self.headers).status_code, 400)
+            on_exit.assert_not_called()
+            self.client.post(f"/api/jobs/{job_id}/cancel", json={}, headers=self.headers)
+            self.wait(job_id, "cancelled")
+        for _ in range(2):
+            self.assertEqual(self.client.post("/api/exit", json={}, headers=self.headers).status_code, 200)
+        on_exit.assert_called_once_with()
+        self.assertEqual(self.client.post("/api/jobs", json={"kind": "book_health", "novel": BOOK},
+                                          headers=self.headers).status_code, 400)
 
     def test_batch_and_review_recovery_modes(self):
         for chapter in (1, 2, 3):

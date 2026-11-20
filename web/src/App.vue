@@ -17,6 +17,7 @@ const query = ref('')
 const filter = ref('')
 const sectionError = ref('')
 const notice = ref('')
+const exited = ref('')
 const busy = ref(false)
 const starting = ref(false)
 const dialog = ref(null)
@@ -45,7 +46,7 @@ const checkpoint = ref(null)
 const checkpointLoaded = ref(null)
 const checkpointActions = [
   ['reset', '重置为待处理', '该任务会恢复为待处理，节拍内存缓存将清除。'],
-  ['rewrite', '重置正文，保留摘要', '章节正文和审稿评分会清除，摘要保留。'],
+  ['rewrite', '重写正文，保留摘要', '将清除正文、审稿评分、导出文件和节拍缓存，保留摘要，任务卡恢复为待处理。'],
   ['clear_beats', '清除节拍缓存', '清除该章节的已存节拍，下次写作会重新规划。'],
 ]
 const healthGroups = [['due_soon', '即将到期'], ['overdue', '严重超期'], ['macro', '宏观悬念']]
@@ -57,6 +58,7 @@ let checkpointRequest = 0
 let modelRequest = 0
 
 const activeJob = computed(() => ['running', 'waiting', 'stopping'].includes(job.value?.status))
+const dialogReady = computed(() => dialog.value && (!activeJob.value || dialog.value.jobId !== job.value.id))
 const verifying = computed(() => startingKind.value === 'models' ||
   (job.value?.kind === 'models' && activeJob.value))
 const submittingAnswer = computed(() => sendingAnswer.value === job.value?.prompt?.id)
@@ -204,7 +206,6 @@ watch(selected, name => {
   book.value = chapter.value = null
   intentDrafts.value = {}
   styleForm.value = { style: '1', custom: '' }
-  dialog.value = null
   notice.value = ''
   readAt.value = ''
   ++chapterRequest
@@ -214,10 +215,10 @@ watch(selected, name => {
   checkpointLoaded.value = null
   query.value = filter.value = ''
 })
-watch([view, selected], ([page]) => {
+watch([view, selected], ([page], [previousPage]) => {
   query.value = filter.value = sectionError.value = ''
   notice.value = ''
-  dialog.value = null
+  if (page !== previousPage || !['create', 'import', 'exit'].includes(dialog.value?.kind)) dialog.value = null
   if (page === 'models') {
     loadModels()
   } else {
@@ -226,6 +227,7 @@ watch([view, selected], ([page]) => {
 })
 
 function receive(next) {
+  const newPrompt = next.prompt && (next.id !== job.value?.id || next.prompt.id !== job.value?.prompt?.id)
   if (next.kind === 'models') {
     if (modelJob.value?.id !== next.id) modelLog.value = []
     modelLog.value = [...modelLog.value, ...next.log].slice(-12)
@@ -241,20 +243,26 @@ function receive(next) {
   }
   jobLog.value = [...jobLog.value, ...next.log].slice(-350)
   job.value = next
+  if (newPrompt && !dialogReady.value) jobOpen.value = true
 }
 
-async function start(kind, fields = {}, target = selected.value) {
+async function start(kind, fields = {}, target = selected.value, submittedDialog = null) {
   if (starting.value || activeJob.value) return
   starting.value = true
   startingKind.value = kind
   sectionError.value = notice.value = ''
-  const submittedDialog = dialog.value
   try {
+    if (kind === 'exit') {
+      const result = await api('/exit', {})
+      exited.value = result.message
+      window.clearTimeout(timer)
+      return
+    }
     const next = await api('/jobs', { ...fields, kind, novel: target })
-    if (dialog.value === submittedDialog) dialog.value = null
+    if (submittedDialog && dialog.value === submittedDialog) submittedDialog.jobId = next.id
     receive(next)
     jobOpen.value = true
-    if (!activeJob.value) await finished()
+    if (!activeJob.value) void finished()
   } catch (error) {
     if (submittedDialog && dialog.value === submittedDialog) submittedDialog.error = error.message
     else if (selected.value === target) sectionError.value = error.message
@@ -265,21 +273,31 @@ async function start(kind, fields = {}, target = selected.value) {
 }
 
 async function finished() {
-  const result = job.value.result
+  const completed = job.value
+  const result = completed.result
+  if (dialog.value?.jobId === completed.id) {
+    if (completed.status === 'failed') {
+      dialog.value.error = completed.error || '操作未完成，请查看任务记录'
+      jobOpen.value = false
+    } else {
+      dialog.value = null
+    }
+  }
   notice.value = result?.message || ''
-  if (job.value.kind === 'models') {
+  if (completed.kind === 'models') {
     if (view.value === 'models') await loadModels()
     return
   }
   try {
     await loadLibrary()
-    if (result?.novel) {
+    if (job.value?.id !== completed.id) return
+    if (result?.novel && !dialog.value) {
       selected.value = result.novel
       view.value = 'chapters'
     }
     if (selected.value) {
       await loadBook()
-      if (view.value === 'chapters' && result?.chapter && job.value.novel === selected.value) {
+      if (view.value === 'chapters' && result?.chapter && completed.novel === selected.value) {
         await openChapter(result.chapter)
       }
       if (view.value === 'checkpoints' && checkpointLoaded.value) await loadCheckpoint()
@@ -289,27 +307,33 @@ async function finished() {
 }
 
 async function poll() {
+  if (exited.value) return
   try {
     if (activeJob.value) {
       const next = await api('/jobs/' + job.value.id + '?after=' + job.value.sequence)
       receive(next)
-      if (!activeJob.value) await finished()
+      if (!activeJob.value) void finished()
     } else if (!starting.value) {
       const current = await api('/jobs/current?known=' + (job.value?.id || ''))
       if (current.job && !starting.value && current.job.id !== job.value?.id) {
         receive(current.job)
-        if (activeJob.value) jobOpen.value = true
-        else await finished()
+        if (!activeJob.value) void finished()
+        else if (!dialogReady.value) jobOpen.value = true
       }
     }
   } catch (error) {
     if (error.status === 404 && activeJob.value) {
+      if (dialog.value?.jobId === job.value.id) {
+        dialog.value.jobId = null
+        dialog.value.error = '当前任务记录已失效。请核对书库或章节后重新提交。'
+      }
       job.value = null
+      jobOpen.value = false
       await loadLibrary().catch(() => {})
     }
     sectionError.value = error.message
   }
-  timer = window.setTimeout(poll, activeJob.value ? 700 : 1500)
+  if (!exited.value) timer = window.setTimeout(poll, activeJob.value ? 700 : 1500)
 }
 
 async function respond(value) {
@@ -330,7 +354,8 @@ async function stop() {
 }
 
 function form(kind, title, fields = {}) {
-  dialog.value = { kind, title, fields, novel: selected.value, error: '' }
+  jobOpen.value = false
+  dialog.value = { kind, title, fields, novel: selected.value, error: '', jobId: null }
 }
 
 function editForeshadow(row = {}) {
@@ -360,14 +385,39 @@ async function readFile(event, key) {
 }
 
 function submit() {
-  const { kind, fields, novel } = dialog.value
-  start(kind, fields, kind === 'create' ? fields.name.trim() : novel)
+  const current = dialog.value
+  if (!dialogReady.value || starting.value || activeJob.value) return
+  const { kind, fields, novel } = current
+  current.error = ''
+  current.jobId = null
+  const values = { ...fields }
+  if (kind === 'delete_book' && fields.name_confirmation.trim() !== novel) {
+    current.error = '输入的书名与当前小说不一致'
+    return
+  }
+  if ('confirm' in fields && (kind !== 'generate' || fields.count > 50)) {
+    values.confirm = fields.confirm.trim()
+    if (values.confirm !== 'YES') {
+      current.error = '请输入大写 YES 确认'
+      return
+    }
+  }
+  if (kind === 'delete_chapters' && !fields.single) {
+    const range = /^([0-9]+)(?:\s*-\s*([0-9]+))?$/.exec(fields.range)
+    values.first = Number(range?.[1])
+    values.last = Number(range?.[2] ?? range?.[1])
+    if (!range || values.first < 1 || values.last < values.first || values.last > 1000000) {
+      current.error = '请输入有效的章节号或连续范围，例如 3 或 2-5'
+      return
+    }
+  }
+  return start(kind, values, kind === 'create' ? fields.name.trim() : novel, current)
 }
 
 onMounted(async () => {
   try {
     const initialJob = await loadLibrary()
-    if (initialJob) { receive(initialJob); jobOpen.value = activeJob.value }
+    if (initialJob) { receive(initialJob); jobOpen.value = activeJob.value && !dialogReady.value }
   } catch (error) { sectionError.value = error.message }
   poll()
 })
@@ -375,7 +425,10 @@ onBeforeUnmount(() => window.clearTimeout(timer))
 </script>
 
 <template>
-  <div class="shell">
+  <main v-if="exited" class="workspace"><div class="panel blank-paper">
+    <h1>工作台已退出</h1><p role="status">{{ exited }}</p>
+  </div></main>
+  <div v-else class="shell">
     <aside class="sidebar">
       <div class="brand"><span class="brand-icon">文</span><span>小说工作台<small>本地创作空间</small></span></div>
       <div class="library">
@@ -396,8 +449,9 @@ onBeforeUnmount(() => window.clearTimeout(timer))
         </button>
       </nav>
       <div class="sidebar-foot">
-        <button v-if="selected" class="quiet danger-text" :disabled="activeJob"
+        <button v-if="selected" class="quiet danger-text"
           @click="form('delete_book', '删除小说', { name_confirmation: '', confirm: '' })">删除当前小说</button>
+        <button class="quiet" @click="form('exit', '退出工作台')">退出工作台</button>
         <span class="local"><i></i> 本机运行</span>
       </div>
     </aside>
@@ -406,7 +460,7 @@ onBeforeUnmount(() => window.clearTimeout(timer))
       <header class="topbar">
         <span class="crumb">工作台 <span>/</span> {{ sections.find(item => item[0] === view)[1] }}</span>
         <button v-if="job" class="job-link" @click="jobOpen = !jobOpen">
-          <i :class="{ live: activeJob }"></i>{{ activeJob ? stateLabels[job.status] : '最近操作' }}
+          <i :class="{ live: activeJob }"></i>{{ activeJob ? job.title + ' · ' + stateLabels[job.status] : '最近操作' }}
         </button>
       </header>
 
@@ -428,6 +482,7 @@ onBeforeUnmount(() => window.clearTimeout(timer))
               <h2>角色模型</h2>
               <div class="field-grid">
                 <label v-for="(role, key) in models.roles" :key="key">{{ role.label }}
+                  <span class="small muted">当前使用 {{ role.current }}</span>
                   <select v-model="modelForm[key]" :disabled="verifying || modelBusy" required>
                     <option value="" disabled>{{ role.options.length ? '请选择有免费额度的模型' : '暂无有额度的文本模型，请刷新额度' }}</option>
                     <option v-for="option in role.options" :key="option.id" :value="option.id" :disabled="!option.configured && option.id !== role.current">
@@ -456,6 +511,7 @@ onBeforeUnmount(() => window.clearTimeout(timer))
             <div class="two-up">
               <div class="panel padded stack">
                 <h2>模型费用明细</h2>
+                <p class="muted">总用量 {{ size(models.usage.total_input_tokens + models.usage.total_output_tokens) }} Token<template v-if="models.usage.total_calls"> · 最近调用 {{ models.usage.model_used }}</template></p>
                 <div class="table-wrap"><table><thead><tr><th>模型</th><th>成功调用</th><th>费用</th></tr></thead><tbody>
                   <tr v-for="(stats, name) in models.usage.by_model" :key="name"><td>{{ name }}</td><td>{{ stats.calls }}</td><td>{{ money(stats.cost_yuan) }}</td></tr>
                 </tbody></table></div>
@@ -517,14 +573,14 @@ onBeforeUnmount(() => window.clearTimeout(timer))
                     :class="{ current: chapter?.chapter_num === row.chapter_num }" @click="openChapter(row.chapter_num)">
                     <span class="chapter-num">{{ String(row.chapter_num).padStart(2, '0') }}</span>
                     <span class="chapter-summary"><b>{{ row.title || '第' + row.chapter_num + '章' }}</b>
-                      <small>{{ statusText(row.status) }} · {{ size(row.chars) }} 字</small>
+                      <small>{{ statusText(row.status) }} · {{ size(row.chars) }} 字<template v-if="row.emotion_tag"> · {{ row.emotion_tag }}</template><template v-if="row.retry_count"> · 重试 {{ row.retry_count }} 次</template></small>
                     </span>
                   </button>
                   <p v-if="!filteredChapters.length" class="empty">没有符合条件的章节。</p>
                 </div>
                 <div class="list-footer"><button :disabled="activeJob || !approved" @click="start('export')">导出已审核章节</button>
-                  <button class="danger-text" :disabled="activeJob || !book.chapters.length"
-                    @click="form('delete_chapters', '批量删除章节', { first: 1, last: 1, confirm: '' })">批量删除</button></div>
+                  <button class="danger-text" :disabled="!book.chapters.length"
+                    @click="form('delete_chapters', '批量删除章节', { range: '', confirm: '' })">批量删除</button></div>
               </div>
               <article v-if="chapter" class="panel chapter-paper">
                 <div class="paper-top">
@@ -534,7 +590,7 @@ onBeforeUnmount(() => window.clearTimeout(timer))
                     <button v-if="chapter.status === '审稿失败'" class="primary" :disabled="activeJob"
                       @click="form('recover', '恢复审稿失败', { chapter: chapter.chapter_num, method: '1' })">恢复审稿</button>
                     <button :disabled="activeJob || !chapter.content || !approval.includes(chapter.status)" @click="start('export', { chapter: chapter.chapter_num })">导出 TXT</button>
-                    <button class="danger-text" :disabled="activeJob"
+                    <button class="danger-text"
                       @click="form('delete_chapters', '删除本章', { first: chapter.chapter_num, last: chapter.chapter_num, confirm: '', single: true })">删除</button>
                   </div>
                 </div>
@@ -582,10 +638,6 @@ onBeforeUnmount(() => window.clearTimeout(timer))
               <p v-if="!book.foreshadow.length" class="empty">暂无大纲伏笔。</p>
             </div>
             <div class="panel padded stack"><h2>伏笔健康度</h2>
-              <div class="actions">
-                <button :disabled="activeJob" @click="start('book_health')">只读体检</button>
-                <button :disabled="activeJob" @click="start('archive_legacy')">整理旧伏笔</button>
-              </div>
               <template v-if="book.health">
                 <p class="muted">未兑现 {{ book.health.total_active }} · 近期新增 {{ book.health.recent_added }} · 近期兑现 {{ book.health.recent_redeemed }} · 每章净增 {{ book.health.trend }}</p>
                 <div class="field-grid"><div v-for="[key, title] in healthGroups" :key="key">
@@ -595,6 +647,12 @@ onBeforeUnmount(() => window.clearTimeout(timer))
                 </div></div>
               </template>
               <p v-else class="muted">写作后可查看伏笔健康度。</p>
+            </div>
+            <div class="panel padded row between"><h2>旧书体检与伏笔归档</h2>
+              <div class="actions">
+                <button :disabled="activeJob" @click="start('book_health')">只读体检</button>
+                <button :disabled="activeJob" @click="start('archive_legacy')">整理旧伏笔</button>
+              </div>
             </div>
           </div>
 
@@ -651,7 +709,7 @@ onBeforeUnmount(() => window.clearTimeout(timer))
       </section>
     </main>
 
-    <div v-if="dialog" class="overlay" @click.self="dialog = null" @keydown.esc="dialog = null">
+    <div v-if="dialogReady && !jobOpen" class="overlay" @click.self="dialog = null" @keydown.esc="dialog = null">
       <form class="dialog panel stack" role="dialog" aria-modal="true" aria-labelledby="dialog-title" @submit.prevent="submit">
         <header class="row between"><h2 id="dialog-title">{{ dialog.title }}</h2><button type="button" class="quiet" @click="dialog = null" aria-label="关闭">×</button></header>
         <template v-if="dialog.kind === 'create'">
@@ -687,27 +745,35 @@ onBeforeUnmount(() => window.clearTimeout(timer))
             <label>计划兑现章<input v-model.number="dialog.fields.resolve_chapter" type="number" :min="dialog.fields.fid ? 0 : 1" :required="!dialog.fields.fid"></label></div>
           <label>备注<textarea v-model="dialog.fields.notes" rows="2"></textarea></label>
         </template>
+        <p v-else-if="dialog.kind === 'exit'">退出将停止本机工作台服务。再次打开请运行 <code>python main.py</code>。</p>
         <template v-else>
-          <p v-if="dialog.kind === 'delete_book'">将删除《{{ selected }}》及其导出文件。请先核对书名。</p>
-          <label v-if="dialog.kind === 'delete_book'">输入完整书名<input v-model="dialog.fields.name_confirmation" required></label>
-          <div v-if="dialog.kind === 'delete_chapters' && !dialog.fields.single" class="field-grid">
-            <label>起始章节<input v-model.number="dialog.fields.first" type="number" min="1" required></label>
-            <label>结束章节<input v-model.number="dialog.fields.last" type="number" :min="dialog.fields.first || 1" required></label>
-          </div>
-          <p v-if="dialog.kind === 'delete_chapters'" class="muted">正文、摘要和导出文件将删除，任务卡恢复为待处理。已提取伏笔保留。</p>
+          <template v-if="dialog.kind === 'delete_book'">
+            <p>将永久删除《{{ dialog.novel }}》及其导出文件。</p>
+            <label>输入完整书名<input v-model.trim="dialog.fields.name_confirmation" required></label>
+          </template>
+          <template v-if="dialog.kind === 'delete_chapters'">
+            <p>《{{ dialog.novel }}》<template v-if="dialog.fields.single">第 {{ dialog.fields.first }} 章</template></p>
+            <label v-if="!dialog.fields.single">章节号或范围<input v-model.trim="dialog.fields.range" required placeholder="例如 3 或 2-5"></label>
+            <p class="muted">将删除正文、逐章摘要和导出文件，现有任务卡恢复为待处理。可定位到这些章节的伏笔状态会回滚。</p>
+          </template>
           <p v-if="dialog.fields.message">第 {{ dialog.fields.chapter }} 章。{{ dialog.fields.message }}</p>
-          <label>输入 YES 确认<input v-model="dialog.fields.confirm" required pattern="YES"></label>
+          <label>输入 YES 确认<input v-model.trim="dialog.fields.confirm" required></label>
         </template>
+        <div v-if="activeJob" class="prompt row between">
+          <p role="status">「{{ job.title }}」{{ stateLabels[job.status] }}，请先处理当前任务。</p>
+          <button type="button" @click="jobOpen = true">处理当前任务</button>
+        </div>
         <p v-if="dialog.error" class="error" role="alert">{{ dialog.error }}</p>
         <footer class="actions"><button type="button" @click="dialog = null">取消</button>
-          <button :class="dialog.kind.startsWith('delete') ? 'danger' : 'primary'" :disabled="activeJob || starting">确认</button></footer>
+          <button v-if="dialog.error && dialog.jobId === job?.id" type="button" @click="jobOpen = true">查看任务记录</button>
+          <button :class="dialog.kind.startsWith('delete') ? 'danger' : 'primary'" :disabled="activeJob || starting">{{ starting ? '提交中…' : '确认' }}</button></footer>
       </form>
     </div>
 
     <section v-if="job && jobOpen" class="panel job-panel" aria-label="任务进度">
       <header class="row between">
         <div><h2>{{ job.title }}</h2><span class="small muted" aria-live="polite">{{ stateLabels[job.status] }}{{ job.novel ? ' · ' + job.novel : '' }}</span></div>
-        <div class="actions"><button v-if="activeJob" :disabled="job.status === 'stopping'" @click="stop">停止任务</button><button class="quiet" @click="jobOpen = false" aria-label="收起任务进度">×</button></div>
+        <div class="actions"><button v-if="activeJob" :disabled="job.status === 'stopping'" @click="stop">停止任务</button><button class="quiet" @click="jobOpen = false" :aria-label="dialogReady ? '返回表单' : '收起任务进度'">{{ dialogReady ? '返回表单' : '×' }}</button></div>
       </header>
       <div v-if="job.prompt" class="prompt stack">
         <h3>{{ job.prompt.text }}</h3>
@@ -727,7 +793,7 @@ onBeforeUnmount(() => window.clearTimeout(timer))
         <a v-for="name in job.result.downloads" :key="name" :href="download(name, job.novel)" download>{{ name }}</a>
       </div>
       <details v-if="jobLog.length" :open="!job.prompt"><summary>任务记录</summary>
-        <div class="log"><p v-for="row in jobLog.slice(-60)" :key="row.id">{{ row.text }}</p></div>
+        <div class="log"><p v-for="row in jobLog" :key="row.id">{{ row.text }}</p></div>
       </details>
     </section>
   </div>

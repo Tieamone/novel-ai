@@ -221,23 +221,16 @@ def generate(novel, count):
 
 
 def delete_chapters(novel, data):
+    if string(data, "confirm", 20).strip() != "YES":
+        raise ValueError("请输入大写 YES 确认")
     first = number(data.get("first"))
     last = number(data.get("last", first))
-    if last < first or data.get("confirm") != "YES":
-        raise ValueError("请核对章节范围并输入 YES")
-    rows = chapter_rows(novel, """
-        SELECT c.chapter_num, c.status, t.status AS task_status
-        FROM chapters c LEFT JOIN chapter_tasks t ON c.chapter_num=t.chapter_num
-        WHERE c.chapter_num BETWEEN ? AND ? ORDER BY c.chapter_num
-    """, (first, last))
-    if len(rows) != last - first + 1:
-        raise ValueError("选定范围内有章节不存在")
-    if any(row["status"] == "writing" or row["task_status"] == cli.TASK_IN_PROGRESS for row in rows):
-        raise ValueError("选定范围内有章节正在写作")
+    if last < first:
+        raise ValueError("结束章节应大于或等于起始章节")
     protect_exports(novel)
-    for row in rows:
-        cli.delete_chapter(novel, row["chapter_num"])
-    return {"message": f"已删除 {len(rows)} 章，任务卡已重置"}
+    cli.delete_chapter_range(novel, first, last)
+    chapters = f"第 {first} 章" if first == last else f"第 {first} 至 {last} 章"
+    return {"message": f"已删除{chapters}，对应任务卡已重置为待处理"}
 
 
 def save_foreshadow(novel, data):
@@ -319,8 +312,10 @@ def run(kind, novel, data):
             raise ValueError("没有可导出的章节正文")
         return {"downloads": downloads, "message": f"已导出 {len(downloads)} 章"}
     if kind == "delete_book":
-        if data.get("name_confirmation") != novel or data.get("confirm") != "YES":
-            raise ValueError("请输入完整书名及 YES 确认删除")
+        if string(data, "name_confirmation", 128).strip() != novel:
+            raise ValueError("输入的书名与当前小说不一致")
+        if string(data, "confirm", 20).strip() != "YES":
+            raise ValueError("请输入大写 YES 确认")
         output_path = export_directory(novel)
         for other, _ in cli._list_novels(readonly=True):
             if other != novel and os.path.normcase(str(get_safe_output_dir(other).resolve())) == os.path.normcase(str(output_path)):
@@ -374,11 +369,12 @@ def run(kind, novel, data):
                 raise ValueError("任务卡不存在")
             cli.reset_writing_checkpoint(novel, chapter)
         else:
-            if tasks and tasks[0]["status"] == cli.TASK_IN_PROGRESS:
+            if tasks and tasks[0]["status"] in (cli.TASK_IN_PROGRESS, "in_progress"):
                 raise ValueError("章节正在写作，请先检查断点")
             if kind == "rewrite":
                 if not chapters:
                     raise ValueError("章节不存在")
+                protect_exports(novel)
                 cli.rewrite_writing_checkpoint(novel, chapter)
             else:
                 cli.clear_writing_beats(novel, chapter)
